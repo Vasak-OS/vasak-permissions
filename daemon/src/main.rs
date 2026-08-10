@@ -69,6 +69,62 @@ async fn caller_of(
     PinnedCaller::capture(pid, uid).map_err(FdoError::Failed)
 }
 
+
+impl PermissionService {
+    /// Looks up the stored answer, asks the user when there is none, and
+    /// remembers what they said.
+    async fn decide(
+        &self,
+        connection: &Connection,
+        subject: &PinnedCaller,
+        resource_id: &str,
+        detail: String,
+    ) -> zbus::fdo::Result<bool> {
+        let application = subject.describe();
+
+        let stored = self
+            .store
+            .load(subject.uid)
+            .map_err(FdoError::Failed)?
+            .decision(&application.binary_path, resource_id);
+
+        let decision = match stored {
+            Decision::Allowed | Decision::Denied => stored,
+            Decision::Unknown => {
+                let request = PermissionRequest {
+                    application: application.clone(),
+                    resource_id: resource_id.to_string(),
+                    detail,
+                };
+
+                let answer = agent::ask(connection, &self.agents, subject.uid, &request).await;
+
+                // Record the refusal too. Storing nothing would re-open the
+                // same dialog on the program's very next attempt, and the
+                // person would have no way to settle it.
+                let _guard = self.write_lock.lock().await;
+                let mut policy = self.store.load(subject.uid).map_err(FdoError::Failed)?;
+                policy.record(&application, resource_id, Decision::from_answer(answer));
+                self.store
+                    .save(subject.uid, &policy)
+                    .map_err(FdoError::Failed)?;
+
+                Decision::from_answer(answer)
+            }
+        };
+
+        if !decision.is_allowed() {
+            tracing::info!(
+                "Denegado '{resource_id}' a {} (PID {})",
+                application.binary_path,
+                subject.pid
+            );
+        }
+
+        Ok(decision.is_allowed())
+    }
+}
+
 #[interface(name = "ar.net.vasak.os.Permissions")]
 impl PermissionService {
     /// Whether the calling program may use `resource_id`, asking the user the
@@ -94,49 +150,55 @@ impl PermissionService {
         }
 
         let caller = caller_of(connection, &header).await?;
-        let application = caller.describe();
+        self.decide(connection, &caller, &resource_id, detail).await
+    }
 
-        let stored = self
-            .store
-            .load(caller.uid)
-            .map_err(FdoError::Failed)?
-            .decision(&application.binary_path, &resource_id);
-
-        let decision = match stored {
-            Decision::Allowed | Decision::Denied => stored,
-            Decision::Unknown => {
-                let request = PermissionRequest {
-                    application: application.clone(),
-                    resource_id: resource_id.clone(),
-                    detail,
-                };
-
-                let answer =
-                    agent::ask(connection, &self.agents, caller.uid, &request).await;
-
-                // Record the refusal too. Storing nothing would re-open the
-                // same dialog on the program's very next attempt, and the
-                // person would have no way to settle it.
-                let _guard = self.write_lock.lock().await;
-                let mut policy = self.store.load(caller.uid).map_err(FdoError::Failed)?;
-                policy.record(&application, &resource_id, Decision::from_answer(answer));
-                self.store
-                    .save(caller.uid, &policy)
-                    .map_err(FdoError::Failed)?;
-
-                Decision::from_answer(answer)
-            }
-        };
-
-        if !decision.is_allowed() {
-            tracing::info!(
-                "Denegado '{resource_id}' a {} (PID {})",
-                application.binary_path,
-                caller.pid
-            );
+    /// The same question, asked by a service on behalf of the program that
+    /// called *it*.
+    ///
+    /// Needed because an application does not reach this service directly for an
+    /// online account: it asks the account service, which then has to ask here.
+    /// Without naming the original program, every application would share one
+    /// decision recorded against the account service — which is no decision.
+    ///
+    /// Only the delegates listed in the protocol may call this, identified the
+    /// same way as anyone else: by the executable behind their pinned PID.
+    async fn check_permission_for(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        subject_pid: u32,
+        subject_start_time: u64,
+        resource_id: String,
+        detail: String,
+    ) -> zbus::fdo::Result<bool> {
+        if Resource::from_id(&resource_id).is_none() {
+            return Err(FdoError::InvalidArgs(format!(
+                "recurso desconocido: '{resource_id}'"
+            )));
         }
 
-        Ok(decision.is_allowed())
+        let delegate = caller_of(connection, &header).await?;
+        if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
+            return Err(FdoError::AccessDenied(format!(
+                "{} no puede consultar permisos en nombre de otro proceso",
+                delegate.binary_path()
+            )));
+        }
+
+        let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
+            .map_err(FdoError::InvalidArgs)?;
+
+        // A delegate must not be able to ask about a process belonging to
+        // somebody else, or one user's answer would be recorded in another
+        // user's policy.
+        if subject.uid != delegate.uid {
+            return Err(FdoError::AccessDenied(
+                "el proceso indicado pertenece a otro usuario".into(),
+            ));
+        }
+
+        self.decide(connection, &subject, &resource_id, detail).await
     }
 
     /// Everything decided for the calling user, as JSON, for the settings

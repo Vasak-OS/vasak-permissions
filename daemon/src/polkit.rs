@@ -67,11 +67,16 @@ pub async fn authorize(
 /// parentheses and may itself contain spaces or brackets — splitting the whole
 /// line on whitespace misplaces every field after it.
 fn process_start_time(pid: u32) -> Result<u64, FdoError> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|e| FdoError::Failed(format!("no se pudo leer /proc/{pid}/stat: {e}")))?;
+    start_time_of(pid).map_err(FdoError::Failed)
+}
 
-    parse_start_time(&stat)
-        .ok_or_else(|| FdoError::Failed(format!("no se pudo interpretar /proc/{pid}/stat")))
+/// Public for the delegated path, which compares it to the value a delegate
+/// reported to detect a reused PID.
+pub fn start_time_of(pid: u32) -> Result<u64, String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("no se pudo leer /proc/{pid}/stat: {e}"))?;
+
+    parse_start_time(&stat).ok_or_else(|| format!("no se pudo interpretar /proc/{pid}/stat"))
 }
 
 fn parse_start_time(stat: &str) -> Option<u64> {

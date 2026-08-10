@@ -31,6 +31,31 @@ pub struct PinnedCaller {
 }
 
 impl PinnedCaller {
+    /// Pins a process somebody else named, checking it is still the same one.
+    ///
+    /// A delegate hands over a PID it saw a moment ago. By the time this runs
+    /// that process could have exited and its number been given to something
+    /// else — so the start time is compared as well, which is the pair the
+    /// kernel guarantees to be unique. Without it, a delegate could be tricked
+    /// into naming a process that no longer exists and the answer would be
+    /// recorded against whatever inherited the number.
+    pub fn capture_subject(pid: u32, start_time: u64) -> Result<Self, String> {
+        let uid = std::fs::metadata(format!("/proc/{pid}"))
+            .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+            .map_err(|e| format!("el proceso {pid} ya no existe: {e}"))?;
+
+        let pinned = Self::capture(pid, uid)?;
+
+        let actual = crate::polkit::start_time_of(pid)?;
+        if actual != start_time {
+            return Err(format!(
+                "el proceso {pid} no es el que se indicó: el número fue reutilizado"
+            ));
+        }
+
+        Ok(pinned)
+    }
+
     pub fn capture(pid: u32, uid: u32) -> Result<Self, String> {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
@@ -164,6 +189,30 @@ fn matching_entry_name(contents: &str, executable: &Path, file_name: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The pairing of PID and start time is what makes a delegated request
+    /// safe. A delegate hands over a number it saw a moment ago; if only the
+    /// number were checked, a process that exited and had its number reused
+    /// would be silently mistaken for the original.
+    #[test]
+    fn a_delegated_subject_must_match_its_start_time() {
+        let pid = std::process::id();
+        let start_time = crate::polkit::start_time_of(pid).expect("start time");
+
+        let pinned = PinnedCaller::capture_subject(pid, start_time).expect("correct start time");
+        assert_eq!(pinned.pid, pid);
+
+        assert!(
+            PinnedCaller::capture_subject(pid, start_time + 1).is_err(),
+            "a mismatched start time means the number was reused"
+        );
+    }
+
+    #[test]
+    fn a_process_that_no_longer_exists_cannot_be_pinned() {
+        assert!(PinnedCaller::capture_subject(999_999_999, 0).is_err());
+    }
 
     #[test]
     fn programs_the_user_can_replace_are_marked_unverified() {

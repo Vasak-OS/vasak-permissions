@@ -35,6 +35,25 @@ pub const AGENT_BINARY: &str = "/usr/bin/vasak-permissions-agent";
 /// was just refused — which would make the whole service decorative.
 pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
 
+
+/// Services allowed to ask on behalf of somebody else.
+///
+/// An application does not talk to the permission service directly for an
+/// online account — it talks to the account service, which then has to ask. If
+/// that second hop asked in its own name, every application would end up
+/// sharing one decision recorded against the account service, which is no
+/// decision at all.
+///
+/// So a delegate names the process it is acting for. The list is absolute
+/// paths under `/usr/bin`, which needs root to write: a program the user can
+/// write cannot be one of these, and therefore cannot claim to be asking for
+/// somebody else.
+pub const DELEGATE_BINARIES: [&str; 1] = ["/usr/bin/vasak-accounts"];
+
+pub fn is_delegate(binary_path: &str) -> bool {
+    DELEGATE_BINARIES.contains(&binary_path)
+}
+
 // ── Resources ───────────────────────────────────────────────────────────────
 
 /// Something an application can ask to use.
@@ -246,5 +265,23 @@ mod tests {
         assert_eq!(Resource::from_id("account.nonsense"), None);
         assert_eq!(Resource::from_id("account."), None);
         assert_eq!(Resource::from_id(""), None);
+    }
+}
+
+#[cfg(test)]
+mod delegate_tests {
+    use super::*;
+
+    #[test]
+    fn only_services_installed_by_the_system_may_ask_for_someone_else() {
+        assert!(is_delegate("/usr/bin/vasak-accounts"));
+
+        // A program the user can write must never be able to claim it is
+        // asking on another program's behalf — it would name whichever
+        // already-approved program it liked.
+        assert!(!is_delegate("/home/someone/.local/bin/vasak-accounts"));
+        assert!(!is_delegate("/tmp/vasak-accounts"));
+        assert!(!is_delegate("vasak-accounts"));
+        assert!(!is_delegate("/usr/bin/anything-else"));
     }
 }
