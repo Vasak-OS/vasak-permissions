@@ -1,0 +1,10 @@
+[package]
+name = "vasak-permissions-protocol"
+description = "Shared D-Bus contract for the VasakOS permission service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true

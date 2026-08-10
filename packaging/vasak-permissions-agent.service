@@ -1,0 +1,14 @@
+[Unit]
+Description=VasakOS permission dialog agent
+Documentation=https://github.com/Vasak-OS/vasak-permissions
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/vasak-permissions-agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>VasakOS</vendor>
+  <vendor_url>https://vasak.net.ar</vendor_url>
+
+  <action id="ar.net.vasak.os.permissions.manage">
+    <description>Cambiar los permisos de las aplicaciones</description>
+    <description xml:lang="en">Change application permissions</description>
+    <message>Se requiere autenticación para cambiar qué aplicaciones pueden usar la cámara, el micrófono, la pantalla y tus cuentas.</message>
+    <message xml:lang="en">Authentication is required to change which applications may use the camera, microphone, screen and your accounts.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- The user authenticates as themselves, and the answer is remembered
+           for a short while so adjusting several switches in Settings does not
+           ask again for each one. -->
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

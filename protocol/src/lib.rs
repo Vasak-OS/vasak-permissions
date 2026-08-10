@@ -1,0 +1,250 @@
+//! The contract between the permission service, the dialog agent and the
+//! settings interface.
+//!
+//! Everything that travels over D-Bus is defined here once so the three sides
+//! cannot drift apart: a field renamed on one end stops compiling on the other
+//! instead of silently becoming a permission that never matches.
+
+use serde::{Deserialize, Serialize};
+
+// ── Bus addresses ───────────────────────────────────────────────────────────
+
+/// The service runs on the **system** bus, as root.
+///
+/// It has to read `/proc/<pid>/exe` of arbitrary processes to know who is
+/// asking, which an unprivileged process cannot do for someone else's
+/// processes, and it has to own a policy file the user's own programs cannot
+/// rewrite. A service in the user's session could do neither.
+pub const SERVICE_NAME: &str = "ar.net.vasak.os.Permissions";
+pub const SERVICE_PATH: &str = "/ar/net/vasak/os/Permissions";
+pub const SERVICE_INTERFACE: &str = "ar.net.vasak.os.Permissions";
+
+/// The dialog agent, on the session bus of whoever is logged in.
+pub const AGENT_INTERFACE: &str = "ar.net.vasak.os.PermissionAgent";
+
+/// The only executable accepted as the dialog agent.
+///
+/// This is the whole reason a malicious program cannot register itself as the
+/// agent and approve everything on its own behalf: writing to `/usr/bin`
+/// requires root, so no program running as you can occupy this path.
+pub const AGENT_BINARY: &str = "/usr/bin/vasak-permissions-agent";
+
+/// polkit action guarding every change made from the settings interface.
+///
+/// Without it, any program could call `SetPermission` and grant itself what it
+/// was just refused — which would make the whole service decorative.
+pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
+
+// ── Resources ───────────────────────────────────────────────────────────────
+
+/// Something an application can ask to use.
+///
+/// Deliberately open-ended: hardware and online accounts share one model, so a
+/// new resource is a new variant and everything else — storage, the dialog, the
+/// settings list — already handles it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Resource {
+    Camera,
+    Microphone,
+    /// Recording or capturing the screen.
+    ScreenCapture,
+    Location,
+    /// Reading the keyboard globally: keyloggers and global shortcuts alike.
+    InputCapture,
+    /// Access to one capability of the user's online accounts.
+    #[serde(rename = "account")]
+    Account(AccountResource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountResource {
+    Email,
+    Calendar,
+    Contacts,
+    Chat,
+    Drive,
+    Tasks,
+}
+
+impl Resource {
+    /// Stable text form used on the bus and in the stored policy.
+    ///
+    /// Spelled out by hand rather than derived, because these strings end up in
+    /// a file on disk: a refactor that renamed a variant would otherwise
+    /// silently invalidate every decision the user had already made.
+    pub fn as_id(&self) -> String {
+        match self {
+            Resource::Camera => "camera".into(),
+            Resource::Microphone => "microphone".into(),
+            Resource::ScreenCapture => "screen-capture".into(),
+            Resource::Location => "location".into(),
+            Resource::InputCapture => "input-capture".into(),
+            Resource::Account(capability) => format!("account.{}", capability.as_id()),
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        if let Some(capability) = id.strip_prefix("account.") {
+            return AccountResource::from_id(capability).map(Resource::Account);
+        }
+
+        match id {
+            "camera" => Some(Resource::Camera),
+            "microphone" => Some(Resource::Microphone),
+            "screen-capture" => Some(Resource::ScreenCapture),
+            "location" => Some(Resource::Location),
+            "input-capture" => Some(Resource::InputCapture),
+            _ => None,
+        }
+    }
+}
+
+impl AccountResource {
+    pub fn as_id(&self) -> &'static str {
+        match self {
+            AccountResource::Email => "email",
+            AccountResource::Calendar => "calendar",
+            AccountResource::Contacts => "contacts",
+            AccountResource::Chat => "chat",
+            AccountResource::Drive => "drive",
+            AccountResource::Tasks => "tasks",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "email" => Some(AccountResource::Email),
+            "calendar" => Some(AccountResource::Calendar),
+            "contacts" => Some(AccountResource::Contacts),
+            "chat" => Some(AccountResource::Chat),
+            "drive" => Some(AccountResource::Drive),
+            "tasks" => Some(AccountResource::Tasks),
+            _ => None,
+        }
+    }
+}
+
+// ── Decisions ───────────────────────────────────────────────────────────────
+
+/// What the stored policy says about one application and one resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Decision {
+    Allowed,
+    Denied,
+    /// Never decided, so the user has to be asked.
+    Unknown,
+}
+
+impl Decision {
+    pub fn from_answer(allowed: bool) -> Self {
+        if allowed {
+            Decision::Allowed
+        } else {
+            Decision::Denied
+        }
+    }
+
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Decision::Allowed)
+    }
+}
+
+// ── Applications ────────────────────────────────────────────────────────────
+
+/// How much the service can vouch for the identity of a program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provenance {
+    /// Installed under a path only root can write, so the binary behind a
+    /// remembered decision cannot have been swapped for another one.
+    SystemInstalled,
+    /// Anywhere the user can write: their own scripts, a downloaded AppImage.
+    /// The decision is still honoured, but the dialog says so — the same thing
+    /// macOS means by an unidentified developer.
+    Unverified,
+}
+
+/// A program asking for something, as the service sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Application {
+    /// Absolute, symlink-resolved path to the executable. This is the identity
+    /// a decision is recorded against.
+    pub binary_path: String,
+    /// Name to show a person, resolved from the desktop entry when there is
+    /// one and falling back to the file name.
+    pub display_name: String,
+    pub provenance: Provenance,
+}
+
+/// One stored decision, as listed by the settings interface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionEntry {
+    pub application: Application,
+    /// Resource ids (`Resource::as_id`) mapped to what was decided.
+    pub decisions: std::collections::BTreeMap<String, Decision>,
+}
+
+/// What the agent is asked to put to the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub application: Application,
+    pub resource_id: String,
+    /// Extra context for account resources: which account is being asked for.
+    /// Empty for hardware resources.
+    pub detail: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These strings are written to disk. If a rename ever changes one, every
+    /// decision recorded under the old spelling silently stops matching and
+    /// the user is asked all over again.
+    #[test]
+    fn resource_ids_survive_a_round_trip() {
+        let resources = [
+            Resource::Camera,
+            Resource::Microphone,
+            Resource::ScreenCapture,
+            Resource::Location,
+            Resource::InputCapture,
+            Resource::Account(AccountResource::Email),
+            Resource::Account(AccountResource::Calendar),
+            Resource::Account(AccountResource::Contacts),
+            Resource::Account(AccountResource::Chat),
+            Resource::Account(AccountResource::Drive),
+            Resource::Account(AccountResource::Tasks),
+        ];
+
+        for resource in resources {
+            let id = resource.as_id();
+            assert_eq!(
+                Resource::from_id(&id),
+                Some(resource.clone()),
+                "id {id} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ids_are_the_ones_written_to_disk() {
+        assert_eq!(Resource::Camera.as_id(), "camera");
+        assert_eq!(Resource::ScreenCapture.as_id(), "screen-capture");
+        assert_eq!(
+            Resource::Account(AccountResource::Email).as_id(),
+            "account.email"
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_is_rejected_rather_than_guessed() {
+        assert_eq!(Resource::from_id("nonsense"), None);
+        assert_eq!(Resource::from_id("account.nonsense"), None);
+        assert_eq!(Resource::from_id("account."), None);
+        assert_eq!(Resource::from_id(""), None);
+    }
+}

@@ -1,3 +1,7 @@
+# Build output. The Cargo workspace lives at the repository root, so its
+# target directory does too — src-tauri/.gitignore does not cover it.
+/target
+
 # Logs
 logs
 *.log

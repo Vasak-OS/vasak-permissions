@@ -1,0 +1,26 @@
+[package]
+name = "vasak-permissions-daemon"
+description = "VasakOS system permission service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vasak-permissions"
+path = "src/main.rs"
+
+[dependencies]
+vasak-permissions-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zbus.workspace = true
+tokio.workspace = true
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
