@@ -107,17 +107,20 @@ fn is_the_agent(binary_path: &str) -> bool {
             .is_some_and(|name| name == "vasak-permissions-agent")
 }
 
-/// Puts a request to the user and returns their answer.
+/// Puts a request to the user and returns their answer, or `None` when the
+/// question could not be put to them at all.
 ///
-/// Every failure — no agent registered, a timeout, a malformed reply — refuses.
-/// The caller is asking for the camera, the microphone or someone's mail; the
-/// only safe answer to "we could not ask" is no.
+/// The distinction matters more than it looks. Access is refused either way —
+/// the safe answer to "we could not ask" is no — but only a real answer may be
+/// remembered. Recording "no agent was running" as a refusal would permanently
+/// deny anything that asked during login, before the dialog agent had started,
+/// and the user would never be asked again.
 pub async fn ask(
     connection: &zbus::Connection,
     agents: &SharedAgents,
     uid: u32,
     request: &PermissionRequest,
-) -> bool {
+) -> Option<bool> {
     let Some(agent) = agents.lock().await.agent_for(uid) else {
         tracing::warn!(
             "No hay agente de permisos para el usuario {uid}; \
@@ -125,14 +128,14 @@ pub async fn ask(
             request.resource_id,
             request.application.binary_path
         );
-        return false;
+        return None;
     };
 
     let payload = match serde_json::to_string(request) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::error!("No se pudo serializar la consulta de permiso: {error}");
-            return false;
+            return None;
         }
     };
 
@@ -153,7 +156,7 @@ pub async fn ask(
                  se deniega '{}'",
                 request.resource_id
             );
-            return false;
+            return None;
         }
         Err(_) => {
             tracing::warn!(
@@ -162,15 +165,15 @@ pub async fn ask(
                 ANSWER_TIMEOUT.as_secs(),
                 request.resource_id
             );
-            return false;
+            return None;
         }
     };
 
     match reply.body().deserialize::<bool>() {
-        Ok(answer) => answer,
+        Ok(answer) => Some(answer),
         Err(error) => {
             tracing::warn!("Respuesta inválida del agente de permisos: {error}");
-            false
+            None
         }
     }
 }

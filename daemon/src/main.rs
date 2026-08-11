@@ -15,6 +15,7 @@ mod agent;
 mod identity;
 mod policy;
 mod polkit;
+mod throttle;
 
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ use zbus::{interface, Connection};
 use agent::{AgentRegistry, SharedAgents};
 use identity::PinnedCaller;
 use policy::PolicyStore;
+use throttle::PromptThrottle;
 use vasak_permissions_protocol::{
     Decision, PermissionRequest, Resource, SERVICE_INTERFACE, SERVICE_NAME, SERVICE_PATH,
 };
@@ -39,6 +41,8 @@ struct PermissionService {
     /// answer and write it back, and whichever finished last would erase the
     /// other's decision.
     write_lock: Arc<Mutex<()>>,
+    /// Ceiling on how many dialogs a person can be shown at once.
+    throttle: Arc<Mutex<PromptThrottle>>,
 }
 
 /// Pins the caller of the current message and resolves who it is.
@@ -91,17 +95,45 @@ impl PermissionService {
         let decision = match stored {
             Decision::Allowed | Decision::Denied => stored,
             Decision::Unknown => {
+                // Refuse without asking once the person has been shown enough
+                // dialogs at once. Nothing is recorded: a burst of noise must
+                // not permanently deny a program whose dialog was never seen.
+                let within_ceiling = self
+                    .throttle
+                    .lock()
+                    .await
+                    .allow(subject.uid, std::time::Instant::now());
+
+                if !within_ceiling {
+                    tracing::warn!(
+                        "Demasiadas consultas de permiso seguidas; se deniega \
+                         '{resource_id}' a {} sin preguntar",
+                        application.binary_path
+                    );
+                    return Ok(false);
+                }
+
                 let request = PermissionRequest {
                     application: application.clone(),
                     resource_id: resource_id.to_string(),
                     detail,
                 };
 
-                let answer = agent::ask(connection, &self.agents, subject.uid, &request).await;
+                let Some(answer) =
+                    agent::ask(connection, &self.agents, subject.uid, &request).await
+                else {
+                    // The question could not be put to anyone — no agent yet,
+                    // or it never answered. Refuse, but remember nothing:
+                    // recording this would deny anything that asked during
+                    // login for good, and the user would never see a dialog.
+                    // Give the slot back too, since no dialog was displayed.
+                    self.throttle.lock().await.refund(subject.uid);
+                    return Ok(false);
+                };
 
-                // Record the refusal too. Storing nothing would re-open the
-                // same dialog on the program's very next attempt, and the
-                // person would have no way to settle it.
+                // A real answer is remembered, refusals included. Storing
+                // nothing would re-open the same dialog on the program's very
+                // next attempt, and the person could never settle it.
                 let _guard = self.write_lock.lock().await;
                 let mut policy = self.store.load(subject.uid).map_err(FdoError::Failed)?;
                 policy.record(&application, resource_id, Decision::from_answer(answer));
@@ -357,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: PolicyStore::from_environment(),
         agents: Arc::clone(&agents),
         write_lock: Arc::new(Mutex::new(())),
+        throttle: Arc::new(Mutex::new(PromptThrottle::default())),
     };
 
     let connection = service_bus()?
