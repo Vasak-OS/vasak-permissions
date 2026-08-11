@@ -3,9 +3,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { RESOURCE_TEXT } from '@/resources';
-import type { PermissionRequest } from '@/types/permissions';
+import type { Question } from '@/types/permissions';
 
-const request = ref<PermissionRequest | null>(null);
+const question = ref<Question | null>(null);
 const answering = ref(false);
 let unlistenFocus: (() => void) | null = null;
 
@@ -14,14 +14,34 @@ let unlistenFocus: (() => void) | null = null;
  * again each time it appears rather than only on first mount.
  */
 const load = async () => {
-	request.value = await invoke<PermissionRequest | null>('pending_request');
+	question.value = await invoke<Question | null>('pending_request');
 };
 
-const text = computed(() => RESOURCE_TEXT[request.value?.resource_id ?? ''] ?? null);
+/** The permission service knows exactly who is asking and what for. */
+const permission = computed(() =>
+	question.value?.kind === 'permission' ? question.value : null
+);
+
+/**
+ * The portal knows neither, and hands over prose instead. Kept apart from the
+ * case above rather than merged: presenting a portal request as if the program
+ * had been identified would be a claim we cannot make.
+ */
+const portal = computed(() => (question.value?.kind === 'portal' ? question.value : null));
+
+const resourceText = computed(() =>
+	permission.value ? (RESOURCE_TEXT[permission.value.resource_id] ?? null) : null
+);
 
 const title = computed(() => {
-	const name = request.value?.application.display_name ?? '';
-	return text.value ? text.value.title.replace('{0}', name) : '';
+	if (portal.value) return portal.value.title;
+	if (!permission.value || !resourceText.value) return '';
+	return resourceText.value.title.replace('{0}', permission.value.application.display_name);
+});
+
+const explanation = computed(() => {
+	if (portal.value) return portal.value.subtitle || portal.value.body;
+	return resourceText.value?.explanation ?? '';
 });
 
 const answer = async (allowed: boolean) => {
@@ -31,7 +51,7 @@ const answer = async (allowed: boolean) => {
 		await invoke('answer', { allowed });
 	} finally {
 		answering.value = false;
-		request.value = null;
+		question.value = null;
 	}
 };
 
@@ -51,30 +71,45 @@ onUnmounted(() => unlistenFocus?.());
 	<div
 		class="h-screen w-screen select-none rounded-corner-window border border-ui-border bg-ui-bg/95 p-6 flex flex-col gap-4"
 	>
-		<template v-if="request && text">
+		<template v-if="title">
 			<div class="flex flex-col gap-2">
 				<h1 class="text-lg font-semibold text-tx-main">{{ title }}</h1>
-				<p class="text-sm text-tx-muted">{{ text.explanation }}</p>
+				<p v-if="explanation" class="text-sm text-tx-muted">{{ explanation }}</p>
 			</div>
 
-			<p v-if="request.detail" class="text-sm text-tx-main">
-				{{ request.detail }}
+			<p v-if="portal && portal.body && portal.subtitle" class="text-sm text-tx-main">
+				{{ portal.body }}
+			</p>
+			<p v-else-if="permission && permission.detail" class="text-sm text-tx-main">
+				{{ permission.detail }}
 			</p>
 
-			<!-- The user is deciding based on which program is asking, so being
-			     honest about how sure we are is the point, not a detail. -->
-			<p
-				v-if="request.application.provenance === 'unverified'"
-				class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
-			>
-				Este programa no está instalado por el sistema, así que no podemos
-				garantizar que siga siendo el mismo más adelante.
-				<span class="mt-1 block break-all opacity-80">
-					{{ request.application.binary_path }}
+			<template v-if="permission">
+				<!-- The user is deciding based on which program is asking, so being
+				     honest about how sure we are is the point, not a detail. -->
+				<p
+					v-if="permission.application.provenance === 'unverified'"
+					class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
+				>
+					Este programa no está instalado por el sistema, así que no podemos
+					garantizar que siga siendo el mismo más adelante.
+					<span class="mt-1 block break-all opacity-80">
+						{{ permission.application.binary_path }}
+					</span>
+				</p>
+				<p v-else class="break-all text-xs text-tx-muted">
+					{{ permission.application.binary_path }}
+				</p>
+			</template>
+
+			<!-- Nothing to name: the portal passes an app_id that is empty for
+			     anything outside a sandbox, which is nearly everything here. -->
+			<p v-else-if="portal" class="text-xs text-tx-muted">
+				<span v-if="portal.app_id">{{ portal.app_id }}</span>
+				<span v-else>
+					No podemos confirmar qué programa lo está pidiendo: la solicitud llega
+					a través del portal del escritorio, que no lo identifica.
 				</span>
-			</p>
-			<p v-else class="break-all text-xs text-tx-muted">
-				{{ request.application.binary_path }}
 			</p>
 
 			<div class="mt-auto flex justify-end gap-2">

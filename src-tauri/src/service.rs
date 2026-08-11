@@ -37,7 +37,7 @@ impl Agent {
             zbus::fdo::Error::InvalidArgs(format!("consulta de permiso inválida: {error}"))
         })?;
 
-        Ok(crate::dialog::ask(&self.app, request).await)
+        Ok(crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await)
     }
 }
 

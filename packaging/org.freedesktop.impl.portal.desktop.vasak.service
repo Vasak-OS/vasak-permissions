@@ -1,0 +1,6 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.vasak
+# The agent is normally already running as a user service; this lets the portal
+# start it if a request arrives first.
+Exec=/usr/bin/vasak-permissions-agent
+SystemdService=vasak-permissions-agent.service

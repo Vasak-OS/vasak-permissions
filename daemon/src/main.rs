@@ -45,6 +45,27 @@ struct PermissionService {
     throttle: Arc<Mutex<PromptThrottle>>,
 }
 
+/// Rejects anything this service cannot honour.
+///
+/// An unrecognised id is a bug or an attempt to litter the policy with entries
+/// the settings screen can never show. A recognised one that nothing enforces
+/// is worse: the person would be asked a question, the answer would be stored,
+/// and it would change nothing — while looking exactly like a decision that
+/// held.
+fn check_resource(resource_id: &str) -> Result<(), FdoError> {
+    match Resource::from_id(resource_id) {
+        Some(resource) if resource.is_enforceable() => Ok(()),
+        Some(_) => Err(FdoError::NotSupported(format!(
+            "'{resource_id}' todavía no se puede hacer cumplir en VasakOS: \
+             lo entrega PipeWire o el portal de escritorio, que no consultan \
+             este servicio. No se guarda ninguna decisión al respecto."
+        ))),
+        None => Err(FdoError::InvalidArgs(format!(
+            "recurso desconocido: '{resource_id}'"
+        ))),
+    }
+}
+
 /// Pins the caller of the current message and resolves who it is.
 async fn caller_of(
     connection: &Connection,
@@ -172,14 +193,7 @@ impl PermissionService {
         resource_id: String,
         detail: String,
     ) -> zbus::fdo::Result<bool> {
-        // Reject ids the service does not know rather than storing them: an
-        // unrecognised resource is a bug or an attempt to litter the policy
-        // with entries the settings screen can never show or undo.
-        if Resource::from_id(&resource_id).is_none() {
-            return Err(FdoError::InvalidArgs(format!(
-                "recurso desconocido: '{resource_id}'"
-            )));
-        }
+        check_resource(&resource_id)?;
 
         let caller = caller_of(connection, &header).await?;
         self.decide(connection, &caller, &resource_id, detail).await
@@ -204,11 +218,7 @@ impl PermissionService {
         resource_id: String,
         detail: String,
     ) -> zbus::fdo::Result<bool> {
-        if Resource::from_id(&resource_id).is_none() {
-            return Err(FdoError::InvalidArgs(format!(
-                "recurso desconocido: '{resource_id}'"
-            )));
-        }
+        check_resource(&resource_id)?;
 
         let delegate = caller_of(connection, &header).await?;
         if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
@@ -260,11 +270,7 @@ impl PermissionService {
         resource_id: String,
         allowed: bool,
     ) -> zbus::fdo::Result<()> {
-        if Resource::from_id(&resource_id).is_none() {
-            return Err(FdoError::InvalidArgs(format!(
-                "recurso desconocido: '{resource_id}'"
-            )));
-        }
+        check_resource(&resource_id)?;
 
         let caller = caller_of(connection, &header).await?;
         polkit::authorize(connection, &caller).await?;

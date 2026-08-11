@@ -6,9 +6,13 @@
 //! of times in the life of an installation.
 
 mod dialog;
+mod portal;
 mod service;
 
 use tauri::Manager;
+
+/// Keeps the portal's session-bus connection alive in app state.
+struct PortalConnection(#[allow(dead_code)] zbus::Connection);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,6 +34,24 @@ pub fn run() {
                     eprintln!(
                         "[vasak-permissions-agent] no se pudo registrar contra el servicio: {error}"
                     );
+                }
+            });
+
+            // The desktop portal's dialogs, on the session bus. Failing here
+            // costs the portal its VasakOS-looking prompt and nothing else, so
+            // it must not stop the agent from serving the permission service.
+            let portal_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match portal::serve(portal_handle.clone()).await {
+                    Ok(connection) => {
+                        // Held for the life of the process: dropping it would
+                        // give the name back and the portal would fall through
+                        // to another backend mid-session.
+                        portal_handle.manage(PortalConnection(connection));
+                    }
+                    Err(error) => eprintln!(
+                        "[vasak-permissions-agent] sin backend de portal: {error}"
+                    ),
                 }
             });
             Ok(())

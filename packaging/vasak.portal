@@ -1,0 +1,7 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.vasak
+# Only the permission dialog. Screen capture and screenshots stay with
+# xdg-desktop-portal-wlr, which is what actually knows how to capture a wlroots
+# compositor's output — implementing them here would mean reimplementing that.
+Interfaces=org.freedesktop.impl.portal.Access;
+UseIn=VasakOS;

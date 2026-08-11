@@ -105,6 +105,23 @@ pub enum AccountResource {
 }
 
 impl Resource {
+    /// Whether refusing this actually stops anything.
+    ///
+    /// Online accounts are handed out by a service that asks before answering,
+    /// so a refusal is enforced. The camera, the microphone and the screen are
+    /// handed out by PipeWire and the desktop portal, and neither consults this
+    /// policy: a program that goes straight to them is not stopped, and the
+    /// portal cannot even say which program is asking — the identity it passes
+    /// on is empty for anything outside a sandbox.
+    ///
+    /// Requests for the rest are refused outright rather than remembered. A
+    /// decision that changes nothing, and that the settings screen therefore
+    /// does not show, would be worse than no decision: the person could neither
+    /// rely on it nor take it back.
+    pub fn is_enforceable(&self) -> bool {
+        matches!(self, Resource::Account(_))
+    }
+
     /// Stable text form used on the bus and in the stored policy.
     ///
     /// Spelled out by hand rather than derived, because these strings end up in
@@ -300,5 +317,26 @@ mod delegate_tests {
         assert!(!is_delegate("/tmp/vasak-accounts"));
         assert!(!is_delegate("vasak-accounts"));
         assert!(!is_delegate("/usr/bin/anything-else"));
+    }
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::*;
+
+    /// The list has to match what the service actually stands behind. If a
+    /// resource starts being enforced, this is the one place to change.
+    #[test]
+    fn only_online_accounts_are_enforced_today() {
+        assert!(Resource::Account(AccountResource::Email).is_enforceable());
+        assert!(Resource::Account(AccountResource::Drive).is_enforceable());
+
+        // Handed out by PipeWire and the desktop portal, which do not consult
+        // this policy — and the portal cannot say which program is asking.
+        assert!(!Resource::Camera.is_enforceable());
+        assert!(!Resource::Microphone.is_enforceable());
+        assert!(!Resource::ScreenCapture.is_enforceable());
+        assert!(!Resource::Location.is_enforceable());
+        assert!(!Resource::InputCapture.is_enforceable());
     }
 }
