@@ -50,8 +50,25 @@ pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
 /// somebody else.
 pub const DELEGATE_BINARIES: [&str; 1] = ["/usr/bin/vasak-accounts"];
 
+#[cfg(not(debug_assertions))]
 pub fn is_delegate(binary_path: &str) -> bool {
     DELEGATE_BINARIES.contains(&binary_path)
+}
+
+/// Debug builds also accept a delegate that has not been installed yet, so the
+/// chain can be exercised from a working copy. Compiled out of release
+/// entirely rather than guarded at runtime.
+#[cfg(debug_assertions)]
+pub fn is_delegate(binary_path: &str) -> bool {
+    if DELEGATE_BINARIES.contains(&binary_path) {
+        return true;
+    }
+
+    std::env::var_os("VASAK_PERMISSIONS_TEST_ROOT").is_some()
+        && DELEGATE_BINARIES.iter().any(|installed| {
+            std::path::Path::new(installed).file_name()
+                == std::path::Path::new(binary_path).file_name()
+        })
 }
 
 // ── Resources ───────────────────────────────────────────────────────────────
