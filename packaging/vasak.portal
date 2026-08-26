@@ -4,4 +4,12 @@ DBusName=org.freedesktop.impl.portal.desktop.vasak
 # xdg-desktop-portal-wlr, which is what actually knows how to capture a wlroots
 # compositor's output — implementing them here would mean reimplementing that.
 Interfaces=org.freedesktop.impl.portal.Access;
-UseIn=VasakOS;
+# `Vasak`, que es lo que la sesión exporta en XDG_CURRENT_DESKTOP. Decía
+# «VasakOS» y no coincidía con nada, así que ni por este camino —el obsoleto— el
+# portal elegía este backend: caía en «last-resort fallback» y todos los permisos
+# los preguntaba el diálogo de GTK.
+#
+# La forma que corresponde hoy es `vasak-portals.conf`, que entrega
+# vasak-desktop-settings. Esta clave queda como red de seguridad para una
+# instalación donde ese archivo falte.
+UseIn=Vasak;
