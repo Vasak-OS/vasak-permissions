@@ -186,6 +186,17 @@ fn matching_entry_name(contents: &str, executable: &Path, file_name: &str) -> Op
     matches.then_some(name).flatten()
 }
 
+/// Describes a program by path alone, for entries the settings screen manages
+/// on behalf of a program that is not currently running.
+pub fn describe_path(binary_path: &str) -> Application {
+    let path = PathBuf::from(binary_path);
+    Application {
+        binary_path: binary_path.to_string(),
+        display_name: display_name_for(&path),
+        provenance: provenance_of(&path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,16 +295,5 @@ mod tests {
             display_name_for(Path::new("/usr/bin/definitely-not-installed-xyz")),
             "definitely-not-installed-xyz"
         );
-    }
-}
-
-/// Describes a program by path alone, for entries the settings screen manages
-/// on behalf of a program that is not currently running.
-pub fn describe_path(binary_path: &str) -> Application {
-    let path = PathBuf::from(binary_path);
-    Application {
-        binary_path: binary_path.to_string(),
-        display_name: display_name_for(&path),
-        provenance: provenance_of(&path),
     }
 }
