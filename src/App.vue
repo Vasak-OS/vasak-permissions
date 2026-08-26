@@ -18,9 +18,7 @@ const load = async () => {
 };
 
 /** The permission service knows exactly who is asking and what for. */
-const permission = computed(() =>
-	question.value?.kind === 'permission' ? question.value : null
-);
+const permission = computed(() => (question.value?.kind === 'permission' ? question.value : null));
 
 /**
  * The portal knows neither, and hands over prose instead. Kept apart from the

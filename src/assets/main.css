@@ -1,3 +1,7 @@
+/* biome-ignore-all lint/style/noDescendingSpecificity: el `body *` de más abajo
+   fija el color del texto y el bloque de `@layer base` fija `border-color`. La
+   regla compara selectores sin mirar qué propiedad tocan, así que ve un conflicto
+   donde no hay ninguno: ninguna de las dos declaraciones puede pisar a la otra. */
 @import "tailwindcss";
 
 :root {
@@ -133,7 +137,6 @@
   --color-status-success: var(--use-status-success);
   --color-status-warning: var(--use-status-warning);
 }
-
 
 ::view-transition-old(root) {
   animation-delay: 500ms;
