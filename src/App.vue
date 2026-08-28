@@ -92,7 +92,7 @@ onUnmounted(() => unlistenFocus?.());
 					Este programa no está instalado por el sistema, así que no podemos
 					garantizar que siga siendo el mismo más adelante.
 					<span
-						class="mt-1 block line-clamp-2 break-all opacity-80"
+						class="mt-1 line-clamp-2 break-all opacity-80"
 						:title="permission.application.binary_path"
 					>
 						{{ permission.application.binary_path }}

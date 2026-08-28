@@ -93,9 +93,14 @@ app.use(pinia);
 // dos segundos, así que un destello en claro y después el cambio se ve peor que
 // la espera. Si la configuración no contesta, con los colores por omisión sigue
 // siendo un diálogo usable; lo que no puede es no aparecer.
-const configuracion = useConfigStore() as Store<
+// `loadConfig` va en el cuarto parámetro, que es el de las acciones: metida en
+// el segundo —el del estado— la aserción esconde su firma real y `vue-tsc` deja
+// de comprobar la llamada.
+const configuracion = useConfigStore() as unknown as Store<
 	'config',
-	{ config: unknown; loadConfig: () => Promise<void> }
+	{ config: unknown },
+	Record<string, never>,
+	{ loadConfig: () => Promise<void> }
 >;
 
 await Promise.race([
