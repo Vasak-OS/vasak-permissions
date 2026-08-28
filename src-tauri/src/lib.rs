@@ -6,6 +6,7 @@
 //! of times in the life of an installation.
 
 mod dialog;
+mod locales;
 mod portal;
 mod service;
 
@@ -17,6 +18,10 @@ struct PortalConnection(#[allow(dead_code)] zbus::Connection);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_i18n_vsk::init_with_path(
+            Some(locales::idioma_del_sistema()),
+            locales::directorio(),
+        ))
         .plugin(tauri_plugin_config_manager::init())
         .plugin(tauri_plugin_vicons::init())
         .invoke_handler(tauri::generate_handler![

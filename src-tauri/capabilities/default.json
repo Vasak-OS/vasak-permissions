@@ -13,6 +13,10 @@
     "core:window:allow-minimize",
     "core:window:allow-close",
     "vicons:default",
-    "config-manager:default"
+    "config-manager:default",
+    "i18n:allow-load-translations",
+    "i18n:allow-get-available-locales",
+    "i18n:allow-get-locale",
+    "i18n:allow-set-locale"
   ]
 }

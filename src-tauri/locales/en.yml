@@ -1,0 +1,51 @@
+_version: 1
+
+dialog:
+  allow: Allow
+  deny: Don't allow
+  empty: No pending requests
+  unverified: >-
+    This program was not installed by the system, so we cannot guarantee it will
+    still be the same one later.
+  unknownRequester: >-
+    We cannot confirm which program is asking: the request comes through the
+    desktop portal, which does not identify it.
+
+resources:
+  camera:
+    title: Let {0} use the camera?
+    explanation: It will be able to see and record whatever the camera captures while you use it.
+  microphone:
+    title: Let {0} use the microphone?
+    explanation: It will be able to hear and record what you say while you use it.
+  screen-capture:
+    title: Let {0} see your screen?
+    explanation: >-
+      It will be able to see and record everything on screen, including other
+      applications and what you type in them.
+  location:
+    title: Let {0} know where you are?
+    explanation: It will be able to know your approximate location.
+  input-capture:
+    title: Let {0} read the keyboard?
+    explanation: >-
+      It will be able to see everything you type, in other applications too, and
+      your passwords as well.
+  account.email:
+    title: Let {0} access your email?
+    explanation: It will be able to read and send email from the account you choose.
+  account.calendar:
+    title: Let {0} access your calendar?
+    explanation: It will be able to see and change your events.
+  account.contacts:
+    title: Let {0} access your contacts?
+    explanation: It will be able to see and change your address book.
+  account.chat:
+    title: Let {0} access your messages?
+    explanation: It will be able to read and send messages from your account.
+  account.drive:
+    title: Let {0} access your files in the cloud?
+    explanation: It will be able to see, change and upload files to your account.
+  account.tasks:
+    title: Let {0} access your tasks?
+    explanation: It will be able to see and change your task lists.

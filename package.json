@@ -17,6 +17,7 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@vasakgroup/plugin-config-manager": "^2.2.6",
+    "@vasakgroup/tauri-plugin-i18n": "^2.1.0",
     "@vasakgroup/plugin-vicons": "^2.1.2",
     "path": "^0.12.7",
     "pinia": "^3.0.4",

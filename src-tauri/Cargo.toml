@@ -22,6 +22,7 @@ vasak-permissions-protocol.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-vicons = "2"
 tauri-plugin-config-manager = "2"
+tauri-plugin-i18n-vsk = "2.1.1"
 serde.workspace = true
 serde_json.workspace = true
 zbus.workspace = true
