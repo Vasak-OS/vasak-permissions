@@ -1,4 +1,5 @@
-import { createPinia } from 'pinia';
+import { useConfigStore } from '@vasakgroup/plugin-config-manager';
+import { createPinia, type Store } from 'pinia';
 import { createApp } from 'vue';
 import App from '@/App.vue';
 import { disableNativeContextMenu } from '@/tools/native-menu';
@@ -73,11 +74,35 @@ document.addEventListener('securitypolicyviolation', (evento) => {
 	);
 });
 
+/** Cuánto se espera a los colores antes de montar. */
+const PLAZO_CONFIGURACION_MS = 1500;
+
 disableNativeContextMenu();
 
 const app = createApp(App);
 const pinia = createPinia();
 
 app.use(pinia);
+
+// Los colores llegan por la configuración, como en el resto del escritorio, y
+// acá nadie los pedía: el diálogo salía con la paleta clara por omisión aunque
+// la sesión estuviera en oscuro. Se ve enseguida, porque este diálogo aparece
+// encima de lo que sea que estés haciendo.
+//
+// Antes de montar, y con plazo: esta ventana se abre de golpe y se responde en
+// dos segundos, así que un destello en claro y después el cambio se ve peor que
+// la espera. Si la configuración no contesta, con los colores por omisión sigue
+// siendo un diálogo usable; lo que no puede es no aparecer.
+const configuracion = useConfigStore() as Store<
+	'config',
+	{ config: unknown; loadConfig: () => Promise<void> }
+>;
+
+await Promise.race([
+	configuracion.loadConfig().catch((error: unknown) => {
+		console.error('No se pudo cargar la configuración', error);
+	}),
+	new Promise((resolve) => setTimeout(resolve, PLAZO_CONFIGURACION_MS)),
+]);
 
 app.mount('#app');
