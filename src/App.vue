@@ -81,7 +81,7 @@ onUnmounted(() => unlistenFocus?.());
 
 <template>
 	<div
-		class="h-screen w-screen select-none rounded-corner-window border border-ui-border bg-ui-bg/95 p-6 flex flex-col gap-4"
+		class="h-screen w-screen select-none rounded-corner-window border border-ui-border bg-ui-bg/80 p-6 flex flex-col gap-4"
 	>
 		<template v-if="title">
 			<div class="flex flex-col gap-2">
@@ -104,11 +104,18 @@ onUnmounted(() => unlistenFocus?.());
 					class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
 				>
 					{{ t('dialog.unverified') }}
-					<span class="mt-1 block break-all opacity-80">
+					<span
+						class="mt-1 line-clamp-2 break-all opacity-80"
+						:title="permission.application.binary_path"
+					>
 						{{ permission.application.binary_path }}
 					</span>
 				</p>
-				<p v-else class="break-all text-xs text-tx-muted">
+				<p
+					v-else
+					class="line-clamp-2 break-all text-xs text-tx-muted"
+					:title="permission.application.binary_path"
+				>
 					{{ permission.application.binary_path }}
 				</p>
 			</template>
