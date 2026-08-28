@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { RESOURCE_TEXT } from '@/resources';
+import { esRecursoConocido } from '@/resources';
 import type { Question } from '@/types/permissions';
 
 const question = ref<Question | null>(null);
@@ -18,6 +19,8 @@ const load = async () => {
 };
 
 /** The permission service knows exactly who is asking and what for. */
+const { t } = useI18n();
+
 const permission = computed(() => (question.value?.kind === 'permission' ? question.value : null));
 
 /**
@@ -27,19 +30,30 @@ const permission = computed(() => (question.value?.kind === 'permission' ? quest
  */
 const portal = computed(() => (question.value?.kind === 'portal' ? question.value : null));
 
-const resourceText = computed(() =>
-	permission.value ? (RESOURCE_TEXT[permission.value.resource_id] ?? null) : null
-);
+/**
+ * El recurso pedido, si es uno que este diálogo sabe describir.
+ *
+ * Con un id desconocido no se arma la clave: `t('resources.loquesea.title')`
+ * devolvería la clave cruda, y ésta es la pantalla donde menos se puede
+ * permitir un texto así.
+ */
+const recurso = computed(() => {
+	const id = permission.value?.resource_id;
+	return id && esRecursoConocido(id) ? id : null;
+});
 
 const title = computed(() => {
 	if (portal.value) return portal.value.title;
-	if (!permission.value || !resourceText.value) return '';
-	return resourceText.value.title.replace('{0}', permission.value.application.display_name);
+	if (!permission.value || !recurso.value) return '';
+	return t(`resources.${recurso.value}.title`).replace(
+		'{0}',
+		permission.value.application.display_name
+	);
 });
 
 const explanation = computed(() => {
 	if (portal.value) return portal.value.subtitle || portal.value.body;
-	return resourceText.value?.explanation ?? '';
+	return recurso.value ? t(`resources.${recurso.value}.explanation`) : '';
 });
 
 const answer = async (allowed: boolean) => {
@@ -89,8 +103,7 @@ onUnmounted(() => unlistenFocus?.());
 					v-if="permission.application.provenance === 'unverified'"
 					class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
 				>
-					Este programa no está instalado por el sistema, así que no podemos
-					garantizar que siga siendo el mismo más adelante.
+					{{ t('dialog.unverified') }}
 					<span
 						class="mt-1 line-clamp-2 break-all opacity-80"
 						:title="permission.application.binary_path"
@@ -111,10 +124,7 @@ onUnmounted(() => unlistenFocus?.());
 			     anything outside a sandbox, which is nearly everything here. -->
 			<p v-else-if="portal" class="text-xs text-tx-muted">
 				<span v-if="portal.app_id">{{ portal.app_id }}</span>
-				<span v-else>
-					No podemos confirmar qué programa lo está pidiendo: la solicitud llega
-					a través del portal del escritorio, que no lo identifica.
-				</span>
+				<span v-else>{{ t('dialog.unknownRequester') }}</span>
 			</p>
 
 			<div class="mt-auto flex justify-end gap-2">
@@ -127,7 +137,7 @@ onUnmounted(() => unlistenFocus?.());
 					class="rounded-corner border border-ui-border px-4 py-2 text-sm text-tx-main hover:bg-ui-surface disabled:opacity-50"
 					@click="answer(false)"
 				>
-					No permitir
+					{{ t('dialog.deny') }}
 				</button>
 				<button
 					type="button"
@@ -135,11 +145,11 @@ onUnmounted(() => unlistenFocus?.());
 					class="rounded-corner bg-primary px-4 py-2 text-sm font-semibold text-tx-on-primary hover:bg-secondary disabled:opacity-50"
 					@click="answer(true)"
 				>
-					Permitir
+					{{ t('dialog.allow') }}
 				</button>
 			</div>
 		</template>
 
-		<p v-else class="m-auto text-sm text-tx-muted">Sin consultas pendientes</p>
+		<p v-else class="m-auto text-sm text-tx-muted">{{ t('dialog.empty') }}</p>
 	</div>
 </template>

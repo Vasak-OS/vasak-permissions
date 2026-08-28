@@ -1,0 +1,51 @@
+_version: 1
+
+dialog:
+  allow: Permitir
+  deny: No permitir
+  empty: Sin consultas pendientes
+  unverified: >-
+    Este programa no está instalado por el sistema, así que no podemos
+    garantizar que siga siendo el mismo más adelante.
+  unknownRequester: >-
+    No podemos confirmar qué programa lo está pidiendo: la solicitud llega a
+    través del portal del escritorio, que no lo identifica.
+
+resources:
+  camera:
+    title: ¿Querés que {0} use la cámara?
+    explanation: Va a poder ver y grabar lo que capte la cámara mientras lo uses.
+  microphone:
+    title: ¿Querés que {0} use el micrófono?
+    explanation: Va a poder escuchar y grabar lo que digas mientras lo uses.
+  screen-capture:
+    title: ¿Querés que {0} vea tu pantalla?
+    explanation: >-
+      Va a poder ver y grabar todo lo que se muestre, incluidas otras
+      aplicaciones y lo que escribas en ellas.
+  location:
+    title: ¿Querés que {0} sepa dónde estás?
+    explanation: Va a poder conocer tu ubicación aproximada.
+  input-capture:
+    title: ¿Querés que {0} lea el teclado?
+    explanation: >-
+      Va a poder ver todo lo que escribas, también en otras aplicaciones y
+      también tus contraseñas.
+  account.email:
+    title: ¿Querés que {0} acceda a tu correo?
+    explanation: Va a poder leer y enviar correo desde la cuenta que elijas.
+  account.calendar:
+    title: ¿Querés que {0} acceda a tu calendario?
+    explanation: Va a poder ver y modificar tus eventos.
+  account.contacts:
+    title: ¿Querés que {0} acceda a tus contactos?
+    explanation: Va a poder ver y modificar tu libreta de direcciones.
+  account.chat:
+    title: ¿Querés que {0} acceda a tus mensajes?
+    explanation: Va a poder leer y enviar mensajes desde tu cuenta.
+  account.drive:
+    title: ¿Querés que {0} acceda a tus archivos en la nube?
+    explanation: Va a poder ver, modificar y subir archivos a tu cuenta.
+  account.tasks:
+    title: ¿Querés que {0} acceda a tus tareas?
+    explanation: Va a poder ver y modificar tus listas de tareas.
