@@ -340,3 +340,27 @@ mod enforcement_tests {
         assert!(!Resource::InputCapture.is_enforceable());
     }
 }
+
+#[cfg(test)]
+mod policy_tests {
+    /// La política de D-Bus tiene que dejar al servicio hablarle al agente.
+    ///
+    /// Sin esa regla el servicio no puede llamarlo —en el bus del sistema los
+    /// method calls se deniegan por omisión— y se cae el flujo entero de
+    /// preguntar, en silencio y sin que nada deje de compilar. Fue exactamente
+    /// lo que pasó: el diálogo de permisos nunca llegaba a aparecer.
+    ///
+    /// Se comprueba contra el archivo que se instala, y usando la constante,
+    /// para que renombrar la interfaz acá haga fallar la prueba en vez de
+    /// romper el sistema en silencio.
+    #[test]
+    fn the_bus_policy_lets_the_service_reach_the_agent() {
+        let policy = include_str!("../../packaging/ar.net.vasak.os.Permissions.conf");
+        let rule = format!("<allow send_interface=\"{}\"/>", super::AGENT_INTERFACE);
+        assert!(
+            policy.contains(&rule),
+            "la política instalada no deja al servicio llamar al agente; \
+             falta la regla: {rule}"
+        );
+    }
+}
