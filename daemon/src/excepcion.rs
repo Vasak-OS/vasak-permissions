@@ -36,6 +36,8 @@
 // Este `allow` se saca en cuanto exista quien lo llame.
 #![allow(dead_code)]
 
+use vasak_permissions_protocol::Resource;
+
 /// Por qué una ruta no puede tener excepción.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Motivo {
@@ -90,18 +92,38 @@ pub fn nombre_de(ruta: &str) -> String {
     nombre
 }
 
+/// Lo que el perfil general niega, y cómo se escribe cada negación.
+///
+/// Tiene que ser lo mismo que hay en `/etc/apparmor.d/vasak-appimage`: si allá
+/// se agrega una negación y acá no, una excepción parcial la levantaría sin
+/// querer.
+const NEGACIONES: &[(Resource, &str)] = &[
+    (Resource::Camera, "audit deny /dev/video* rwk,"),
+    (Resource::Microphone, "audit deny /dev/snd/pcmC*D*c rwk,"),
+];
+
 /// El texto del perfil de excepción para esa ruta.
 ///
-/// Permite todo y no niega nada: es el perfil general menos las negaciones. No
-/// se deja "sin perfil" a secas porque entonces ganaría el general, que es el
-/// que bloquea.
-pub fn perfil_para(ruta: &str) -> Result<String, Motivo> {
+/// `permitidos` son los recursos que esta aplicación **sí** puede usar. Los que
+/// no estén en esa lista se siguen negando acá.
+///
+/// Esa distinción es el punto: una excepción sin negaciones devolvería de una
+/// vez todo lo que el perfil general quita, así que permitir la cámara
+/// permitiría también el micrófono. Un permiso que concede de más es peor que
+/// no tenerlo, porque quien lo dio cree que dio otra cosa.
+pub fn perfil_para(ruta: &str, permitidos: &[Resource]) -> Result<String, Motivo> {
     if !ruta.starts_with('/') {
         return Err(Motivo::NoEsAbsoluta);
     }
     if let Some(c) = ruta.chars().find(|c| AMBIGUOS.contains(c)) {
         return Err(Motivo::CaracterAmbiguo(c));
     }
+
+    let negaciones: String = NEGACIONES
+        .iter()
+        .filter(|(recurso, _)| !permitidos.contains(recurso))
+        .map(|(_, regla)| format!("\n  {regla}\n"))
+        .collect();
 
     Ok(format!(
         r#"# ARCHIVO GENERADO — no editar a mano.
@@ -120,7 +142,9 @@ abi <abi/4.0>,
 include <tunables/global>
 
 profile {nombre} "{ruta}" {{
-  # Todo permitido y nada negado: es el perfil general menos las negaciones.
+  # Todo permitido, y después se vuelve a negar lo que esta aplicación no tiene
+  # concedido. Sin las negaciones de abajo, la excepción devolvería de una vez
+  # todo lo que el perfil general quita.
   file,
   network,
   unix,
@@ -135,12 +159,13 @@ profile {nombre} "{ruta}" {{
   io_uring,
   mqueue,
   userns,
-
+{negaciones}
   include if exists <local/{nombre}>
 }}
 "#,
         nombre = nombre_de(ruta),
-        ruta = ruta
+        ruta = ruta,
+        negaciones = negaciones,
     ))
 }
 
@@ -150,21 +175,59 @@ mod tests {
 
     #[test]
     fn el_perfil_engancha_la_ruta_exacta_y_no_niega_nada() {
-        let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage").unwrap();
+        let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
         assert!(perfil.contains(r#""/home/alguien/Apps/cosa.AppImage""#));
-        assert!(!perfil.contains("deny"), "una excepción no puede negar nada");
         assert!(perfil.contains("file,"));
     }
 
     /// El caso real: el AppImage del equipo de pruebas tiene espacios.
     #[test]
     fn una_ruta_con_espacios_se_acepta_y_queda_entre_comillas() {
-        let perfil = perfil_para("/home/pato/Apps/App Monitor_0.1.0.AppImage").unwrap();
+        let perfil = perfil_para("/home/pato/Apps/App Monitor_0.1.0.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
         assert!(perfil.contains(r#""/home/pato/Apps/App Monitor_0.1.0.AppImage""#));
     }
 
     /// Lo importante de todo el módulo. Una ruta con comodines produciría una
     /// excepción que cubre aplicaciones que nadie autorizó.
+    /// El motivo de todo este cambio: permitir la cámara no puede regalar el
+    /// micrófono de yapa.
+    #[test]
+    fn permitir_uno_no_permite_el_otro() {
+        let solo_camara = perfil_para("/home/x/a.AppImage", &[Resource::Camera]).unwrap();
+        assert!(
+            !solo_camara.contains("/dev/video"),
+            "sigue negando la cámara, que es lo que se permitió"
+        );
+        assert!(
+            solo_camara.contains("deny /dev/snd/pcmC*D*c"),
+            "dejó de negar el micrófono, que nadie permitió"
+        );
+    }
+
+    #[test]
+    fn permitir_el_microfono_es_simetrico() {
+        let solo_micro = perfil_para("/home/x/a.AppImage", &[Resource::Microphone]).unwrap();
+        assert!(solo_micro.contains("deny /dev/video*"));
+        assert!(!solo_micro.contains("/dev/snd"));
+    }
+
+    /// Una excepción sin nada permitido no tiene sentido, pero si llegara no
+    /// puede terminar concediendo: tiene que negar todo lo que el general niega.
+    #[test]
+    fn una_excepcion_vacia_no_concede_nada() {
+        let ninguno = perfil_para("/home/x/a.AppImage", &[]).unwrap();
+        assert!(ninguno.contains("deny /dev/video*"));
+        assert!(ninguno.contains("deny /dev/snd/pcmC*D*c"));
+    }
+
+    /// Y el caso completo sí devuelve todo.
+    #[test]
+    fn permitir_los_dos_no_deja_ninguna_negacion() {
+        let ambos =
+            perfil_para("/home/x/a.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
+        assert!(!ambos.contains("deny"));
+    }
+
     #[test]
     fn las_rutas_con_comodines_se_rechazan() {
         for ruta in [
@@ -174,7 +237,7 @@ mod tests {
             "/home/x/{a,b}.AppImage",
         ] {
             assert!(
-                matches!(perfil_para(ruta), Err(Motivo::CaracterAmbiguo(_))),
+                matches!(perfil_para(ruta, &[]), Err(Motivo::CaracterAmbiguo(_))),
                 "se aceptó una ruta con comodín: {ruta}"
             );
         }
@@ -184,15 +247,15 @@ mod tests {
     /// convertir el resto de la ruta en otra cosa.
     #[test]
     fn las_rutas_que_romperian_la_sintaxis_se_rechazan() {
-        assert!(perfil_para("/home/x/co\"sa.AppImage").is_err());
-        assert!(perfil_para("/home/x/co\\sa.AppImage").is_err());
-        assert!(perfil_para("/home/x/dos\nlineas").is_err());
+        assert!(perfil_para("/home/x/co\"sa.AppImage", &[]).is_err());
+        assert!(perfil_para("/home/x/co\\sa.AppImage", &[Resource::Camera, Resource::Microphone]).is_err());
+        assert!(perfil_para("/home/x/dos\nlineas", &[Resource::Camera, Resource::Microphone]).is_err());
     }
 
     #[test]
     fn una_ruta_relativa_no_sirve_de_enganche() {
-        assert_eq!(perfil_para("cosa.AppImage"), Err(Motivo::NoEsAbsoluta));
-        assert_eq!(perfil_para(""), Err(Motivo::NoEsAbsoluta));
+        assert_eq!(perfil_para("cosa.AppImage", &[Resource::Camera, Resource::Microphone]), Err(Motivo::NoEsAbsoluta));
+        assert_eq!(perfil_para("", &[Resource::Camera, Resource::Microphone]), Err(Motivo::NoEsAbsoluta));
     }
 
     /// Dos rutas distintas no pueden compartir nombre de perfil: la segunda
