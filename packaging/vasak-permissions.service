@@ -27,6 +27,12 @@ PrivateDevices=yes
 #
 # Con el `-` delante para que el servicio arranque igual en un kernel sin él.
 BindReadOnlyPaths=-/dev/kmsg
+# Y el permiso, además del montaje: `PrivateDevices` implica
+# `DevicePolicy=closed`, así que montar el nodo lo hace visible pero no
+# accesible. En una unidad **del sistema** ese filtro sí se aplica —en una de
+# usuario no, porque el gestor sin privilegios no puede cargar el programa BPF
+# que lo implementa—, y ésta corre como root.
+DeviceAllow=/dev/kmsg r
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

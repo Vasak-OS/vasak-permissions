@@ -14,7 +14,7 @@
 
 use tauri::AppHandle;
 use tauri_plugin_i18n_vsk::PluginI18nExt;
-use vasak_permissions_protocol::PermissionRequest;
+use vasak_permissions_protocol::{PermissionRequest, Resource};
 
 /// El icono de cada recurso, con nombres del tema de iconos.
 fn icono_de(resource_id: &str) -> &'static str {
@@ -22,6 +22,23 @@ fn icono_de(resource_id: &str) -> &'static str {
         "microphone" => "audio-input-microphone",
         _ => "camera-web",
     }
+}
+
+/// Si este aviso es de un recurso del que sabemos hablar.
+///
+/// El método de D-Bus que recibe los avisos está expuesto en el bus del
+/// sistema, así que en principio lo puede llamar cualquier proceso local y no
+/// sólo el servicio de permisos. Sin esto, alguien podría hacer aparecer una
+/// notificación con la marca de VasakOS y el texto que quisiera.
+///
+/// Se aceptan los dos recursos que los perfiles de AppArmor niegan, que son los
+/// únicos para los que hay texto traducido: cualquier otro terminaría mostrando
+/// la clave cruda.
+pub fn se_avisa_de(resource_id: &str) -> bool {
+    matches!(
+        Resource::from_id(resource_id),
+        Some(Resource::Camera) | Some(Resource::Microphone)
+    )
 }
 
 /// El texto del aviso, ya traducido y con el nombre de la aplicación puesto.
@@ -103,6 +120,23 @@ mod tests {
     #[test]
     fn una_plantilla_sin_marcador_no_rompe() {
         assert_eq!(texto("Se bloqueó la cámara", "App"), "Se bloqueó la cámara");
+    }
+
+    #[test]
+    fn solo_se_avisa_de_lo_que_los_perfiles_niegan() {
+        assert!(se_avisa_de("camera"));
+        assert!(se_avisa_de("microphone"));
+    }
+
+    /// Lo demás no: no hay texto traducido para esos recursos, y el método está
+    /// expuesto en el bus del sistema.
+    #[test]
+    fn no_se_avisa_de_cualquier_cosa_que_llegue_por_el_bus() {
+        assert!(!se_avisa_de("screen-capture"));
+        assert!(!se_avisa_de("location"));
+        assert!(!se_avisa_de("account.email"));
+        assert!(!se_avisa_de("inventado"));
+        assert!(!se_avisa_de(""));
     }
 
     #[test]

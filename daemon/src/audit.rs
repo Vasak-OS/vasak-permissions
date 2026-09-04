@@ -126,6 +126,15 @@ use std::time::{Duration, Instant};
 /// esto, un solo intento fallido se convierte en una lluvia de notificaciones.
 const SILENCIO: Duration = Duration::from_secs(300);
 
+/// Cuántos avisos pueden estar en vuelo a la vez.
+const AVISOS_A_LA_VEZ: usize = 4;
+
+fn cupo() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static CUPO: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    CUPO.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AVISOS_A_LA_VEZ)))
+}
+
 /// Sigue el registro del kernel y avisa de lo que nuestros perfiles bloquean.
 ///
 /// Nunca termina; se lanza como tarea de fondo. Si `/dev/kmsg` no se puede
@@ -165,7 +174,7 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
         }
     });
 
-    let mut recientes: HashMap<(String, String), Instant> = HashMap::new();
+    let mut recientes: HashMap<(u32, String, String), Instant> = HashMap::new();
     while let Some(denegacion) = recepcion.recv().await {
         let Some(recurso) = recurso_de(&denegacion.ruta) else {
             // Un perfil nuestro negó algo que este módulo no sabe nombrar.
@@ -194,7 +203,9 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
         };
         let aplicacion = proceso.describe();
 
-        let clave = (aplicacion.binary_path.clone(), recurso.as_id());
+        // El uid va en la clave: si dos personas con sesión abierta usan la
+        // misma aplicación, callar a una no puede callar a la otra.
+        let clave = (denegacion.uid, aplicacion.binary_path.clone(), recurso.as_id());
         let ahora = Instant::now();
         if let Some(anterior) = recientes.get(&clave) {
             if ahora.duration_since(*anterior) < SILENCIO {
@@ -211,8 +222,29 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
             aplicacion.binary_path,
             denegacion.uid
         );
-        crate::agent::avisar_de_bloqueo(&connection, &agents, denegacion.uid, &aplicacion, &recurso)
-            .await;
+        // Aparte, y no `await` acá. Este bucle es el único que vacía el canal
+        // que alimenta el hilo lector de /dev/kmsg: si se queda esperando a un
+        // agente lento, el canal se llena, el lector se bloquea al enviar y el
+        // kernel sigue rotando su registro. Se perderían denegaciones por
+        // esperar a una notificación.
+        //
+        // El cupo evita que un aluvión de aplicaciones distintas —que el
+        // silencio de arriba no cubre, porque son claves distintas— abra tareas
+        // sin techo.
+        let permiso = match cupo().clone().try_acquire_owned() {
+            Ok(permiso) => permiso,
+            Err(_) => {
+                tracing::debug!("Demasiados avisos a la vez; se descarta uno");
+                continue;
+            }
+        };
+        let connection = connection.clone();
+        let agents = agents.clone();
+        let uid = denegacion.uid;
+        tokio::spawn(async move {
+            let _permiso = permiso;
+            crate::agent::avisar_de_bloqueo(&connection, &agents, uid, &aplicacion, &recurso).await;
+        });
     }
 }
 
