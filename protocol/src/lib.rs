@@ -108,11 +108,26 @@ impl Resource {
     /// Whether refusing this actually stops anything.
     ///
     /// Online accounts are handed out by a service that asks before answering,
-    /// so a refusal is enforced. The camera, the microphone and the screen are
-    /// handed out by PipeWire and the desktop portal, and neither consults this
-    /// policy: a program that goes straight to them is not stopped, and the
-    /// portal cannot even say which program is asking — the identity it passes
-    /// on is empty for anything outside a sandbox.
+    /// so a refusal is enforced.
+    ///
+    /// The camera and the microphone are now **partly** enforced, which is why
+    /// this still answers no for them. An AppArmor profile denies the device
+    /// nodes to applications the system did not install, and this service
+    /// writes a per-application exception when somebody allows one. But that
+    /// only covers the direct route: a program that asks PipeWire instead of
+    /// opening the device — which is what modern applications do — is still not
+    /// stopped, and neither is a program no profile covers, such as anything
+    /// the package manager installed.
+    ///
+    /// Saying yes here would overstate it. Whoever asks this question wants to
+    /// know whether a refusal can be relied upon, and for those two it cannot
+    /// be yet.
+    ///
+    /// The screen, the location and the keyboard are handed out by PipeWire and
+    /// the desktop portal, and neither consults this policy: a program that
+    /// goes straight to them is not stopped, and the portal cannot even say
+    /// which program is asking — the identity it passes on is empty for
+    /// anything outside a sandbox.
     ///
     /// Requests for the rest are refused outright rather than remembered. A
     /// decision that changes nothing, and that the settings screen therefore

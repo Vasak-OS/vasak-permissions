@@ -27,15 +27,6 @@
 //! se queda sin excepción, y eso es mucho mejor que una excepción que cubra de
 //! más sin que nadie se entere.
 
-// Todavía no lo llama nadie, y es a propósito: esto se escribió y se validó
-// aparte —el mecanismo se comprobó a mano con dos aplicaciones de prueba— antes
-// de conectarlo a un botón. Decidir *cuándo* se concede una excepción tiene
-// preguntas abiertas: si vale para siempre o por una vez, y qué pasa cuando la
-// aplicación se actualiza y la ruta ya no contiene el mismo binario.
-//
-// Este `allow` se saca en cuanto exista quien lo llame.
-#![allow(dead_code)]
-
 use vasak_permissions_protocol::Resource;
 
 /// Por qué una ruta no puede tener excepción.
@@ -169,9 +160,133 @@ profile {nombre} "{ruta}" {{
     ))
 }
 
+// ── Ponerlas y sacarlas ─────────────────────────────────────────────────────
+
+/// Dónde viven los perfiles de excepción.
+///
+/// El mismo directorio que los demás, y con el prefijo `vasak-`, para que el
+/// cargador del sistema —que toma `/etc/apparmor.d/vasak-*`— los cargue solos
+/// en cada arranque. Una excepción tiene que sobrevivir al reinicio: es una
+/// decisión que la persona tomó, no un estado de la sesión.
+const DIRECTORIO: &str = "/etc/apparmor.d";
+
+/// Aplica lo decidido para una aplicación.
+///
+/// `permitidos` es la lista completa de lo que esa aplicación tiene concedido,
+/// no un agregado: se pasa entera cada vez y el perfil se reescribe. Así el
+/// archivo en disco siempre refleja la decisión guardada, en lugar de ser el
+/// resultado de una sucesión de cambios que puede haberse desincronizado.
+///
+/// Sin nada permitido no queda un perfil que no permite nada: se **borra**. El
+/// perfil general vuelve a ser el que engancha, que es exactamente el estado
+/// original.
+pub fn aplicar(binary_path: &str, permitidos: &[Resource]) -> Result<(), String> {
+    let archivo = std::path::Path::new(DIRECTORIO).join(nombre_de(binary_path));
+
+    if permitidos.is_empty() {
+        if !archivo.exists() {
+            return Ok(());
+        }
+        // Se descarga antes de borrar: al revés, el perfil quedaría cargado en
+        // el kernel sin archivo que lo respalde, y seguiría permitiendo hasta
+        // el próximo reinicio sin que nada lo delate.
+        descargar(&archivo)?;
+        return std::fs::remove_file(&archivo)
+            .map_err(|e| format!("no se pudo borrar {}: {e}", archivo.display()));
+    }
+
+    let contenido = perfil_para(binary_path, permitidos).map_err(|motivo| motivo.to_string())?;
+    std::fs::write(&archivo, contenido)
+        .map_err(|e| format!("no se pudo escribir {}: {e}", archivo.display()))?;
+    cargar(&archivo)
+}
+
+fn cargar(archivo: &std::path::Path) -> Result<(), String> {
+    correr_parser(&["--replace"], archivo)
+}
+
+fn descargar(archivo: &std::path::Path) -> Result<(), String> {
+    correr_parser(&["--remove"], archivo)
+}
+
+fn correr_parser(argumentos: &[&str], archivo: &std::path::Path) -> Result<(), String> {
+    let salida = std::process::Command::new("apparmor_parser")
+        .args(argumentos)
+        .arg(archivo)
+        .output()
+        .map_err(|e| format!("no se pudo ejecutar apparmor_parser: {e}"))?;
+    if salida.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "apparmor_parser falló: {}",
+        String::from_utf8_lossy(&salida.stderr).trim()
+    ))
+}
+
+/// Los recursos de hardware que una aplicación tiene concedidos.
+///
+/// Sólo los que el perfil general niega: el resto no se representa en AppArmor,
+/// así que ponerlo en la excepción no cambiaría nada y confundiría a quien lea
+/// el archivo.
+pub fn permitidos_de(
+    policy: &crate::policy::UserPolicy,
+    binary_path: &str,
+) -> Vec<Resource> {
+    NEGACIONES
+        .iter()
+        .map(|(recurso, _)| recurso)
+        .filter(|recurso| policy.decision(binary_path, &recurso.as_id()).is_allowed())
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use vasak_permissions_protocol::{Application, Decision, Provenance};
+
+    fn una_app(ruta: &str) -> Application {
+        Application {
+            binary_path: ruta.to_string(),
+            display_name: "prueba".into(),
+            provenance: Provenance::Unverified,
+        }
+    }
+
+    /// Lo concedido sale de la política guardada, no de lo que se acaba de
+    /// tocar: si no, cambiar el micrófono reescribiría el perfil olvidando que
+    /// la cámara ya estaba permitida.
+    #[test]
+    fn lo_permitido_se_lee_de_la_politica_entera() {
+        let mut politica = crate::policy::UserPolicy::default();
+        let app = una_app("/home/x/a.AppImage");
+        politica.record(&app, "camera", Decision::Allowed);
+        politica.record(&app, "microphone", Decision::Denied);
+
+        let permitidos = permitidos_de(&politica, "/home/x/a.AppImage");
+        assert_eq!(permitidos, vec![Resource::Camera]);
+    }
+
+    #[test]
+    fn una_aplicacion_sin_nada_decidido_no_tiene_permitido_nada() {
+        let politica = crate::policy::UserPolicy::default();
+        assert!(permitidos_de(&politica, "/home/x/a.AppImage").is_empty());
+    }
+
+    /// Los recursos que AppArmor no representa no entran en la excepción, aunque
+    /// estén concedidos: ponerlos ahí no cambiaría nada y confundiría a quien
+    /// lea el archivo.
+    #[test]
+    fn los_recursos_que_apparmor_no_niega_no_entran() {
+        let mut politica = crate::policy::UserPolicy::default();
+        let app = una_app("/home/x/a.AppImage");
+        politica.record(&app, "screen-capture", Decision::Allowed);
+        politica.record(&app, "account.email", Decision::Allowed);
+
+        assert!(permitidos_de(&politica, "/home/x/a.AppImage").is_empty());
+    }
 
     #[test]
     fn el_perfil_engancha_la_ruta_exacta_y_no_niega_nada() {

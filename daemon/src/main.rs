@@ -283,9 +283,42 @@ impl PermissionService {
         // Describe the target program from the path being managed, not from
         // the caller: the settings screen is editing somebody else's entry.
         let application = identity::describe_path(&binary_path);
+        // Lo que estaba concedido antes, para poder volver atrás si el guardado
+        // falla después de haber tocado el perfil.
+        let antes = excepcion::permitidos_de(&policy, &binary_path);
         policy.record(&application, &resource_id, Decision::from_answer(allowed));
+        let ahora = excepcion::permitidos_de(&policy, &binary_path);
 
-        self.store.save(caller.uid, &policy).map_err(FdoError::Failed)
+        // Primero el perfil, después el archivo de decisiones.
+        //
+        // El orden no es indiferente y las dos formas de fallar son distintas.
+        // Guardando primero, un fallo al aplicar dejaría una decisión escrita
+        // que el sistema no cumple: quien la tomó creería que la cámara quedó
+        // permitida —o negada— y no sería cierto.
+        //
+        // Aplicando primero, un fallo deja todo como estaba y el error llega a
+        // quien pidió el cambio, que es lo que corresponde. Y si lo que falla
+        // es el guardado, se deshace el perfil para que el kernel y el disco no
+        // queden diciendo cosas distintas.
+        if let Err(error) = excepcion::aplicar(&binary_path, &ahora) {
+            tracing::warn!("No se pudo aplicar el perfil de {binary_path}: {error}");
+            return Err(FdoError::Failed(format!(
+                "la decisión no se guardó porque no se pudo aplicar: {error}"
+            )));
+        }
+
+        if let Err(error) = self.store.save(caller.uid, &policy) {
+            if let Err(otro) = excepcion::aplicar(&binary_path, &antes) {
+                // Deshacer también falló. Se registra fuerte: el perfil quedó
+                // en un estado que el archivo de decisiones no describe.
+                tracing::error!(
+                    "No se pudo guardar la decisión de {binary_path} ni deshacer \
+                     el perfil ({otro}); el sistema quedó inconsistente"
+                );
+            }
+            return Err(FdoError::Failed(error));
+        }
+        Ok(())
     }
 
     /// Forgets a program entirely, so the next time it asks the user is asked
