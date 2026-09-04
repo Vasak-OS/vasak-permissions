@@ -17,6 +17,11 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 StateDirectory=vasak-permissions
+# El servicio escribe los perfiles de excepción de AppArmor, y con
+# ProtectSystem=strict todo /etc es de sólo lectura. Se abre ese directorio y
+# nada más: es el poder mínimo para que un «permitir» de la configuración
+# realmente permita.
+ReadWritePaths=/etc/apparmor.d
 StateDirectoryMode=0700
 PrivateTmp=yes
 PrivateDevices=yes
