@@ -15,13 +15,17 @@ use std::process::Command;
 /// integración no pueden importarlo. Si el formato cambia allá y no acá, esta
 /// prueba deja de valer, así que compara contra un perfil generado a mano con
 /// la misma forma.
-fn perfil(nombre: &str, ruta: &str) -> String {
+fn perfil_con(nombre: &str, ruta: &str, negaciones: &str) -> String {
     format!(
         "abi <abi/4.0>,\ninclude <tunables/global>\nprofile {nombre} \"{ruta}\" {{\n  \
          file,\n  network,\n  unix,\n  signal,\n  ptrace,\n  dbus,\n  capability,\n  \
          mount,\n  umount,\n  pivot_root,\n  change_profile,\n  io_uring,\n  mqueue,\n  \
-         userns,\n}}\n"
+         userns,\n{negaciones}\n}}\n"
     )
+}
+
+fn perfil(nombre: &str, ruta: &str) -> String {
+    perfil_con(nombre, ruta, "")
 }
 
 fn hay_parser() -> bool {
@@ -72,5 +76,25 @@ fn una_ruta_con_espacios_tambien_compila() {
     );
     if let Err(error) = compila(&texto) {
         panic!("una ruta con espacios no compila:\n{error}");
+    }
+}
+
+/// El caso parcial: se permitió la cámara y el micrófono sigue negado.
+///
+/// Importa aparte porque mezcla reglas amplias con una negación, y una negación
+/// mal escrita no siempre falla al compilar: puede compilar y no negar.
+#[test]
+fn un_perfil_con_una_negacion_tambien_compila() {
+    if !hay_parser() {
+        eprintln!("apparmor_parser no está instalado; se salta la comprobación");
+        return;
+    }
+    let texto = perfil_con(
+        "vasak-permitida-parcial",
+        "/home/alguien/Apps/cosa.AppImage",
+        "  audit deny /dev/snd/pcmC*D*c rwk,",
+    );
+    if let Err(error) = compila(&texto) {
+        panic!("el perfil parcial no compila:\n{error}\n\nperfil:\n{texto}");
     }
 }
