@@ -12,6 +12,7 @@
 //! decorative — anyone could edit the file and grant themselves anything.
 
 mod audit;
+mod excepcion;
 mod agent;
 mod identity;
 mod policy;
