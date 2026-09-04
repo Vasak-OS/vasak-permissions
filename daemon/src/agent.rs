@@ -107,6 +107,50 @@ fn is_the_agent(binary_path: &str) -> bool {
             .is_some_and(|name| name == "vasak-permissions-agent")
 }
 
+/// Le avisa al usuario que AppArmor le negó un recurso a una aplicación.
+///
+/// No pregunta nada y no espera respuesta: el bloqueo ya ocurrió y no se puede
+/// deshacer. Lo único que hace es que deje de ser invisible.
+///
+/// Si no hay agente corriendo, se pierde, y está bien: un aviso es útil en el
+/// momento y no tiene sentido guardarlo para mostrarlo en el próximo inicio de
+/// sesión, cuando la persona ya no se acuerda de qué estaba haciendo.
+pub async fn avisar_de_bloqueo(
+    connection: &zbus::Connection,
+    agents: &SharedAgents,
+    uid: u32,
+    application: &vasak_permissions_protocol::Application,
+    resource: &vasak_permissions_protocol::Resource,
+) {
+    let Some(agent) = agents.lock().await.agent_for(uid) else {
+        tracing::debug!("Sin agente para el usuario {uid}; el aviso se descarta");
+        return;
+    };
+
+    let aviso = PermissionRequest {
+        application: application.clone(),
+        resource_id: resource.as_id(),
+        detail: String::new(),
+    };
+    let Ok(payload) = serde_json::to_string(&aviso) else {
+        return;
+    };
+
+    let arguments = (payload.as_str(),);
+    let call = connection.call_method(
+        Some(agent.unique_name.as_str()),
+        agent.object_path.as_str(),
+        Some(AGENT_INTERFACE),
+        "NotifyBlocked",
+        &arguments,
+    );
+    // Con tiempo máximo: un agente colgado no debe frenar al vigilante, que es
+    // el que sigue leyendo el registro del kernel.
+    if let Err(error) = tokio::time::timeout(ANSWER_TIMEOUT, call).await {
+        tracing::debug!("El agente del usuario {uid} no acusó el aviso: {error}");
+    }
+}
+
 /// Puts a request to the user and returns their answer, or `None` when the
 /// question could not be put to them at all.
 ///

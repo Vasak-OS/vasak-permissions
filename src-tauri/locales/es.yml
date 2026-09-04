@@ -49,3 +49,10 @@ resources:
   account.tasks:
     title: ¿Querés que {0} acceda a tus tareas?
     explanation: Va a poder ver y modificar tus listas de tareas.
+
+blocked:
+  camera: "{0} quiso usar la cámara"
+  microphone: "{0} quiso usar el micrófono"
+  body: >-
+    VasakOS se lo impidió: las aplicaciones que no instala el sistema no tienen
+    acceso a la cámara ni al micrófono.

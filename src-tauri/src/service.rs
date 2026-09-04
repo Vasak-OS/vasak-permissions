@@ -39,6 +39,35 @@ impl Agent {
 
         Ok(crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await)
     }
+
+    /// Avisa que AppArmor le negó un recurso a una aplicación.
+    ///
+    /// No pregunta: el bloqueo ya ocurrió. Devuelve enseguida y muestra el
+    /// aviso aparte, para que el servicio —que está leyendo el registro del
+    /// kernel— no quede esperando a que aparezca una notificación.
+    async fn notify_blocked(&self, aviso: String) -> zbus::fdo::Result<()> {
+        let aviso: PermissionRequest = serde_json::from_str(&aviso).map_err(|error| {
+            zbus::fdo::Error::InvalidArgs(format!("aviso de bloqueo inválido: {error}"))
+        })?;
+
+        // Este método está expuesto en el bus del sistema, así que en principio
+        // lo puede llamar cualquier proceso local, no sólo el servicio de
+        // permisos. Sin esta comprobación, alguien podría hacer aparecer un
+        // aviso de VasakOS con el texto y el icono que quisiera.
+        //
+        // Se aceptan sólo los dos recursos que los perfiles de AppArmor niegan,
+        // que son los únicos de los que este aviso sabe hablar.
+        if !crate::aviso::se_avisa_de(&aviso.resource_id) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "no se avisa de bloqueos de '{}'",
+                aviso.resource_id
+            )));
+        }
+
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move { crate::aviso::mostrar(&app, &aviso).await });
+        Ok(())
+    }
 }
 
 
