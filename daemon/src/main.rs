@@ -426,10 +426,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agents: SharedAgents = Arc::new(Mutex::new(AgentRegistry::default()));
 
+    // El vigilante del registro del kernel también anota decisiones, así que
+    // comparte el almacén y —sobre todo— el mismo candado de escritura: son dos
+    // escritores sobre el mismo archivo.
+    let store = PolicyStore::from_environment();
+    let write_lock = Arc::new(Mutex::new(()));
+    let store_para_el_vigilante = store.clone();
+    let write_lock_para_el_vigilante = Arc::clone(&write_lock);
+
     let service = PermissionService {
-        store: PolicyStore::from_environment(),
+        store,
         agents: Arc::clone(&agents),
-        write_lock: Arc::new(Mutex::new(())),
+        write_lock,
         throttle: Arc::new(Mutex::new(PromptThrottle::default())),
     };
 
@@ -443,7 +451,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Avisa de lo que los perfiles de AppArmor bloquean. Sin esto, el bloqueo
     // es correcto pero invisible: se ve una cámara que no anda y nadie sabe por
     // qué.
-    tokio::spawn(audit::vigilar(connection.clone(), agents));
+    tokio::spawn(audit::vigilar(
+        connection.clone(),
+        agents,
+        store_para_el_vigilante,
+        write_lock_para_el_vigilante,
+    ));
 
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");
     std::future::pending::<()>().await;

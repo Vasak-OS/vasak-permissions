@@ -82,6 +82,7 @@ impl UserPolicy {
 }
 
 /// Reads and writes the per-user policy files.
+#[derive(Clone)]
 pub struct PolicyStore {
     directory: PathBuf,
 }

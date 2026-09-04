@@ -140,7 +140,12 @@ fn cupo() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
 /// Nunca termina; se lanza como tarea de fondo. Si `/dev/kmsg` no se puede
 /// leer, se registra y se sale: un sistema sin AppArmor activo no tiene nada
 /// que vigilar, y no es un error.
-pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedAgents) {
+pub async fn vigilar(
+    connection: zbus::Connection,
+    agents: crate::agent::SharedAgents,
+    store: crate::policy::PolicyStore,
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+) {
     let (envio, mut recepcion) = tokio::sync::mpsc::channel::<Denegacion>(64);
 
     // La lectura de /dev/kmsg bloquea a la espera del próximo mensaje, así que
@@ -227,6 +232,19 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
         // Que el mapa no crezca sin techo en una sesión larga.
         recientes.retain(|_, cuando| ahora.duration_since(*cuando) < SILENCIO);
 
+        // Dejar constancia de que esta aplicación quiso el recurso.
+        //
+        // Sin esto el aviso es lo único que queda, y desaparece de la pantalla
+        // en unos segundos: la aplicación no aparecería en la lista de permisos
+        // y no habría desde dónde permitirle nada. Registrarla es lo que
+        // convierte un bloqueo en algo sobre lo que después se puede decidir.
+        //
+        // Sólo cuando no había decisión previa. Si alguien ya dijo que no, esto
+        // no agrega nada; y si dijo que sí, escribir «denegado» acá borraría su
+        // decisión por un bloqueo que probablemente venga de que la excepción
+        // todavía no estaba cargada.
+        registrar_el_intento(&store, &write_lock, denegacion.uid, &aplicacion, &recurso).await;
+
         tracing::info!(
             "AppArmor le negó '{}' a {}; avisando al usuario {}",
             recurso.as_id(),
@@ -259,9 +277,109 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
     }
 }
 
+/// Anota en la política que esta aplicación pidió el recurso y no lo tenía.
+async fn registrar_el_intento(
+    store: &crate::policy::PolicyStore,
+    write_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    uid: u32,
+    aplicacion: &vasak_permissions_protocol::Application,
+    recurso: &Resource,
+) {
+    use vasak_permissions_protocol::Decision;
+
+    // El mismo candado que usan las respuestas del diálogo: sin él, dos
+    // escrituras a la vez se pisan y una decisión se pierde.
+    let _guard = write_lock.lock().await;
+    let mut politica = match store.load(uid) {
+        Ok(politica) => politica,
+        Err(error) => {
+            tracing::warn!("No se pudo leer la política del usuario {uid}: {error}");
+            return;
+        }
+    };
+    if politica.decision(&aplicacion.binary_path, &recurso.as_id()) != Decision::Unknown {
+        return;
+    }
+    politica.record(aplicacion, &recurso.as_id(), Decision::Denied);
+    if let Err(error) = store.save(uid, &politica) {
+        tracing::warn!("No se pudo anotar el bloqueo de {}: {error}", aplicacion.binary_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use vasak_permissions_protocol::{Application, Decision, Provenance};
+
+    fn una_app(ruta: &str) -> Application {
+        Application {
+            binary_path: ruta.to_string(),
+            display_name: "prueba".into(),
+            provenance: Provenance::Unverified,
+        }
+    }
+
+    async fn registrar_en(
+        store: &crate::policy::PolicyStore,
+        app: &Application,
+        recurso: &Resource,
+    ) {
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        registrar_el_intento(store, &lock, 1000, app, recurso).await;
+    }
+
+    /// Sin esto la aplicación bloqueada no aparece en ninguna lista y no hay
+    /// desde dónde permitirle nada: el bloqueo sería definitivo por omisión.
+    #[tokio::test]
+    async fn un_bloqueo_deja_a_la_aplicacion_anotada() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::policy::PolicyStore::at(dir.path().to_path_buf());
+        let app = una_app("/home/x/a.AppImage");
+
+        registrar_en(&store, &app, &Resource::Camera).await;
+
+        let politica = store.load(1000).unwrap();
+        assert_eq!(
+            politica.decision("/home/x/a.AppImage", "camera"),
+            Decision::Denied
+        );
+    }
+
+    /// Lo más importante: si alguien ya dijo que sí, un bloqueo no puede
+    /// borrarlo. Un bloqueo con el permiso concedido suele significar que la
+    /// excepción todavía no estaba cargada, no que la persona cambió de idea.
+    #[tokio::test]
+    async fn no_pisa_una_decision_ya_tomada() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::policy::PolicyStore::at(dir.path().to_path_buf());
+        let app = una_app("/home/x/a.AppImage");
+
+        let mut politica = store.load(1000).unwrap();
+        politica.record(&app, "camera", Decision::Allowed);
+        store.save(1000, &politica).unwrap();
+
+        registrar_en(&store, &app, &Resource::Camera).await;
+
+        assert_eq!(
+            store.load(1000).unwrap().decision("/home/x/a.AppImage", "camera"),
+            Decision::Allowed,
+            "el bloqueo borró un permiso que la persona había concedido"
+        );
+    }
+
+    #[tokio::test]
+    async fn cada_recurso_se_anota_por_separado() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::policy::PolicyStore::at(dir.path().to_path_buf());
+        let app = una_app("/home/x/a.AppImage");
+
+        registrar_en(&store, &app, &Resource::Microphone).await;
+
+        let politica = store.load(1000).unwrap();
+        assert_eq!(politica.decision("/home/x/a.AppImage", "microphone"), Decision::Denied);
+        assert_eq!(politica.decision("/home/x/a.AppImage", "camera"), Decision::Unknown);
+    }
 
     /// Una línea tal cual la escribe el kernel, copiada del registro real.
     const REAL: &str = concat!(
