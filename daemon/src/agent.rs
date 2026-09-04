@@ -19,6 +19,14 @@ use vasak_permissions_protocol::{
 /// it for the rest of the session.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Lo que se espera por un aviso, que es otra cosa que una pregunta.
+///
+/// Una pregunta espera a que una persona lea y decida, y por eso se le dan dos
+/// minutos. Un aviso no espera a nadie: si el agente no lo acusa en unos
+/// segundos es que algo anda mal, y seguir esperando sólo retrasa el registro
+/// del problema.
+const TIEMPO_DE_AVISO: Duration = Duration::from_secs(10);
+
 /// The unique bus name and object path of one registered agent.
 #[derive(Clone)]
 struct RegisteredAgent {
@@ -144,10 +152,24 @@ pub async fn avisar_de_bloqueo(
         "NotifyBlocked",
         &arguments,
     );
-    // Con tiempo máximo: un agente colgado no debe frenar al vigilante, que es
-    // el que sigue leyendo el registro del kernel.
-    if let Err(error) = tokio::time::timeout(ANSWER_TIMEOUT, call).await {
-        tracing::debug!("El agente del usuario {uid} no acusó el aviso: {error}");
+    // Los dos fallos posibles se registran, y a nivel `warn`.
+    //
+    // La primera versión de esto hacía `if let Err(_) = timeout(...)`, que sólo
+    // atrapa que se acabe el tiempo: el error de la propia llamada de D-Bus
+    // viene envuelto adentro del `Ok`, y se perdía en silencio. El resultado
+    // fue un aviso que no aparecía y un servicio que decía haberlo mandado —
+    // exactamente el fallo callado que este módulo existe para evitar—.
+    match tokio::time::timeout(TIEMPO_DE_AVISO, call).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("El agente del usuario {uid} rechazó el aviso: {error}");
+        }
+        Err(_) => {
+            tracing::warn!(
+                "El agente del usuario {uid} no acusó el aviso en {}s",
+                TIEMPO_DE_AVISO.as_secs()
+            );
+        }
     }
 }
 
