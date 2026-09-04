@@ -11,6 +11,7 @@
 //! neither, which is exactly why the online-accounts list it replaces was
 //! decorative — anyone could edit the file and grant themselves anything.
 
+mod audit;
 mod agent;
 mod identity;
 mod policy;
@@ -404,7 +405,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    tokio::spawn(watch_for_departed_agents(connection.clone(), agents));
+    tokio::spawn(watch_for_departed_agents(connection.clone(), agents.clone()));
+    // Avisa de lo que los perfiles de AppArmor bloquean. Sin esto, el bloqueo
+    // es correcto pero invisible: se ve una cámara que no anda y nadie sabe por
+    // qué.
+    tokio::spawn(audit::vigilar(connection.clone(), agents));
 
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");
     std::future::pending::<()>().await;

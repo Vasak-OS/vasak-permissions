@@ -6,6 +6,7 @@
 //! of times in the life of an installation.
 
 mod dialog;
+mod aviso;
 mod locales;
 mod portal;
 mod service;

@@ -39,6 +39,21 @@ impl Agent {
 
         Ok(crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await)
     }
+
+    /// Avisa que AppArmor le negó un recurso a una aplicación.
+    ///
+    /// No pregunta: el bloqueo ya ocurrió. Devuelve enseguida y muestra el
+    /// aviso aparte, para que el servicio —que está leyendo el registro del
+    /// kernel— no quede esperando a que aparezca una notificación.
+    async fn notify_blocked(&self, aviso: String) -> zbus::fdo::Result<()> {
+        let aviso: PermissionRequest = serde_json::from_str(&aviso).map_err(|error| {
+            zbus::fdo::Error::InvalidArgs(format!("aviso de bloqueo inválido: {error}"))
+        })?;
+
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move { crate::aviso::mostrar(&app, &aviso).await });
+        Ok(())
+    }
 }
 
 

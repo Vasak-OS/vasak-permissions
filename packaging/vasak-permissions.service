@@ -20,6 +20,13 @@ StateDirectory=vasak-permissions
 StateDirectoryMode=0700
 PrivateTmp=yes
 PrivateDevices=yes
+# El servicio sigue el registro del kernel para avisar de lo que los perfiles de
+# AppArmor bloquean. `PrivateDevices` le da un /dev propio donde ese archivo no
+# existe —comprobado: queda null, zero, random y poco más—, así que se monta el
+# único que hace falta, y de sólo lectura.
+#
+# Con el `-` delante para que el servicio arranque igual en un kernel sin él.
+BindReadOnlyPaths=-/dev/kmsg
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

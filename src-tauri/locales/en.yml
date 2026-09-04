@@ -49,3 +49,10 @@ resources:
   account.tasks:
     title: Let {0} access your tasks?
     explanation: It will be able to see and change your task lists.
+
+blocked:
+  camera: "{0} tried to use the camera"
+  microphone: "{0} tried to use the microphone"
+  body: >-
+    VasakOS blocked it: applications the system did not install have no access
+    to the camera or the microphone.
