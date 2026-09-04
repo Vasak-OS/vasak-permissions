@@ -208,7 +208,18 @@ pub async fn vigilar(connection: zbus::Connection, agents: crate::agent::SharedA
         let clave = (denegacion.uid, aplicacion.binary_path.clone(), recurso.as_id());
         let ahora = Instant::now();
         if let Some(anterior) = recientes.get(&clave) {
-            if ahora.duration_since(*anterior) < SILENCIO {
+            let desde = ahora.duration_since(*anterior);
+            if desde < SILENCIO {
+                // Se deja constancia. Sin esta línea, un aviso callado por el
+                // silencio y un aviso que falló se ven exactamente igual desde
+                // el diario —nada—, y averiguar cuál de los dos fue cuesta más
+                // que escribirla.
+                tracing::debug!(
+                    "Callado: ya se avisó de '{}' para {} hace {}s",
+                    recurso.as_id(),
+                    aplicacion.binary_path,
+                    desde.as_secs()
+                );
                 continue;
             }
         }
