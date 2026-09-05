@@ -57,11 +57,12 @@ struct PermissionService {
 /// held.
 fn check_resource(resource_id: &str) -> Result<(), FdoError> {
     match Resource::from_id(resource_id) {
-        Some(resource) if resource.is_enforceable() => Ok(()),
+        Some(resource) if resource.decision_has_effect() => Ok(()),
         Some(_) => Err(FdoError::NotSupported(format!(
             "'{resource_id}' todavía no se puede hacer cumplir en VasakOS: \
              lo entrega PipeWire o el portal de escritorio, que no consultan \
-             este servicio. No se guarda ninguna decisión al respecto."
+             este servicio, y no hay perfil que lo niegue. No se guarda ninguna \
+             decisión al respecto."
         ))),
         None => Err(FdoError::InvalidArgs(format!(
             "recurso desconocido: '{resource_id}'"

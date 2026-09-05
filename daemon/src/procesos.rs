@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Cuánto se recuerda un proceso después de su `exec`.
 ///
@@ -39,7 +39,28 @@ const MEMORIA: Duration = Duration::from_secs(60);
 /// Techo de entradas, por si el sistema hace muchos `exec` de golpe.
 const MAXIMO: usize = 512;
 
-pub type Cache = Arc<Mutex<HashMap<u32, (PathBuf, Instant)>>>;
+/// Varias generaciones por pid, cada una con el momento de su `exec`.
+///
+/// No alcanza con guardar una ruta por pid. Los pid se reciclan: si al proceso
+/// A se le niega algo, termina, el número pasa a B y B arranca antes de que se
+/// procese la línea del registro, una caché de una sola ruta devolvería a B —y
+/// la decisión, y la excepción que se escriba después, irían sobre la
+/// aplicación equivocada—.
+///
+/// Con las generaciones y la hora de la denegación se puede elegir la correcta:
+/// la última que arrancó **antes** de que ocurriera el bloqueo.
+pub type Cache = Arc<Mutex<HashMap<u32, Vec<(PathBuf, Duration)>>>>;
+
+/// Cuántos arranques se recuerdan por pid.
+const GENERACIONES: usize = 4;
+
+/// El momento actual, en segundos desde el epoch, para poder compararlo con la
+/// marca de tiempo que trae el registro del kernel.
+fn ahora_epoch() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+}
 
 pub fn cache_nueva() -> Cache {
     Arc::new(Mutex::new(HashMap::new()))
@@ -62,21 +83,39 @@ pub fn anotar(cache: &Cache, pid: u32) {
     if !interesa(&ruta) {
         return;
     }
-    let ahora = Instant::now();
+    let ahora = ahora_epoch();
     let Ok(mut mapa) = cache.lock() else { return };
-    mapa.retain(|_, (_, cuando)| ahora.duration_since(*cuando) < MEMORIA);
-    if mapa.len() >= MAXIMO {
+    mapa.retain(|_, generaciones| {
+        generaciones.retain(|(_, cuando)| ahora.saturating_sub(*cuando) < MEMORIA);
+        !generaciones.is_empty()
+    });
+    if mapa.len() >= MAXIMO && !mapa.contains_key(&pid) {
         return;
     }
-    mapa.insert(pid, (ruta, ahora));
+    let generaciones = mapa.entry(pid).or_default();
+    generaciones.push((ruta, ahora));
+    if generaciones.len() > GENERACIONES {
+        generaciones.remove(0);
+    }
 }
 
-/// La ruta de un proceso que ya no está, si se la recuerda.
-pub fn recordada(cache: &Cache, pid: u32) -> Option<PathBuf> {
-    let ahora = Instant::now();
+/// La ruta que tenía ese pid cuando ocurrió el bloqueo.
+///
+/// `cuando` es la marca de tiempo que trae el propio registro del kernel. Se
+/// elige la última generación que arrancó **antes o en** ese momento: una
+/// posterior es otro proceso que heredó el número, y devolverla nombraría a la
+/// aplicación equivocada.
+///
+/// Si no hay ninguna anterior, no se devuelve nada. Preferimos no nombrar a
+/// nadie antes que nombrar mal: sobre ese nombre se anota una decisión y se
+/// escribe una excepción.
+pub fn recordada(cache: &Cache, pid: u32, cuando: Duration) -> Option<PathBuf> {
     let mapa = cache.lock().ok()?;
-    mapa.get(&pid)
-        .filter(|(_, cuando)| ahora.duration_since(*cuando) < MEMORIA)
+    mapa.get(&pid)?
+        .iter()
+        .filter(|(_, arranco)| *arranco <= cuando)
+        .filter(|(_, arranco)| cuando.saturating_sub(*arranco) < MEMORIA)
+        .max_by_key(|(_, arranco)| *arranco)
         .map(|(ruta, _)| ruta.clone())
 }
 
@@ -97,12 +136,22 @@ const NLMSG_DONE: u16 = 3;
 const OFFSET_QUE: usize = 16 + 20;
 const OFFSET_PID: usize = OFFSET_QUE + 16;
 
-/// Saca el pid de un mensaje del conector, si es un `exec`.
+/// Saca el pid de un mensaje del conector, si es un `exec` nuestro.
 ///
 /// Separado del socket para poder comprobarlo sin privilegios ni kernel: es
 /// aritmética de desplazamientos, que es justo donde uno se equivoca.
+///
+/// Comprueba también el identificador del conector. Sin eso, cualquier mensaje
+/// con los bytes en la posición correcta pasaría por un `exec`, incluidos los
+/// de otro subsistema que comparta el socket.
 pub fn pid_de_exec(mensaje: &[u8]) -> Option<u32> {
     if mensaje.len() < OFFSET_PID + 4 {
+        return None;
+    }
+    // El `cn_msg` empieza después del `nlmsghdr` y arranca con su `cb_id`.
+    let idx = u32::from_ne_bytes(mensaje[16..20].try_into().ok()?);
+    let val = u32::from_ne_bytes(mensaje[20..24].try_into().ok()?);
+    if idx != CN_IDX_PROC || val != CN_VAL_PROC {
         return None;
     }
     let que = u32::from_ne_bytes(mensaje[OFFSET_QUE..OFFSET_QUE + 4].try_into().ok()?);
@@ -192,9 +241,40 @@ pub fn escuchar(cache: Cache) {
     tracing::info!("Escuchando los arranques de proceso del kernel");
     let mut buffer = [0u8; 1024];
     loop {
-        let leidos = unsafe {
-            libc::recv(fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len(), 0)
+        // `recvmsg` y no `recv`, para quedarse con la dirección de quien envía.
+        //
+        // Un socket de netlink también recibe mensajes de **otros procesos del
+        // usuario** que conozcan nuestro identificador de puerto. Sin mirar el
+        // remitente, cualquiera podría fabricar un `exec` falso y envenenar la
+        // caché: la denegación siguiente quedaría atribuida a la ruta que él
+        // eligiera, y sobre esa ruta se anotaría una decisión y se escribiría
+        // una excepción. Los mensajes del kernel llegan con `nl_pid` en cero.
+        let mut remitente: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buffer.len(),
         };
+        let mut cabecera: libc::msghdr = unsafe { std::mem::zeroed() };
+        cabecera.msg_name = &mut remitente as *mut _ as *mut libc::c_void;
+        cabecera.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+        cabecera.msg_iov = &mut iov;
+        cabecera.msg_iovlen = 1;
+
+        let leidos = unsafe { libc::recvmsg(fd, &mut cabecera, 0) };
+        if leidos > 0 {
+            // Truncado: no se puede confiar en lo que quedó, y procesarlo a
+            // medias sería leer campos de otro mensaje.
+            if cabecera.msg_flags & libc::MSG_TRUNC != 0 {
+                continue;
+            }
+            if remitente.nl_pid != 0 {
+                tracing::debug!(
+                    "Mensaje de proceso descartado: no vino del kernel (nl_pid={})",
+                    remitente.nl_pid
+                );
+                continue;
+            }
+        }
         if leidos <= 0 {
             // EINTR y demás: reintentar. Un error persistente haría girar esto,
             // así que se corta.
@@ -219,6 +299,9 @@ mod tests {
     /// Arma un mensaje como el que manda el kernel.
     fn mensaje(que: u32, pid: i32) -> Vec<u8> {
         let mut m = vec![0u8; OFFSET_PID + 4];
+        // El identificador del conector, que ahora también se comprueba.
+        m[16..20].copy_from_slice(&CN_IDX_PROC.to_ne_bytes());
+        m[20..24].copy_from_slice(&CN_VAL_PROC.to_ne_bytes());
         m[OFFSET_QUE..OFFSET_QUE + 4].copy_from_slice(&que.to_ne_bytes());
         m[OFFSET_PID..OFFSET_PID + 4].copy_from_slice(&pid.to_ne_bytes());
         m
@@ -227,6 +310,15 @@ mod tests {
     #[test]
     fn de_un_exec_sale_el_pid() {
         assert_eq!(pid_de_exec(&mensaje(PROC_EVENT_EXEC, 4242)), Some(4242));
+    }
+
+    /// Un mensaje de otro subsistema del conector no es un arranque de proceso,
+    /// aunque tenga los bytes en la posición correcta.
+    #[test]
+    fn un_mensaje_de_otro_subsistema_se_ignora() {
+        let mut m = mensaje(PROC_EVENT_EXEC, 4242);
+        m[16..20].copy_from_slice(&99u32.to_ne_bytes());
+        assert_eq!(pid_de_exec(&m), None);
     }
 
     /// Por el conector pasan también forks, salidas y cambios de uid. Tomar el
@@ -266,22 +358,61 @@ mod tests {
         assert!(!interesa(std::path::Path::new("/tmp/a")));
     }
 
-    #[test]
-    fn lo_que_no_se_anoto_no_se_recuerda() {
-        let cache = cache_nueva();
-        assert_eq!(recordada(&cache, 999), None);
+    fn en(segundos: u64) -> Duration {
+        Duration::from_secs(1_788_000_000 + segundos)
     }
 
-    /// Los pid se reciclan. Recordar uno viejo nombraría a la aplicación
-    /// equivocada, que es peor que no recordar nada.
-    #[test]
-    fn una_entrada_vencida_no_se_devuelve() {
+    fn con(pid: u32, generaciones: &[(&str, u64)]) -> Cache {
         let cache = cache_nueva();
-        let viejo = Instant::now() - MEMORIA - Duration::from_secs(1);
+        cache.lock().unwrap().insert(
+            pid,
+            generaciones
+                .iter()
+                .map(|(r, s)| (PathBuf::from(*r), en(*s)))
+                .collect(),
+        );
         cache
-            .lock()
-            .unwrap()
-            .insert(7, (PathBuf::from("/home/x/a.AppImage"), viejo));
-        assert_eq!(recordada(&cache, 7), None);
+    }
+
+    #[test]
+    fn lo_que_no_se_anoto_no_se_recuerda() {
+        assert_eq!(recordada(&cache_nueva(), 999, en(10)), None);
+    }
+
+    #[test]
+    fn se_devuelve_la_generacion_que_estaba_corriendo() {
+        let cache = con(7, &[("/home/x/a.AppImage", 10)]);
+        assert_eq!(
+            recordada(&cache, 7, en(11)),
+            Some(PathBuf::from("/home/x/a.AppImage"))
+        );
+    }
+
+    /// El caso que motiva las generaciones: el pid 7 fue de A, A terminó, el
+    /// número pasó a B, y recién después se procesa el bloqueo **de A**.
+    /// Devolver B haría que la decisión y la excepción fueran sobre la
+    /// aplicación equivocada.
+    #[test]
+    fn un_pid_reciclado_no_nombra_a_la_aplicacion_nueva() {
+        let cache = con(7, &[("/home/x/vieja.AppImage", 10), ("/home/x/nueva.AppImage", 20)]);
+        assert_eq!(
+            recordada(&cache, 7, en(15)),
+            Some(PathBuf::from("/home/x/vieja.AppImage")),
+            "eligió una generación posterior al bloqueo"
+        );
+    }
+
+    /// Y si el bloqueo es anterior a todo lo que se recuerda, no se nombra a
+    /// nadie: preferimos no decir nada antes que decir mal.
+    #[test]
+    fn sin_generacion_anterior_no_se_devuelve_nada() {
+        let cache = con(7, &[("/home/x/nueva.AppImage", 20)]);
+        assert_eq!(recordada(&cache, 7, en(15)), None);
+    }
+
+    #[test]
+    fn una_generacion_vencida_no_se_devuelve() {
+        let cache = con(7, &[("/home/x/a.AppImage", 10)]);
+        assert_eq!(recordada(&cache, 7, en(10 + MEMORIA.as_secs() + 1)), None);
     }
 }

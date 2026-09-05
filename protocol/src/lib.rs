@@ -137,6 +137,26 @@ impl Resource {
         matches!(self, Resource::Account(_))
     }
 
+    /// Whether deciding this changes anything at all.
+    ///
+    /// A different question from [`Self::is_enforceable`], and mixing the two
+    /// kept the camera switch from working: that one asks whether a refusal can
+    /// be *relied upon*, and for the camera it cannot yet, because a program can
+    /// still ask PipeWire. This one asks whether the decision has any effect —
+    /// and it does: the service writes an AppArmor exception, so allowing gives
+    /// a confined application access it did not have, and removing takes it
+    /// away.
+    ///
+    /// Storing a decision that changes nothing would be worse than refusing it,
+    /// which is why the distinction exists at all. But refusing one that *does*
+    /// change something leaves a switch that cannot be moved.
+    pub fn decision_has_effect(&self) -> bool {
+        matches!(
+            self,
+            Resource::Account(_) | Resource::Camera | Resource::Microphone
+        )
+    }
+
     /// Stable text form used on the bus and in the stored policy.
     ///
     /// Spelled out by hand rather than derived, because these strings end up in
@@ -341,6 +361,25 @@ mod enforcement_tests {
 
     /// The list has to match what the service actually stands behind. If a
     /// resource starts being enforced, this is the one place to change.
+    /// La cámara y el micrófono: decidirlos cambia algo aunque la garantía no
+    /// sea completa todavía. Confundir las dos preguntas dejó el interruptor
+    /// sin poder moverse.
+    #[test]
+    fn deciding_the_camera_now_has_an_effect() {
+        assert!(Resource::Camera.decision_has_effect());
+        assert!(Resource::Microphone.decision_has_effect());
+        assert!(Resource::Account(AccountResource::Email).decision_has_effect());
+    }
+
+    /// Y lo que sigue sin control no: guardar una decisión que no cambia nada
+    /// es peor que no aceptarla.
+    #[test]
+    fn deciding_what_nothing_enforces_still_has_none() {
+        assert!(!Resource::ScreenCapture.decision_has_effect());
+        assert!(!Resource::Location.decision_has_effect());
+        assert!(!Resource::InputCapture.decision_has_effect());
+    }
+
     #[test]
     fn only_online_accounts_are_enforced_today() {
         assert!(Resource::Account(AccountResource::Email).is_enforceable());

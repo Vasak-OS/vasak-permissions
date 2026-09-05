@@ -47,6 +47,12 @@ pub struct Denegacion {
     pub pid: u32,
     /// A qué usuario avisarle.
     pub uid: u32,
+    /// Cuándo ocurrió, según el propio registro del kernel.
+    ///
+    /// Hace falta para elegir bien en la caché de procesos: sin esto, un pid
+    /// reciclado devolvería la aplicación que heredó el número en vez de la que
+    /// fue bloqueada.
+    pub momento: std::time::Duration,
 }
 
 /// Los perfiles cuyos bloqueos avisamos.
@@ -94,7 +100,23 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
         // `fsuid` y no `ouid`: el primero es quién intentó, el segundo de quién
         // es el archivo. Para saber a quién avisarle hace falta el primero.
         uid: numero_de(linea, "fsuid")?,
+        momento: momento_de(linea).unwrap_or_default(),
     })
+}
+
+/// Cuándo ocurrió la denegación, según la marca del propio registro.
+///
+/// El kernel la escribe como `audit(1788539628.817:36077)`: segundos desde el
+/// epoch, con milésimas, y después un número de serie que acá no interesa.
+pub fn momento_de(linea: &str) -> Option<std::time::Duration> {
+    let inicio = linea.find("audit(")? + "audit(".len();
+    let resto = &linea[inicio..];
+    let fin = resto.find(':')?;
+    let segundos: f64 = resto[..fin].parse().ok()?;
+    if segundos < 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(segundos))
 }
 
 /// Qué recurso es la ruta que se bloqueó.
@@ -207,7 +229,7 @@ pub async fn vigilar(
             denegacion.uid,
         ) {
             Ok(proceso) => proceso.describe(),
-            Err(_) => match crate::procesos::recordada(&procesos, denegacion.pid) {
+            Err(_) => match crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento) {
                 Some(ruta) => {
                     tracing::debug!(
                         "El proceso {} ya no está; se lo nombra por lo recordado",
@@ -420,6 +442,21 @@ mod tests {
 
     /// El caso que hace fácil equivocarse: `fsuid`, `ouid` y `pid` conviven en
     /// la misma línea y terminan en las mismas letras.
+    /// La marca del registro es lo que permite elegir bien en la caché cuando un
+    /// pid se recicló.
+    #[test]
+    fn la_hora_del_bloqueo_sale_del_registro() {
+        let d = parsear(REAL).unwrap();
+        assert_eq!(d.momento.as_secs(), 1788539628);
+        assert!(d.momento.subsec_millis() >= 816 && d.momento.subsec_millis() <= 818);
+    }
+
+    #[test]
+    fn una_linea_sin_marca_no_inventa_una_hora() {
+        assert_eq!(momento_de("sin marca"), None);
+        assert_eq!(momento_de("audit(sin dos puntos"), None);
+    }
+
     #[test]
     fn no_confunde_fsuid_con_ouid() {
         let d = parsear(REAL).unwrap();
