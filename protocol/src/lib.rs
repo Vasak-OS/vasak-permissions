@@ -129,10 +129,13 @@ impl Resource {
     /// which program is asking — the identity it passes on is empty for
     /// anything outside a sandbox.
     ///
-    /// Requests for the rest are refused outright rather than remembered. A
-    /// decision that changes nothing, and that the settings screen therefore
-    /// does not show, would be worse than no decision: the person could neither
-    /// rely on it nor take it back.
+    /// This is *not* the question the service asks before storing a decision —
+    /// that one is [`Self::decision_has_effect`], and confusing the two is what
+    /// left the camera switch unable to move. The camera is not enforceable,
+    /// because the PipeWire path is still open; but deciding it does have an
+    /// effect, because an AppArmor exception gets written either way. What is
+    /// refused outright is a decision that changes *nothing at all*: the person
+    /// could neither rely on it nor take it back.
     pub fn is_enforceable(&self) -> bool {
         matches!(self, Resource::Account(_))
     }
