@@ -108,15 +108,40 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
 ///
 /// El kernel la escribe como `audit(1788539628.817:36077)`: segundos desde el
 /// epoch, con milésimas, y después un número de serie que acá no interesa.
+///
+/// Se leen los dos campos como enteros, sin pasar por punto flotante. La
+/// versión anterior hacía `Duration::from_secs_f64` de lo que hubiera parseado,
+/// y esa función **entra en pánico** con `NaN`, con infinito y con cualquier
+/// valor que no entre en un `u64` — las tres cosas que `"inf".parse::<f64>()`,
+/// `"NaN"` y `"1e30"` producen sin ser negativas, así que la guarda de signo no
+/// las tocaba. Un pánico acá se lleva el hilo que lee el registro del kernel, y
+/// a partir de ahí ningún bloqueo se vuelve a avisar: el resto del servicio
+/// sigue en pie, así que la falla sería muda.
 pub fn momento_de(linea: &str) -> Option<std::time::Duration> {
     let inicio = linea.find("audit(")? + "audit(".len();
     let resto = &linea[inicio..];
     let fin = resto.find(':')?;
-    let segundos: f64 = resto[..fin].parse().ok()?;
-    if segundos < 0.0 {
-        return None;
-    }
-    Some(std::time::Duration::from_secs_f64(segundos))
+    let marca = &resto[..fin];
+
+    let (enteros, decimales) = match marca.split_once('.') {
+        Some((e, d)) => (e, d),
+        None => (marca, ""),
+    };
+
+    let segundos: u64 = enteros.parse().ok()?;
+    // Las milésimas vienen con tres dígitos, pero no se da por sentado: se
+    // normaliza a tres para que `.8` no se lea como 8 ms en vez de 800.
+    let milesimas: u32 = if decimales.is_empty() {
+        0
+    } else {
+        if !decimales.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let tres: String = decimales.chars().chain("000".chars()).take(3).collect();
+        tres.parse().ok()?
+    };
+
+    Some(std::time::Duration::new(segundos, milesimas * 1_000_000))
 }
 
 /// Qué recurso es la ruta que se bloqueó.
@@ -430,6 +455,29 @@ mod tests {
         "name=\"/dev/video0\" pid=167490 comm=\"prueba-vasak.Ap\" ",
         "requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=0"
     );
+
+    /// Una marca imposible no debe tumbar el hilo que lee el registro. Antes
+    /// las tres pasaban la guarda de signo y hacían entrar en pánico a
+    /// `Duration::from_secs_f64`; el aviso de bloqueos quedaba muerto en
+    /// silencio para el resto de la sesión.
+    #[test]
+    fn una_marca_imposible_no_entra_en_panico() {
+        for marca in ["inf", "NaN", "1e30", "-inf", "99999999999999999999999"] {
+            let linea = format!("audit({marca}:36077): apparmor=\"DENIED\"");
+            assert_eq!(momento_de(&linea), None, "marca: {marca}");
+        }
+    }
+
+    /// Y las milésimas se leen como tales, no como el número que parezcan.
+    #[test]
+    fn las_milesimas_valen_lo_que_dicen() {
+        let de = |m: &str| momento_de(&format!("audit({m}:1):")).unwrap();
+        assert_eq!(de("10.817").subsec_millis(), 817);
+        assert_eq!(de("10.8").subsec_millis(), 800);
+        assert_eq!(de("10.08").subsec_millis(), 80);
+        assert_eq!(de("10").subsec_millis(), 0);
+        assert_eq!(de("1788539628.817").as_secs(), 1_788_539_628);
+    }
 
     #[test]
     fn una_denegacion_real_se_interpreta_entera() {

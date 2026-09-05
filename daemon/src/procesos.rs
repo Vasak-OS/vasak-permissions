@@ -54,6 +54,52 @@ pub type Cache = Arc<Mutex<HashMap<u32, Vec<(PathBuf, Duration)>>>>;
 /// Cuántos arranques se recuerdan por pid.
 const GENERACIONES: usize = 4;
 
+/// Cuándo arrancó de verdad ese proceso, en segundos desde el epoch.
+///
+/// No es lo mismo que «cuándo nos enteramos». Entre el `exec` y el momento en
+/// que este proceso lee el aviso del conector pasa un rato —el planificador, la
+/// cola de netlink, el `read_link` de `/proc`— y esa demora se sumaba a la hora
+/// guardada. Si por culpa de ella la generación correcta quedaba anotada
+/// *después* del bloqueo, `recordada` la descartaba y caía en la generación
+/// anterior del mismo pid: otro programa, y sobre ese nombre se escribe una
+/// excepción de AppArmor. El error que la demora podía causar es justo el que
+/// esta caché existe para evitar.
+///
+/// El campo 22 de `/proc/<pid>/stat` es el arranque en tics desde el encendido.
+/// Junto con el pid forma la identidad que el kernel considera única: dos
+/// procesos con el mismo número se distinguen por ahí. Sumado a `btime` da una
+/// hora comparable con la que trae el registro de auditoría, exacta al tic.
+fn arranque_de(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+
+    // El campo 2 es el nombre del ejecutable entre paréntesis, y puede contener
+    // espacios y paréntesis: partir por espacios desde el principio da
+    // cualquier cosa. Se corta después del **último** `)`, que es el cierre.
+    let resto = &stat[stat.rfind(')')? + 1..];
+
+    // Ahí empieza el campo 3, así que el 22 queda en la posición 19.
+    let tics: u64 = resto.split_whitespace().nth(19)?.parse().ok()?;
+
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let hz = hz as u64;
+
+    Some(btime()? + Duration::new(tics / hz, ((tics % hz) * 1_000_000_000 / hz) as u32))
+}
+
+/// Cuándo se encendió la máquina, según `/proc/stat`. No cambia mientras
+/// corre, así que se lee una sola vez.
+fn btime() -> Option<Duration> {
+    static BTIME: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *BTIME.get_or_init(|| {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let linea = stat.lines().find(|l| l.starts_with("btime "))?;
+        Some(Duration::from_secs(linea.split_whitespace().nth(1)?.parse().ok()?))
+    })
+}
+
 /// El momento actual, en segundos desde el epoch, para poder compararlo con la
 /// marca de tiempo que trae el registro del kernel.
 fn ahora_epoch() -> Duration {
@@ -83,7 +129,10 @@ pub fn anotar(cache: &Cache, pid: u32) {
     if !interesa(&ruta) {
         return;
     }
+    // El arranque real si se puede leer; si el proceso ya se fue entre el aviso
+    // y esta lectura, la hora de ahora, que es lo mejor que queda.
     let ahora = ahora_epoch();
+    let arranco = arranque_de(pid).unwrap_or(ahora);
     let Ok(mut mapa) = cache.lock() else { return };
     mapa.retain(|_, generaciones| {
         generaciones.retain(|(_, cuando)| ahora.saturating_sub(*cuando) < MEMORIA);
@@ -93,7 +142,7 @@ pub fn anotar(cache: &Cache, pid: u32) {
         return;
     }
     let generaciones = mapa.entry(pid).or_default();
-    generaciones.push((ruta, ahora));
+    generaciones.push((ruta, arranco));
     if generaciones.len() > GENERACIONES {
         generaciones.remove(0);
     }
@@ -305,6 +354,45 @@ mod tests {
         m[OFFSET_QUE..OFFSET_QUE + 4].copy_from_slice(&que.to_ne_bytes());
         m[OFFSET_PID..OFFSET_PID + 4].copy_from_slice(&pid.to_ne_bytes());
         m
+    }
+
+    /// La hora que se guarda tiene que ser la del `exec`, no la de la lectura.
+    /// Contra el propio proceso de la prueba: arrancó recién, y antes que
+    /// ahora. Si esto devolviera la hora de lectura, la diferencia con `ahora`
+    /// sería cero y la demora que se quiso sacar seguiría ahí.
+    #[test]
+    fn el_arranque_es_el_del_proceso_y_no_el_de_la_lectura() {
+        let mio = arranque_de(std::process::id()).expect("nuestro propio /proc/<pid>/stat");
+        let ahora = ahora_epoch();
+        assert!(mio <= ahora, "arranque {mio:?} después de ahora {ahora:?}");
+        assert!(
+            ahora - mio < Duration::from_secs(600),
+            "el proceso de la prueba no puede llevar diez minutos corriendo"
+        );
+    }
+
+    /// Y contra init, cuyo arranque se conoce por otra vía: `/proc/uptime`.
+    /// Dos caminos distintos hasta el mismo número; si el campo 22 estuviera
+    /// mal contado, o los tics mal convertidos, no coincidirían.
+    #[test]
+    fn el_arranque_de_init_coincide_con_el_uptime() {
+        let Some(init) = arranque_de(1) else { return };
+        let Ok(texto) = std::fs::read_to_string("/proc/uptime") else { return };
+        let Some(segundos) = texto.split_whitespace().next() else { return };
+        let Ok(uptime) = segundos.parse::<f64>() else { return };
+
+        let edad = (ahora_epoch() - init).as_secs_f64();
+        assert!(
+            (edad - uptime).abs() < 5.0,
+            "init lleva {edad:.0}s según /proc/<pid>/stat y {uptime:.0}s según uptime"
+        );
+    }
+
+    /// Un pid que no existe no debe hacer nada raro: `anotar` ya lo descarta
+    /// antes, pero la conversión se llama con lo que venga del kernel.
+    #[test]
+    fn un_pid_inexistente_no_tiene_arranque() {
+        assert_eq!(arranque_de(u32::MAX), None);
     }
 
     #[test]
