@@ -41,7 +41,11 @@ DeviceAllow=/dev/kmsg r
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX
+# AF_NETLINK además de AF_UNIX: por ahí llega el conector de procesos del
+# kernel, que avisa de cada arranque y es lo que permite nombrar a un programa
+# que ya se cerró. Netlink no sale del equipo —es un canal con el kernel—, así
+# que esto no le abre la red al servicio.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

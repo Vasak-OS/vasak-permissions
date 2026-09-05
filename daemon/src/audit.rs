@@ -145,6 +145,7 @@ pub async fn vigilar(
     agents: crate::agent::SharedAgents,
     store: crate::policy::PolicyStore,
     write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    procesos: crate::procesos::Cache,
 ) {
     let (envio, mut recepcion) = tokio::sync::mpsc::channel::<Denegacion>(64);
 
@@ -193,20 +194,39 @@ pub async fn vigilar(
             continue;
         };
 
-        let Ok(proceso) = crate::identity::PinnedCaller::capture(denegacion.pid, denegacion.uid)
-        else {
-            // El proceso ya no está. Pasa: puede haberse cerrado justo por no
-            // conseguir lo que pedía. Sin él no hay forma de decir *qué*
-            // aplicación fue, y un aviso que no nombra a nadie asusta sin
-            // informar.
-            tracing::info!(
-                "Se bloqueó '{}' al proceso {}, que ya no existe; no se avisa",
-                denegacion.ruta,
-                denegacion.pid
-            );
-            continue;
+        // El proceso suele estar vivo, y entonces se lo identifica directo.
+        //
+        // Pero muchas veces ya no está, **precisamente porque se le negó lo que
+        // necesitaba**: a un programa al que le cortan la cámara es normal que
+        // salga en el acto. Para ese caso está la caché, que anotó su ruta
+        // cuando arrancó. Sin ella, el caso más común se perdía entero: ni
+        // aviso ni anotación, y la aplicación no aparecía nunca en la lista,
+        // así que no había forma de concederle nada.
+        let aplicacion = match crate::identity::PinnedCaller::capture(
+            denegacion.pid,
+            denegacion.uid,
+        ) {
+            Ok(proceso) => proceso.describe(),
+            Err(_) => match crate::procesos::recordada(&procesos, denegacion.pid) {
+                Some(ruta) => {
+                    tracing::debug!(
+                        "El proceso {} ya no está; se lo nombra por lo recordado",
+                        denegacion.pid
+                    );
+                    crate::identity::describe_path(&ruta.to_string_lossy())
+                }
+                None => {
+                    // Ni vivo ni recordado. Un aviso que no nombra a nadie
+                    // asusta sin informar, así que no se manda.
+                    tracing::info!(
+                        "Se bloqueó '{}' al proceso {}, que ya no existe y no se recuerda",
+                        denegacion.ruta,
+                        denegacion.pid
+                    );
+                    continue;
+                }
+            },
         };
-        let aplicacion = proceso.describe();
 
         // El uid va en la clave: si dos personas con sesión abierta usan la
         // misma aplicación, callar a una no puede callar a la otra.
