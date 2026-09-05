@@ -11,6 +11,7 @@
 //! neither, which is exactly why the online-accounts list it replaces was
 //! decorative — anyone could edit the file and grant themselves anything.
 
+mod procesos;
 mod audit;
 mod excepcion;
 mod agent;
@@ -56,11 +57,12 @@ struct PermissionService {
 /// held.
 fn check_resource(resource_id: &str) -> Result<(), FdoError> {
     match Resource::from_id(resource_id) {
-        Some(resource) if resource.is_enforceable() => Ok(()),
+        Some(resource) if resource.decision_has_effect() => Ok(()),
         Some(_) => Err(FdoError::NotSupported(format!(
             "'{resource_id}' todavía no se puede hacer cumplir en VasakOS: \
              lo entrega PipeWire o el portal de escritorio, que no consultan \
-             este servicio. No se guarda ninguna decisión al respecto."
+             este servicio, y no hay perfil que lo niegue. No se guarda ninguna \
+             decisión al respecto."
         ))),
         None => Err(FdoError::InvalidArgs(format!(
             "recurso desconocido: '{resource_id}'"
@@ -451,11 +453,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Avisa de lo que los perfiles de AppArmor bloquean. Sin esto, el bloqueo
     // es correcto pero invisible: se ve una cámara que no anda y nadie sabe por
     // qué.
+    // La caché de pid → ruta, que llena un hilo escuchando los arranques de
+    // proceso del kernel. Es lo que permite nombrar a un programa que se cerró
+    // apenas se le negó el acceso, que es el caso más común.
+    let procesos = procesos::cache_nueva();
+    let procesos_para_el_hilo = Arc::clone(&procesos);
+    std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo));
+
     tokio::spawn(audit::vigilar(
         connection.clone(),
         agents,
         store_para_el_vigilante,
         write_lock_para_el_vigilante,
+        procesos,
     ));
 
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");

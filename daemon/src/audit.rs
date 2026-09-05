@@ -47,6 +47,12 @@ pub struct Denegacion {
     pub pid: u32,
     /// A qué usuario avisarle.
     pub uid: u32,
+    /// Cuándo ocurrió, según el propio registro del kernel.
+    ///
+    /// Hace falta para elegir bien en la caché de procesos: sin esto, un pid
+    /// reciclado devolvería la aplicación que heredó el número en vez de la que
+    /// fue bloqueada.
+    pub momento: std::time::Duration,
 }
 
 /// Los perfiles cuyos bloqueos avisamos.
@@ -94,7 +100,48 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
         // `fsuid` y no `ouid`: el primero es quién intentó, el segundo de quién
         // es el archivo. Para saber a quién avisarle hace falta el primero.
         uid: numero_de(linea, "fsuid")?,
+        momento: momento_de(linea).unwrap_or_default(),
     })
+}
+
+/// Cuándo ocurrió la denegación, según la marca del propio registro.
+///
+/// El kernel la escribe como `audit(1788539628.817:36077)`: segundos desde el
+/// epoch, con milésimas, y después un número de serie que acá no interesa.
+///
+/// Se leen los dos campos como enteros, sin pasar por punto flotante. La
+/// versión anterior hacía `Duration::from_secs_f64` de lo que hubiera parseado,
+/// y esa función **entra en pánico** con `NaN`, con infinito y con cualquier
+/// valor que no entre en un `u64` — las tres cosas que `"inf".parse::<f64>()`,
+/// `"NaN"` y `"1e30"` producen sin ser negativas, así que la guarda de signo no
+/// las tocaba. Un pánico acá se lleva el hilo que lee el registro del kernel, y
+/// a partir de ahí ningún bloqueo se vuelve a avisar: el resto del servicio
+/// sigue en pie, así que la falla sería muda.
+pub fn momento_de(linea: &str) -> Option<std::time::Duration> {
+    let inicio = linea.find("audit(")? + "audit(".len();
+    let resto = &linea[inicio..];
+    let fin = resto.find(':')?;
+    let marca = &resto[..fin];
+
+    let (enteros, decimales) = match marca.split_once('.') {
+        Some((e, d)) => (e, d),
+        None => (marca, ""),
+    };
+
+    let segundos: u64 = enteros.parse().ok()?;
+    // Las milésimas vienen con tres dígitos, pero no se da por sentado: se
+    // normaliza a tres para que `.8` no se lea como 8 ms en vez de 800.
+    let milesimas: u32 = if decimales.is_empty() {
+        0
+    } else {
+        if !decimales.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let tres: String = decimales.chars().chain("000".chars()).take(3).collect();
+        tres.parse().ok()?
+    };
+
+    Some(std::time::Duration::new(segundos, milesimas * 1_000_000))
 }
 
 /// Qué recurso es la ruta que se bloqueó.
@@ -145,6 +192,7 @@ pub async fn vigilar(
     agents: crate::agent::SharedAgents,
     store: crate::policy::PolicyStore,
     write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    procesos: crate::procesos::Cache,
 ) {
     let (envio, mut recepcion) = tokio::sync::mpsc::channel::<Denegacion>(64);
 
@@ -193,20 +241,39 @@ pub async fn vigilar(
             continue;
         };
 
-        let Ok(proceso) = crate::identity::PinnedCaller::capture(denegacion.pid, denegacion.uid)
-        else {
-            // El proceso ya no está. Pasa: puede haberse cerrado justo por no
-            // conseguir lo que pedía. Sin él no hay forma de decir *qué*
-            // aplicación fue, y un aviso que no nombra a nadie asusta sin
-            // informar.
-            tracing::info!(
-                "Se bloqueó '{}' al proceso {}, que ya no existe; no se avisa",
-                denegacion.ruta,
-                denegacion.pid
-            );
-            continue;
+        // El proceso suele estar vivo, y entonces se lo identifica directo.
+        //
+        // Pero muchas veces ya no está, **precisamente porque se le negó lo que
+        // necesitaba**: a un programa al que le cortan la cámara es normal que
+        // salga en el acto. Para ese caso está la caché, que anotó su ruta
+        // cuando arrancó. Sin ella, el caso más común se perdía entero: ni
+        // aviso ni anotación, y la aplicación no aparecía nunca en la lista,
+        // así que no había forma de concederle nada.
+        let aplicacion = match crate::identity::PinnedCaller::capture(
+            denegacion.pid,
+            denegacion.uid,
+        ) {
+            Ok(proceso) => proceso.describe(),
+            Err(_) => match crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento) {
+                Some(ruta) => {
+                    tracing::debug!(
+                        "El proceso {} ya no está; se lo nombra por lo recordado",
+                        denegacion.pid
+                    );
+                    crate::identity::describe_path(&ruta.to_string_lossy())
+                }
+                None => {
+                    // Ni vivo ni recordado. Un aviso que no nombra a nadie
+                    // asusta sin informar, así que no se manda.
+                    tracing::info!(
+                        "Se bloqueó '{}' al proceso {}, que ya no existe y no se recuerda",
+                        denegacion.ruta,
+                        denegacion.pid
+                    );
+                    continue;
+                }
+            },
         };
-        let aplicacion = proceso.describe();
 
         // El uid va en la clave: si dos personas con sesión abierta usan la
         // misma aplicación, callar a una no puede callar a la otra.
@@ -389,6 +456,29 @@ mod tests {
         "requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=0"
     );
 
+    /// Una marca imposible no debe tumbar el hilo que lee el registro. Antes
+    /// las tres pasaban la guarda de signo y hacían entrar en pánico a
+    /// `Duration::from_secs_f64`; el aviso de bloqueos quedaba muerto en
+    /// silencio para el resto de la sesión.
+    #[test]
+    fn una_marca_imposible_no_entra_en_panico() {
+        for marca in ["inf", "NaN", "1e30", "-inf", "99999999999999999999999"] {
+            let linea = format!("audit({marca}:36077): apparmor=\"DENIED\"");
+            assert_eq!(momento_de(&linea), None, "marca: {marca}");
+        }
+    }
+
+    /// Y las milésimas se leen como tales, no como el número que parezcan.
+    #[test]
+    fn las_milesimas_valen_lo_que_dicen() {
+        let de = |m: &str| momento_de(&format!("audit({m}:1):")).unwrap();
+        assert_eq!(de("10.817").subsec_millis(), 817);
+        assert_eq!(de("10.8").subsec_millis(), 800);
+        assert_eq!(de("10.08").subsec_millis(), 80);
+        assert_eq!(de("10").subsec_millis(), 0);
+        assert_eq!(de("1788539628.817").as_secs(), 1_788_539_628);
+    }
+
     #[test]
     fn una_denegacion_real_se_interpreta_entera() {
         let d = parsear(REAL).expect("tendría que reconocerla");
@@ -400,6 +490,21 @@ mod tests {
 
     /// El caso que hace fácil equivocarse: `fsuid`, `ouid` y `pid` conviven en
     /// la misma línea y terminan en las mismas letras.
+    /// La marca del registro es lo que permite elegir bien en la caché cuando un
+    /// pid se recicló.
+    #[test]
+    fn la_hora_del_bloqueo_sale_del_registro() {
+        let d = parsear(REAL).unwrap();
+        assert_eq!(d.momento.as_secs(), 1788539628);
+        assert!(d.momento.subsec_millis() >= 816 && d.momento.subsec_millis() <= 818);
+    }
+
+    #[test]
+    fn una_linea_sin_marca_no_inventa_una_hora() {
+        assert_eq!(momento_de("sin marca"), None);
+        assert_eq!(momento_de("audit(sin dos puntos"), None);
+    }
+
     #[test]
     fn no_confunde_fsuid_con_ouid() {
         let d = parsear(REAL).unwrap();

@@ -129,12 +129,35 @@ impl Resource {
     /// which program is asking — the identity it passes on is empty for
     /// anything outside a sandbox.
     ///
-    /// Requests for the rest are refused outright rather than remembered. A
-    /// decision that changes nothing, and that the settings screen therefore
-    /// does not show, would be worse than no decision: the person could neither
-    /// rely on it nor take it back.
+    /// This is *not* the question the service asks before storing a decision —
+    /// that one is [`Self::decision_has_effect`], and confusing the two is what
+    /// left the camera switch unable to move. The camera is not enforceable,
+    /// because the PipeWire path is still open; but deciding it does have an
+    /// effect, because an AppArmor exception gets written either way. What is
+    /// refused outright is a decision that changes *nothing at all*: the person
+    /// could neither rely on it nor take it back.
     pub fn is_enforceable(&self) -> bool {
         matches!(self, Resource::Account(_))
+    }
+
+    /// Whether deciding this changes anything at all.
+    ///
+    /// A different question from [`Self::is_enforceable`], and mixing the two
+    /// kept the camera switch from working: that one asks whether a refusal can
+    /// be *relied upon*, and for the camera it cannot yet, because a program can
+    /// still ask PipeWire. This one asks whether the decision has any effect —
+    /// and it does: the service writes an AppArmor exception, so allowing gives
+    /// a confined application access it did not have, and removing takes it
+    /// away.
+    ///
+    /// Storing a decision that changes nothing would be worse than refusing it,
+    /// which is why the distinction exists at all. But refusing one that *does*
+    /// change something leaves a switch that cannot be moved.
+    pub fn decision_has_effect(&self) -> bool {
+        matches!(
+            self,
+            Resource::Account(_) | Resource::Camera | Resource::Microphone
+        )
     }
 
     /// Stable text form used on the bus and in the stored policy.
@@ -341,6 +364,25 @@ mod enforcement_tests {
 
     /// The list has to match what the service actually stands behind. If a
     /// resource starts being enforced, this is the one place to change.
+    /// La cámara y el micrófono: decidirlos cambia algo aunque la garantía no
+    /// sea completa todavía. Confundir las dos preguntas dejó el interruptor
+    /// sin poder moverse.
+    #[test]
+    fn deciding_the_camera_now_has_an_effect() {
+        assert!(Resource::Camera.decision_has_effect());
+        assert!(Resource::Microphone.decision_has_effect());
+        assert!(Resource::Account(AccountResource::Email).decision_has_effect());
+    }
+
+    /// Y lo que sigue sin control no: guardar una decisión que no cambia nada
+    /// es peor que no aceptarla.
+    #[test]
+    fn deciding_what_nothing_enforces_still_has_none() {
+        assert!(!Resource::ScreenCapture.decision_has_effect());
+        assert!(!Resource::Location.decision_has_effect());
+        assert!(!Resource::InputCapture.decision_has_effect());
+    }
+
     #[test]
     fn only_online_accounts_are_enforced_today() {
         assert!(Resource::Account(AccountResource::Email).is_enforceable());
