@@ -20,6 +20,7 @@ use vasak_permissions_protocol::{PermissionRequest, Resource};
 fn icono_de(resource_id: &str) -> &'static str {
     match resource_id {
         "microphone" => "audio-input-microphone",
+        "credentials" => "dialog-password",
         _ => "camera-web",
     }
 }
@@ -31,13 +32,13 @@ fn icono_de(resource_id: &str) -> &'static str {
 /// sólo el servicio de permisos. Sin esto, alguien podría hacer aparecer una
 /// notificación con la marca de VasakOS y el texto que quisiera.
 ///
-/// Se aceptan los dos recursos que los perfiles de AppArmor niegan, que son los
+/// Se aceptan los recursos que los perfiles de AppArmor niegan, que son los
 /// únicos para los que hay texto traducido: cualquier otro terminaría mostrando
 /// la clave cruda.
 pub fn se_avisa_de(resource_id: &str) -> bool {
     matches!(
         Resource::from_id(resource_id),
-        Some(Resource::Camera) | Some(Resource::Microphone)
+        Some(Resource::Camera) | Some(Resource::Microphone) | Some(Resource::Credentials)
     )
 }
 
@@ -62,9 +63,16 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
         .unwrap_or(&clave)
         .to_string();
     let resumen = texto(&plantilla, &aviso.application.display_name);
+    // El cuerpo, con uno propio por recurso si lo hay.
+    //
+    // El general habla de la cámara y el micrófono, y para un bloqueo de
+    // credenciales sería directamente falso — diría que se impidió el acceso a
+    // la cámara cuando lo que se impidió fue leer tus claves. Un aviso que
+    // explica mal lo que pasó es peor que uno escueto.
     let cuerpo = app
         .i18n()
-        .translate("blocked.body")
+        .translate(&format!("blocked.body-{}", aviso.resource_id))
+        .or_else(|| app.i18n().translate("blocked.body"))
         .unwrap_or("")
         .to_string();
 

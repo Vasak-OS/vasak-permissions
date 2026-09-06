@@ -158,7 +158,49 @@ pub fn recurso_de(ruta: &str) -> Option<Resource> {
     if ruta.starts_with("/dev/snd/pcm") && ruta.ends_with('c') {
         return Some(Resource::Microphone);
     }
+    if es_credencial(ruta) {
+        return Some(Resource::Credentials);
+    }
     None
+}
+
+/// Los sufijos que el kernel informa cuando se bloquea algo que prueba quién
+/// sos.
+///
+/// Se comparan **contra el final de la ruta absoluta** y no contra `@{HOME}`,
+/// porque el registro del kernel trae la ruta ya resuelta: `/home/ana/.ssh/id`,
+/// no la variable del perfil. Y se comparan por segmento —con la barra
+/// delante— para que `/home/ana/proyecto/.sshconfig` no cuente como `.ssh`.
+///
+/// La lista tiene que ser la misma que niega `excepcion::NEGACIONES`. Si allá
+/// se agrega una ruta y acá no, el bloqueo ocurre y nadie se entera: la persona
+/// ve una aplicación que falla sin explicación, que es exactamente lo que este
+/// aviso existe para evitar.
+const CREDENCIALES: &[&str] = &[
+    "/.ssh/",
+    "/.gnupg/",
+    "/.local/share/vasak-keyring/",
+    "/ssh-agent.socket",
+    "/gnupg/",
+    "/.netrc",
+    "/.git-credentials",
+    "/.npmrc",
+    "/.aws/",
+    "/.kube/",
+    "/.config/gh/",
+    "/.docker/config.json",
+];
+
+fn es_credencial(ruta: &str) -> bool {
+    CREDENCIALES.iter().any(|marca| {
+        if marca.ends_with('/') {
+            ruta.contains(marca)
+        } else {
+            // Sin barra final es un archivo concreto: tiene que terminar ahí,
+            // para que `/home/ana/.netrc.bak` no cuente.
+            ruta.ends_with(marca)
+        }
+    })
 }
 
 // ── El vigilante ────────────────────────────────────────────────────────────
@@ -460,6 +502,73 @@ mod tests {
     /// las tres pasaban la guarda de signo y hacían entrar en pánico a
     /// `Duration::from_secs_f64`; el aviso de bloqueos quedaba muerto en
     /// silencio para el resto de la sesión.
+    /// Las rutas que el kernel informa cuando se bloquea una credencial.
+    #[test]
+    fn una_credencial_se_reconoce() {
+        for ruta in [
+            "/home/ana/.ssh/id_ed25519",
+            "/home/ana/.gnupg/private-keys-v1.d/x.key",
+            "/home/ana/.local/share/vasak-keyring/llavero.db",
+            "/run/user/1000/ssh-agent.socket",
+            "/home/ana/.netrc",
+            "/home/ana/.git-credentials",
+            "/home/ana/.aws/credentials",
+            "/home/ana/.config/gh/hosts.yml",
+            "/home/ana/.docker/config.json",
+        ] {
+            assert_eq!(recurso_de(ruta), Some(Resource::Credentials), "{ruta}");
+        }
+    }
+
+    /// Y lo que se le parece pero no lo es. Un falso positivo acá no es
+    /// inofensivo: haría aparecer un aviso de robo de claves por un archivo
+    /// cualquiera, y la persona aprendería a ignorarlos.
+    #[test]
+    fn lo_que_solo_se_parece_no_cuenta() {
+        for ruta in [
+            "/home/ana/proyecto/.sshconfig",
+            "/home/ana/.netrc.bak",
+            "/home/ana/notas/docker/config.json.ejemplo",
+            "/home/ana/Descargas/gnupg.pdf",
+            "/home/ana/Documentos/carta.txt",
+        ] {
+            assert_eq!(recurso_de(ruta), None, "{ruta}");
+        }
+    }
+
+    /// La prueba que de verdad importa: que las dos listas no se separen.
+    ///
+    /// El perfil niega por un lado y el vigilante reconoce por otro. Si se
+    /// agrega una negación allá y no acá, el bloqueo ocurre igual y **nadie se
+    /// entera**: la persona ve una aplicación que falla sin explicación y sin
+    /// forma de concederle nada, que es exactamente lo que este aviso existe
+    /// para evitar. Es una falla muda, y las mudas son las que sobreviven.
+    #[test]
+    fn toda_negacion_de_credenciales_se_reconoce() {
+        let reglas = crate::excepcion::NEGACIONES
+            .iter()
+            .find(|(recurso, _)| *recurso == Resource::Credentials)
+            .expect("las credenciales están en la tabla de negaciones")
+            .1;
+
+        for regla in reglas {
+            // «audit deny @{HOME}/.ssh/** rwkl,» → la ruta es el tercer campo.
+            let patron = regla.split_whitespace().nth(2).expect("regla con ruta");
+            let concreta = patron
+                .replace("@{HOME}", "/home/ana")
+                .replace("/run/user/*/", "/run/user/1000/")
+                .replace("/**", "/un-archivo")
+                .replace("/*", "/un-archivo");
+
+            assert_eq!(
+                recurso_de(&concreta),
+                Some(Resource::Credentials),
+                "el perfil niega «{patron}» y el vigilante no lo reconoce: \
+                 el bloqueo sería mudo"
+            );
+        }
+    }
+
     #[test]
     fn una_marca_imposible_no_entra_en_panico() {
         for marca in ["inf", "NaN", "1e30", "-inf", "99999999999999999999999"] {

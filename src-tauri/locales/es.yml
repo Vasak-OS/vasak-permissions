@@ -53,6 +53,11 @@ resources:
 blocked:
   camera: "{0} quiso usar la cámara"
   microphone: "{0} quiso usar el micrófono"
+  credentials: "{0} quiso leer tus claves"
   body: >-
     VasakOS se lo impidió: las aplicaciones que no instala el sistema no tienen
     acceso a la cámara ni al micrófono.
+  body-credentials: >-
+    VasakOS se lo impidió. Ninguna aplicación que no instale el sistema puede
+    leer tus claves de SSH y GPG, el llavero ni los accesos guardados. Si no
+    esperabas esto, cerrá la aplicación.
