@@ -357,8 +357,18 @@ impl PermissionService {
     /// contraseña para *mirar* haría que la pantalla de seguridad la pida al
     /// abrirse, que es la forma más rápida de que la gente aprenda a tipearla
     /// sin leer.
-    async fn list_blocked(&self) -> zbus::fdo::Result<String> {
-        let lista = crate::local::listar(&self.pendientes);
+    ///
+    /// Pero sí se mira **quién** pregunta, y se devuelve sólo lo suyo. Este
+    /// servicio atiende a todos los del equipo y la lista lleva rutas de
+    /// archivos: devolverla entera contaría qué tiene otra persona en su
+    /// carpeta a cualquiera que sepa llamar a un método de D-Bus.
+    async fn list_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let caller = caller_of(connection, &header).await?;
+        let lista = crate::local::listar(&self.pendientes, caller.uid);
         serde_json::to_string(&lista)
             .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
     }
@@ -384,7 +394,9 @@ impl PermissionService {
         let caller = caller_of(connection, &header).await?;
         polkit::authorize(connection, &caller).await?;
 
-        let bloqueo = crate::local::listar(&self.pendientes)
+        // Sólo de la propia lista: si no, alguien podría permitirle a un
+        // programa de otra persona el acceso a un archivo de ella.
+        let bloqueo = crate::local::listar(&self.pendientes, caller.uid)
             .into_iter()
             .find(|b| b.perfil == profile && b.ruta == path)
             .ok_or_else(|| FdoError::InvalidArgs("ese bloqueo ya no está en la lista".into()))?;
@@ -393,13 +405,13 @@ impl PermissionService {
             .map_err(|m| FdoError::InvalidArgs(m.to_string()))?;
 
         let _guard = self.write_lock.lock().await;
-        let cambio = crate::local::conceder_en(&bloqueo.perfil, &regla, &crate::local::raiz())
+        // El archivo y el kernel se mueven juntos o no se mueve ninguno.
+        crate::local::conceder_y_recargar(&bloqueo.perfil, &regla, &crate::local::raiz())
             .map_err(FdoError::Failed)?;
-        if cambio {
-            crate::local::recargar(&bloqueo.perfil).map_err(FdoError::Failed)?;
-        }
 
-        crate::local::quitar(&self.pendientes, &profile, &path);
+        // Recién ahora sale de la lista: sacarlo antes de que la política esté
+        // en efecto dejaría a la persona sin el aviso y sin el permiso.
+        crate::local::quitar(&self.pendientes, caller.uid, &profile, &path);
         Ok(())
     }
 
@@ -407,8 +419,18 @@ impl PermissionService {
     ///
     /// No hace falta autorizar: no conceder nada es el estado en el que ya
     /// estaba, así que esto no cambia lo que el sistema permite.
-    async fn dismiss_blocked(&self, profile: String, path: String) -> zbus::fdo::Result<()> {
-        crate::local::quitar(&self.pendientes, &profile, &path);
+    async fn dismiss_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        profile: String,
+        path: String,
+    ) -> zbus::fdo::Result<()> {
+        // Sin autorizar, pero sólo sobre lo propio: descartar el bloqueo de otra
+        // persona le sacaría de la vista algo que ella todavía tiene que
+        // decidir, y no volvería a aparecer hasta el próximo intento.
+        let caller = caller_of(connection, &header).await?;
+        crate::local::quitar(&self.pendientes, caller.uid, &profile, &path);
         Ok(())
     }
 
@@ -424,12 +446,9 @@ impl PermissionService {
         polkit::authorize(connection, &caller).await?;
 
         let _guard = self.write_lock.lock().await;
-        let cambio = crate::local::revocar_en(&profile, &rule, &crate::local::raiz())
-            .map_err(FdoError::Failed)?;
-        if cambio {
-            crate::local::recargar(&profile).map_err(FdoError::Failed)?;
-        }
-        Ok(())
+        crate::local::revocar_y_recargar(&profile, &rule, &crate::local::raiz())
+            .map_err(FdoError::Failed)
+
     }
 
     /// Lo que ya se le permitió a un perfil, para poder retirarlo.

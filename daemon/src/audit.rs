@@ -312,6 +312,7 @@ pub async fn vigilar(
             let primera_vez = crate::local::anotar(
                 &pendientes,
                 crate::local::Bloqueo {
+                    uid: denegacion.uid,
                     perfil: denegacion.perfil.clone(),
                     ruta: denegacion.ruta.clone(),
                     mascara: denegacion.mascara.clone(),
@@ -330,14 +331,27 @@ pub async fn vigilar(
                 } else {
                     &programa
                 });
-                crate::agent::avisar_de_archivo(
-                    &connection,
-                    &agents,
-                    denegacion.uid,
-                    &aplicacion,
-                    &denegacion.ruta,
-                )
-                .await;
+                // En una tarea aparte y con cupo, igual que los avisos de
+                // recursos con nombre. Esperando acá, un daemon de
+                // notificaciones lento o ausente frenaría la lectura del
+                // registro del kernel —que no espera a nadie y sigue rotando—,
+                // y se perderían denegaciones por esperar a una notificación.
+                match cupo().clone().try_acquire_owned() {
+                    Ok(permiso) => {
+                        let connection = connection.clone();
+                        let agents = agents.clone();
+                        let uid = denegacion.uid;
+                        let ruta = denegacion.ruta.clone();
+                        tokio::spawn(async move {
+                            let _permiso = permiso;
+                            crate::agent::avisar_de_archivo(
+                                &connection, &agents, uid, &aplicacion, &ruta,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => tracing::debug!("Demasiados avisos a la vez; se descarta uno"),
+                }
             }
             continue;
         }

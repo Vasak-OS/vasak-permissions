@@ -207,6 +207,15 @@ pub fn revocar_en(perfil: &str, regla: &str, raiz: &Path) -> Result<bool, String
     Ok(true)
 }
 
+/// Escribe el archivo entero o no lo toca.
+///
+/// Va por temporal y `rename` porque `write` trunca primero: si el equipo se
+/// corta en el medio, el archivo queda partido. Y esto no es un archivo
+/// cualquiera —es política que el kernel compila—, así que uno truncado deja un
+/// perfil que no carga, o una regla cortada al medio.
+///
+/// El temporal va en el **mismo directorio** que el destino: `rename` sólo es
+/// atómico dentro del mismo sistema de archivos, y `/tmp` suele ser otro.
 fn escribir(perfil: &str, reglas: &[String], raiz: &Path) -> Result<(), String> {
     std::fs::create_dir_all(raiz).map_err(|e| format!("no se pudo crear {}: {e}", raiz.display()))?;
     let mut texto = String::from(CABECERA);
@@ -216,7 +225,79 @@ fn escribir(perfil: &str, reglas: &[String], raiz: &Path) -> Result<(), String> 
         texto.push('\n');
     }
     let destino = archivo_de(perfil, raiz);
-    std::fs::write(&destino, texto).map_err(|e| format!("no se pudo escribir {}: {e}", destino.display()))
+    let temporal = raiz.join(format!(".{perfil}.{}", std::process::id()));
+
+    std::fs::write(&temporal, texto)
+        .map_err(|e| format!("no se pudo escribir {}: {e}", temporal.display()))?;
+
+    if let Err(e) = std::fs::rename(&temporal, &destino) {
+        // Si el cambio de nombre falla, el temporal no puede quedar tirado: es
+        // un archivo dentro de un directorio que el analizador lee entero.
+        let _ = std::fs::remove_file(&temporal);
+        return Err(format!("no se pudo reemplazar {}: {e}", destino.display()));
+    }
+    Ok(())
+}
+
+/// Concede una regla y deja el kernel de acuerdo con el archivo, o no cambia
+/// nada.
+///
+/// Escribir y recargar por separado dejaba dos formas de mentir:
+///
+/// - Si la recarga falla, el archivo queda con la regla y el kernel con la
+///   política vieja. La persona ve «permitido» y el programa sigue sin poder.
+/// - Y al reintentar era peor: `conceder_en` veía la regla ya escrita,
+///   devolvía «no cambió nada», se salteaba la recarga y el método informaba
+///   **éxito** — con el permiso concedido en el archivo y sin efecto en el
+///   kernel, para siempre.
+///
+/// Por eso se recarga siempre, incluso cuando el archivo ya estaba: que la
+/// regla esté escrita no prueba que el kernel la tenga. Y si la recarga falla
+/// se restaura lo anterior y se recarga eso, para no dejar el archivo
+/// adelantado respecto de lo que se está haciendo cumplir.
+pub fn conceder_y_recargar(perfil: &str, regla: &str, raiz: &Path) -> Result<(), String> {
+    let antes = concedidas_en(perfil, raiz);
+    conceder_en(perfil, regla, raiz)?;
+    confirmar(perfil, &antes, raiz)
+}
+
+/// Lo mismo al revés: retira una regla y deja el kernel de acuerdo.
+pub fn revocar_y_recargar(perfil: &str, regla: &str, raiz: &Path) -> Result<(), String> {
+    let antes = concedidas_en(perfil, raiz);
+    revocar_en(perfil, regla, raiz)?;
+    confirmar(perfil, &antes, raiz)
+}
+
+/// Recarga, y si no se puede vuelve todo a como estaba.
+///
+/// Se recarga **siempre**, aunque el archivo no haya cambiado: que la regla
+/// esté escrita no prueba que el kernel la tenga, y ése era justo el caso que
+/// mentía.
+fn confirmar(perfil: &str, antes: &[String], raiz: &Path) -> Result<(), String> {
+    match recargar(perfil) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = guardar(perfil, antes, raiz);
+            let _ = recargar(perfil);
+            Err(error)
+        }
+    }
+}
+
+/// Escribe la lista, o borra el archivo si queda vacía.
+///
+/// Un archivo con sólo la cabecera confunde a quien lo lea: parece que hay algo
+/// concedido y no hay nada.
+fn guardar(perfil: &str, reglas: &[String], raiz: &Path) -> Result<(), String> {
+    if reglas.is_empty() {
+        let destino = archivo_de(perfil, raiz);
+        if destino.exists() {
+            std::fs::remove_file(&destino)
+                .map_err(|e| format!("no se pudo borrar {}: {e}", destino.display()))?;
+        }
+        return Ok(());
+    }
+    escribir(perfil, reglas, raiz)
 }
 
 /// Dónde escribir de verdad. Se puede desviar para las pruebas.
@@ -291,6 +372,14 @@ use std::sync::{Arc, Mutex};
 /// Un bloqueo que ocurrió y espera decisión.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Bloqueo {
+    /// A qué persona le pasó.
+    ///
+    /// Es parte de la identidad y no un dato de adorno: sin él, el mismo perfil
+    /// negando la misma ruta a dos personas distintas se fusionaba en una sola
+    /// entrada, y la segunda no recibía aviso aunque su aplicación siguiera
+    /// bloqueada — se quedaba con un programa que falla y sin nada que le dijera
+    /// por qué.
+    pub uid: u32,
     /// El perfil que lo produjo. Es también la identidad: se engancha al
     /// binario, así que es más estable que la ruta del proceso.
     pub perfil: String,
@@ -325,10 +414,12 @@ pub fn anotar(pendientes: &Pendientes, bloqueo: Bloqueo) -> bool {
     let Ok(mut lista) = pendientes.lock() else {
         return false;
     };
-    if let Some(ya) = lista
-        .iter_mut()
-        .find(|b| b.perfil == bloqueo.perfil && b.ruta == bloqueo.ruta && b.mascara == bloqueo.mascara)
-    {
+    if let Some(ya) = lista.iter_mut().find(|b| {
+        b.uid == bloqueo.uid
+            && b.perfil == bloqueo.perfil
+            && b.ruta == bloqueo.ruta
+            && b.mascara == bloqueo.mascara
+    }) {
         ya.veces = ya.veces.saturating_add(1);
         return false;
     }
@@ -339,15 +430,24 @@ pub fn anotar(pendientes: &Pendientes, bloqueo: Bloqueo) -> bool {
     true
 }
 
-/// Lo que está esperando decisión.
-pub fn listar(pendientes: &Pendientes) -> Vec<Bloqueo> {
-    pendientes.lock().map(|l| l.clone()).unwrap_or_default()
+/// Lo que está esperando decisión, para esa persona.
+///
+/// Se filtra por usuario y no se devuelve todo: este servicio atiende a todos
+/// los del equipo, y la lista lleva rutas de archivos. `/home/otro/Documentos/…`
+/// cuenta qué tiene esa persona en su carpeta aunque nunca se le conceda nada.
+pub fn listar(pendientes: &Pendientes, uid: u32) -> Vec<Bloqueo> {
+    pendientes
+        .lock()
+        .map(|l| l.iter().filter(|b| b.uid == uid).cloned().collect())
+        .unwrap_or_default()
 }
 
-/// Saca uno de la lista, ya decidido.
-pub fn quitar(pendientes: &Pendientes, perfil: &str, ruta: &str) -> Option<Bloqueo> {
+/// Saca uno de la lista, ya decidido. Sólo de quien lo sufrió.
+pub fn quitar(pendientes: &Pendientes, uid: u32, perfil: &str, ruta: &str) -> Option<Bloqueo> {
     let mut lista = pendientes.lock().ok()?;
-    let i = lista.iter().position(|b| b.perfil == perfil && b.ruta == ruta)?;
+    let i = lista
+        .iter()
+        .position(|b| b.uid == uid && b.perfil == perfil && b.ruta == ruta)?;
     Some(lista.remove(i))
 }
 
@@ -403,8 +503,101 @@ mod tests {
         );
         assert!(ubicar("no-existe-este-perfil-12345").is_none());
     }
+    /// Dos personas, el mismo perfil, el mismo archivo: **las dos** tienen que
+    /// enterarse.
+    ///
+    /// Sin el uid en la identidad, el bloqueo de la segunda se fusionaba con el
+    /// de la primera, `anotar` decía «ya estaba» y no se avisaba. La segunda se
+    /// quedaba con un programa que falla y sin nada que le dijera por qué.
+    #[test]
+    fn dos_personas_reciben_su_propio_aviso() {
+        let p = pendientes_nuevos();
+        assert!(anotar(&p, bloqueo_de(1000, "firefox", "/etc/x")));
+        assert!(
+            anotar(&p, bloqueo_de(1001, "firefox", "/etc/x")),
+            "a la segunda persona no se le avisó"
+        );
+    }
+
+    /// Y cada una ve lo suyo y nada más.
+    ///
+    /// La lista lleva rutas de archivos: devolverla entera contaría qué tiene
+    /// otra persona en su carpeta a cualquiera que sepa llamar a un método.
+    #[test]
+    fn cada_persona_ve_solo_sus_bloqueos() {
+        let p = pendientes_nuevos();
+        anotar(&p, bloqueo_de(1000, "firefox", "/home/ana/secreto"));
+        anotar(&p, bloqueo_de(1001, "firefox", "/home/juan/otro"));
+
+        let de_ana = listar(&p, 1000);
+        assert_eq!(de_ana.len(), 1);
+        assert_eq!(de_ana[0].ruta, "/home/ana/secreto");
+        assert_eq!(listar(&p, 1001).len(), 1);
+        assert!(listar(&p, 9999).is_empty());
+    }
+
+    /// Y no se puede descartar el bloqueo de otra persona: se lo sacaría de la
+    /// vista algo que ella todavía tiene que decidir.
+    #[test]
+    fn no_se_descarta_el_bloqueo_de_otra_persona() {
+        let p = pendientes_nuevos();
+        anotar(&p, bloqueo_de(1000, "firefox", "/etc/x"));
+        assert!(quitar(&p, 1001, "firefox", "/etc/x").is_none());
+        assert_eq!(listar(&p, 1000).len(), 1);
+    }
+
+    /// El archivo se escribe entero o no se toca.
+    ///
+    /// Es política que el kernel compila: uno truncado deja un perfil que no
+    /// carga, o una regla cortada al medio.
+    #[test]
+    fn no_queda_ningun_temporal_tirado() {
+        let raiz = tmp("temporales");
+        let regla = regla_para("/home/ana/x.txt", "rw").unwrap();
+        conceder_en("firefox", &regla, &raiz).unwrap();
+
+        let sobrantes: Vec<_> = std::fs::read_dir(&raiz)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(sobrantes.is_empty(), "quedó un temporal: {sobrantes:?}");
+
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// Si la recarga falla, el archivo tiene que volver a como estaba.
+    ///
+    /// Es el caso que mentía dos veces: primero dejaba el archivo con la regla y
+    /// el kernel con la política vieja, y después el reintento veía la regla ya
+    /// escrita, se salteaba la recarga e informaba **éxito** — con el permiso
+    /// concedido en el archivo y sin efecto en el kernel, para siempre.
+    ///
+    /// Acá la recarga falla de verdad: el perfil no existe en el sistema, así
+    /// que `recargar` no encuentra su archivo.
+    #[test]
+    fn si_la_recarga_falla_el_archivo_vuelve_atras() {
+        let raiz = tmp("rollback");
+        let regla = regla_para("/home/ana/x.txt", "rw").unwrap();
+
+        let resultado = conceder_y_recargar("perfil-que-no-existe-12345", &regla, &raiz);
+
+        assert!(resultado.is_err(), "debería fallar: el perfil no está instalado");
+        assert!(
+            concedidas_en("perfil-que-no-existe-12345", &raiz).is_empty(),
+            "quedó la regla escrita con el kernel sin enterarse"
+        );
+
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
     fn bloqueo(perfil: &str, ruta: &str) -> Bloqueo {
+        bloqueo_de(1000, perfil, ruta)
+    }
+
+    fn bloqueo_de(uid: u32, perfil: &str, ruta: &str) -> Bloqueo {
         Bloqueo {
+            uid,
             perfil: perfil.into(),
             ruta: ruta.into(),
             mascara: "r".into(),
@@ -423,7 +616,7 @@ mod tests {
         assert!(!anotar(&p, bloqueo("firefox", "/etc/x")));
         assert!(!anotar(&p, bloqueo("firefox", "/etc/x")));
 
-        let lista = listar(&p);
+        let lista = listar(&p, 1000);
         assert_eq!(lista.len(), 1);
         assert_eq!(lista[0].veces, 3);
     }
@@ -434,7 +627,7 @@ mod tests {
         anotar(&p, bloqueo("firefox", "/etc/uno"));
         anotar(&p, bloqueo("firefox", "/etc/dos"));
         anotar(&p, bloqueo("thunderbird", "/etc/uno"));
-        assert_eq!(listar(&p).len(), 3);
+        assert_eq!(listar(&p, 1000).len(), 3);
     }
 
     /// El techo existe porque un perfil recién puesto a hacer cumplir puede
@@ -445,7 +638,7 @@ mod tests {
         for i in 0..(MAXIMO + 50) {
             anotar(&p, bloqueo("firefox", &format!("/etc/{i}")));
         }
-        assert_eq!(listar(&p).len(), MAXIMO);
+        assert_eq!(listar(&p, 1000).len(), MAXIMO);
     }
 
     #[test]
@@ -454,10 +647,10 @@ mod tests {
         anotar(&p, bloqueo("firefox", "/etc/uno"));
         anotar(&p, bloqueo("firefox", "/etc/dos"));
 
-        assert!(quitar(&p, "firefox", "/etc/uno").is_some());
-        assert_eq!(listar(&p).len(), 1);
+        assert!(quitar(&p, 1000, "firefox", "/etc/uno").is_some());
+        assert_eq!(listar(&p, 1000).len(), 1);
         // Y no vuelve a salir el que ya no está.
-        assert!(quitar(&p, "firefox", "/etc/uno").is_none());
+        assert!(quitar(&p, 1000, "firefox", "/etc/uno").is_none());
     }
     /// El caso que justifica toda la validación: la ruta la elige el programa
     /// bloqueado, y una regla mal formada le daría acceso a lo que quiera
