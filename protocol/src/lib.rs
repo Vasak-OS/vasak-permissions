@@ -298,8 +298,18 @@ pub struct PermissionRequest {
     pub application: Application,
     pub resource_id: String,
     /// Extra context for account resources: which account is being asked for.
-    /// Empty for hardware resources.
+    /// For a generic file block, the path that was denied. Empty otherwise.
     pub detail: String,
+    /// El perfil de AppArmor que produjo el bloqueo, cuando lo hubo.
+    ///
+    /// Hace falta para poder **decidir desde el aviso**: permitir un bloqueo
+    /// genérico se pide como `AllowBlocked(perfil, ruta)`, y sin el perfil el
+    /// aviso sólo puede contar lo que pasó y mandar a Configuración.
+    ///
+    /// Con `default` para que un agente viejo y un servicio nuevo se sigan
+    /// entendiendo: el campo llega vacío y el aviso se comporta como antes.
+    #[serde(default)]
+    pub profile: String,
 }
 
 #[cfg(test)]

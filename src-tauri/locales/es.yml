@@ -55,6 +55,8 @@ blocked:
   microphone: "{0} quiso usar el micrófono"
   credentials: "{0} quiso usar tus claves"
   file: "{0} no pudo abrir un archivo"
+  allow: "Permitir…"
+  deny: "No permitir"
   body: >-
     VasakOS se lo impidió: las aplicaciones que no instala el sistema no tienen
     acceso a la cámara ni al micrófono.
