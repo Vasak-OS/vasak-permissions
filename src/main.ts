@@ -1,5 +1,5 @@
 import { useConfigStore } from '@vasakgroup/plugin-config-manager';
-import { createPinia, type Store } from 'pinia';
+import { createPinia } from 'pinia';
 import { createApp } from 'vue';
 import App from '@/App.vue';
 import { disableNativeContextMenu } from '@/tools/native-menu';
@@ -93,15 +93,7 @@ app.use(pinia);
 // dos segundos, así que un destello en claro y después el cambio se ve peor que
 // la espera. Si la configuración no contesta, con los colores por omisión sigue
 // siendo un diálogo usable; lo que no puede es no aparecer.
-// `loadConfig` va en el cuarto parámetro, que es el de las acciones: metida en
-// el segundo —el del estado— la aserción esconde su firma real y `vue-tsc` deja
-// de comprobar la llamada.
-const configuracion = useConfigStore() as unknown as Store<
-	'config',
-	{ config: unknown },
-	Record<string, never>,
-	{ loadConfig: () => Promise<void> }
->;
+const configuracion = useConfigStore();
 
 await Promise.race([
 	configuracion.loadConfig().catch((error: unknown) => {
