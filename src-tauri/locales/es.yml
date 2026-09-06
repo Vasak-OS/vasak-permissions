@@ -54,11 +54,22 @@ blocked:
   camera: "{0} quiso usar la cámara"
   microphone: "{0} quiso usar el micrófono"
   credentials: "{0} quiso usar tus claves"
+  file: "{0} no pudo abrir un archivo"
   body: >-
     VasakOS se lo impidió: las aplicaciones que no instala el sistema no tienen
     acceso a la cámara ni al micrófono.
+  body-file: >-
+    Un perfil de seguridad le impidió abrir {1}. Si esperabas que lo hiciera,
+    podés permitírselo en Configuración, en Privacidad y seguridad.
   body-credentials: >-
     VasakOS se lo impidió. Ninguna aplicación que no instale el sistema puede
     leer tus claves de SSH y GPG, el llavero ni los accesos guardados, ni
     pedirle a los agentes que firmen por ella. Si no esperabas esto, cerrá la
     aplicación.
+
+screencast:
+  title: ¿Le permitís compartir tu pantalla?
+  subtitle: Va a ver todo lo que tengas abierto mientras dure.
+  body: >-
+    Si aceptás, después vas a elegir qué pantalla. Podés dejar de compartir en
+    cualquier momento desde el indicador de la barra.

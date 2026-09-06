@@ -11,6 +11,7 @@
 //! neither, which is exactly why the online-accounts list it replaces was
 //! decorative — anyone could edit the file and grant themselves anything.
 
+mod local;
 mod procesos;
 mod audit;
 mod excepcion;
@@ -46,6 +47,12 @@ struct PermissionService {
     write_lock: Arc<Mutex<()>>,
     /// Ceiling on how many dialogs a person can be shown at once.
     throttle: Arc<Mutex<PromptThrottle>>,
+    /// Lo que algún perfil ajeno bloqueó y todavía nadie decidió.
+    ///
+    /// Va acá y no en la política porque es otra cosa: la política guarda
+    /// decisiones sobre recursos con nombre, y esto es una lista de hechos —tal
+    /// perfil no dejó abrir tal ruta— que existe hasta que alguien la resuelve.
+    pendientes: crate::local::Pendientes,
 }
 
 /// Rejects anything this service cannot honour.
@@ -341,6 +348,119 @@ impl PermissionService {
         self.store.save(caller.uid, &policy).map_err(FdoError::Failed)
     }
 
+    /// Lo que algún perfil bloqueó y todavía nadie decidió.
+    ///
+    /// Sale como JSON por la misma razón que las consultas de permiso: la forma
+    /// vive en un solo lugar y no se repite como firma de D-Bus en cada lado.
+    ///
+    /// No pide autorización: leer qué se bloqueó no concede nada, y pedir la
+    /// contraseña para *mirar* haría que la pantalla de seguridad la pida al
+    /// abrirse, que es la forma más rápida de que la gente aprenda a tipearla
+    /// sin leer.
+    ///
+    /// Pero sí se mira **quién** pregunta, y se devuelve sólo lo suyo. Este
+    /// servicio atiende a todos los del equipo y la lista lleva rutas de
+    /// archivos: devolverla entera contaría qué tiene otra persona en su
+    /// carpeta a cualquiera que sepa llamar a un método de D-Bus.
+    async fn list_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let caller = caller_of(connection, &header).await?;
+        let lista = crate::local::listar(&self.pendientes, caller.uid);
+        serde_json::to_string(&lista)
+            .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Permite exactamente lo que se bloqueó: ese perfil, esa ruta, esos
+    /// permisos.
+    ///
+    /// Detrás de polkit, como todo lo que cambia la política. Escribe la
+    /// excepción en `/etc/apparmor.d/local/<perfil>` y recarga el perfil, así
+    /// que tiene efecto sin reiniciar nada.
+    ///
+    /// La ruta y los permisos **no** se toman del llamador: se buscan en la
+    /// lista de bloqueos por perfil y ruta. Aceptar una máscara arbitraria
+    /// dejaría que un programa pidiera `rwlkm` sobre algo que sólo se le negó
+    /// leer, y la persona estaría autorizando más de lo que la pantalla dice.
+    async fn allow_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        profile: String,
+        path: String,
+    ) -> zbus::fdo::Result<()> {
+        let caller = caller_of(connection, &header).await?;
+        polkit::authorize(connection, &caller).await?;
+
+        // Sólo de la propia lista: si no, alguien podría permitirle a un
+        // programa de otra persona el acceso a un archivo de ella.
+        let bloqueo = crate::local::listar(&self.pendientes, caller.uid)
+            .into_iter()
+            .find(|b| b.perfil == profile && b.ruta == path)
+            .ok_or_else(|| FdoError::InvalidArgs("ese bloqueo ya no está en la lista".into()))?;
+
+        let regla = crate::local::regla_para(&bloqueo.ruta, &bloqueo.mascara)
+            .map_err(|m| FdoError::InvalidArgs(m.to_string()))?;
+
+        let _guard = self.write_lock.lock().await;
+        // El archivo y el kernel se mueven juntos o no se mueve ninguno.
+        crate::local::conceder_y_recargar(&bloqueo.perfil, &regla, &crate::local::raiz())
+            .map_err(FdoError::Failed)?;
+
+        // Recién ahora sale de la lista: sacarlo antes de que la política esté
+        // en efecto dejaría a la persona sin el aviso y sin el permiso.
+        crate::local::quitar(&self.pendientes, caller.uid, &profile, &path);
+        Ok(())
+    }
+
+    /// Saca un bloqueo de la lista sin permitirlo: la respuesta es que no.
+    ///
+    /// No hace falta autorizar: no conceder nada es el estado en el que ya
+    /// estaba, así que esto no cambia lo que el sistema permite.
+    async fn dismiss_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        profile: String,
+        path: String,
+    ) -> zbus::fdo::Result<()> {
+        // Sin autorizar, pero sólo sobre lo propio: descartar el bloqueo de otra
+        // persona le sacaría de la vista algo que ella todavía tiene que
+        // decidir, y no volvería a aparecer hasta el próximo intento.
+        let caller = caller_of(connection, &header).await?;
+        crate::local::quitar(&self.pendientes, caller.uid, &profile, &path);
+        Ok(())
+    }
+
+    /// Vuelve a bloquear algo que se había permitido.
+    async fn revoke_blocked(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        profile: String,
+        rule: String,
+    ) -> zbus::fdo::Result<()> {
+        let caller = caller_of(connection, &header).await?;
+        polkit::authorize(connection, &caller).await?;
+
+        let _guard = self.write_lock.lock().await;
+        crate::local::revocar_y_recargar(&profile, &rule, &crate::local::raiz())
+            .map_err(FdoError::Failed)
+
+    }
+
+    /// Lo que ya se le permitió a un perfil, para poder retirarlo.
+    async fn list_allowed(&self, profile: String) -> zbus::fdo::Result<String> {
+        if !crate::local::perfil_valido(&profile) {
+            return Err(FdoError::InvalidArgs("nombre de perfil inválido".into()));
+        }
+        let reglas = crate::local::concedidas_en(&profile, &crate::local::raiz());
+        serde_json::to_string(&reglas)
+            .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
     /// Offers this connection as the dialog agent for the calling user.
     ///
     /// Accepted only from the installed agent binary — see `AgentRegistry`.
@@ -436,11 +556,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_para_el_vigilante = store.clone();
     let write_lock_para_el_vigilante = Arc::clone(&write_lock);
 
+    let pendientes = local::pendientes_nuevos();
+
     let service = PermissionService {
         store,
         agents: Arc::clone(&agents),
         write_lock,
         throttle: Arc::new(Mutex::new(PromptThrottle::default())),
+        pendientes: Arc::clone(&pendientes),
     };
 
     let connection = service_bus()?
@@ -466,6 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store_para_el_vigilante,
         write_lock_para_el_vigilante,
         procesos,
+        pendientes.clone(),
     ));
 
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");

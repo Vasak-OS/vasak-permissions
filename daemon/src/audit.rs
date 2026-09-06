@@ -53,6 +53,13 @@ pub struct Denegacion {
     /// reciclado devolvería la aplicación que heredó el número en vez de la que
     /// fue bloqueada.
     pub momento: std::time::Duration,
+    /// Qué permisos se le negaron, tal como los informa el kernel.
+    ///
+    /// Hace falta para conceder exactamente eso y no más: un programa al que
+    /// se le negó leer un archivo no necesita poder escribirlo, y una
+    /// excepción que conceda `rw` porque es más fácil da más de lo que se
+    /// pidió.
+    pub mascara: String,
 }
 
 /// El perfil general, el que confina a toda aplicación sin excepción propia.
@@ -96,16 +103,22 @@ fn numero_de(linea: &str, clave: &str) -> Option<u32> {
 
 /// Interpreta una línea del registro del kernel.
 ///
-/// Devuelve `None` para todo lo que no sea una denegación de uno de nuestros
-/// perfiles, que es la enorme mayoría de lo que pasa por ahí.
+/// Devuelve `None` para todo lo que no sea una denegación, que es la enorme
+/// mayoría de lo que pasa por ahí.
+///
+/// Los perfiles ajenos **ya no se descartan acá**. Se clasifican después, con
+/// [`es_nuestro`]: los nuestros van al flujo de recursos con nombre —cámara,
+/// micrófono, credenciales— y los demás al genérico, donde lo que se ofrece
+/// desbloquear es la ruta concreta. Descartarlos era lo que dejaba a los más de
+/// mil quinientos perfiles del sistema bloqueando sin aviso y sin remedio.
+///
+/// Sólo `DENIED`: en modo aviso el kernel escribe `ALLOWED`, y avisar de algo
+/// que no se bloqueó sería ruido sobre una decisión que no ocurrió.
 pub fn parsear(linea: &str) -> Option<Denegacion> {
     if texto_de(linea, "apparmor")? != "DENIED" {
         return None;
     }
     let perfil = texto_de(linea, "profile")?;
-    if !es_nuestro(perfil) {
-        return None;
-    }
     Some(Denegacion {
         perfil: perfil.to_string(),
         ruta: texto_de(linea, "name")?.to_string(),
@@ -114,6 +127,9 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
         // es el archivo. Para saber a quién avisarle hace falta el primero.
         uid: numero_de(linea, "fsuid")?,
         momento: momento_de(linea).unwrap_or_default(),
+        // Si el kernel no la trae, `r` es la suposición más chica: se concede
+        // lo mínimo y, si hacía falta más, vuelve a aparecer un bloqueo.
+        mascara: texto_de(linea, "denied_mask").unwrap_or("r").to_string(),
     })
 }
 
@@ -248,6 +264,7 @@ pub async fn vigilar(
     store: crate::policy::PolicyStore,
     write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     procesos: crate::procesos::Cache,
+    pendientes: crate::local::Pendientes,
 ) {
     let (envio, mut recepcion) = tokio::sync::mpsc::channel::<Denegacion>(64);
 
@@ -284,10 +301,65 @@ pub async fn vigilar(
 
     let mut recientes: HashMap<(u32, String, String), Instant> = HashMap::new();
     while let Some(denegacion) = recepcion.recv().await {
+        // Un bloqueo de un perfil ajeno —de los más de mil quinientos que trae
+        // el sistema— no tiene un recurso con nombre: lo que se puede ofrecer
+        // desbloquear es la ruta concreta. Antes se descartaba, y eso dejaba a
+        // la persona con un programa que falla sin explicación y sin remedio.
+        if !es_nuestro(&denegacion.perfil) {
+            let programa = crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let primera_vez = crate::local::anotar(
+                &pendientes,
+                crate::local::Bloqueo {
+                    uid: denegacion.uid,
+                    perfil: denegacion.perfil.clone(),
+                    ruta: denegacion.ruta.clone(),
+                    mascara: denegacion.mascara.clone(),
+                    programa: programa.clone(),
+                    veces: 1,
+                },
+            );
+
+            // Se avisa la primera vez y no en cada reintento. Un programa
+            // bloqueado suele reintentar en bucle, y una notificación por
+            // intento haría que la persona apague los avisos — con lo cual el
+            // próximo, el que sí importaba, tampoco se vería.
+            if primera_vez {
+                let aplicacion = crate::identity::describe_path(if programa.is_empty() {
+                    &denegacion.perfil
+                } else {
+                    &programa
+                });
+                // En una tarea aparte y con cupo, igual que los avisos de
+                // recursos con nombre. Esperando acá, un daemon de
+                // notificaciones lento o ausente frenaría la lectura del
+                // registro del kernel —que no espera a nadie y sigue rotando—,
+                // y se perderían denegaciones por esperar a una notificación.
+                match cupo().clone().try_acquire_owned() {
+                    Ok(permiso) => {
+                        let connection = connection.clone();
+                        let agents = agents.clone();
+                        let uid = denegacion.uid;
+                        let ruta = denegacion.ruta.clone();
+                        tokio::spawn(async move {
+                            let _permiso = permiso;
+                            crate::agent::avisar_de_archivo(
+                                &connection, &agents, uid, &aplicacion, &ruta,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => tracing::debug!("Demasiados avisos a la vez; se descarta uno"),
+                }
+            }
+            continue;
+        }
+
         let Some(recurso) = recurso_de(&denegacion.ruta) else {
-            // Un perfil nuestro negó algo que este módulo no sabe nombrar.
+            // Un perfil **nuestro** negó algo que este módulo no sabe nombrar.
             // Vale la pena que quede escrito: significa que el perfil y esto se
-            // desincronizaron.
+            // desincronizaron, que es la falla muda que las pruebas cuidan.
             tracing::warn!(
                 "El perfil '{}' bloqueó '{}', que no sé a qué recurso corresponde",
                 denegacion.perfil,
@@ -524,25 +596,6 @@ mod tests {
     /// bloqueos de esa aplicación: se le niega la clave de SSH, no aparece
     /// aviso, no aparece en la lista, y no hay forma de concederle nada más.
     /// Conceder un permiso no puede apagar los avisos de los otros.
-    /// Y los perfiles ajenos se siguen descartando.
-    ///
-    /// Importa más ahora que el sistema envía más de quinientos perfiles de
-    /// terceros: sin este filtro, cada bloqueo de cualquiera de ellos saldría
-    /// como un aviso de VasakOS sobre una decisión que no tomamos, y la persona
-    /// aprendería a ignorarlos — que es la forma de arruinar un aviso que sí
-    /// importa.
-    #[test]
-    fn un_perfil_ajeno_se_descarta() {
-        for perfil in ["firefox", "thunderbird", "dbus-system", "vasak", "appimage"] {
-            let linea = format!(
-                "audit(1788539628.817:1): apparmor=\"DENIED\" operation=\"open\" \
-                 profile=\"{perfil}\" name=\"/home/ana/.ssh/id\" pid=1 comm=\"x\" \
-                 requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=1000"
-            );
-            assert!(parsear(&linea).is_none(), "no debería avisar de «{perfil}»");
-        }
-    }
-
     #[test]
     fn un_bloqueo_bajo_un_perfil_de_excepcion_no_se_descarta() {
         let nombre = crate::excepcion::nombre_de("/home/ana/Apps/cosa.AppImage");
@@ -679,12 +732,28 @@ mod tests {
         assert_eq!(parsear(&permitido), None);
     }
 
-    /// El paquete `apparmor` trae 145 perfiles de terceros. Avisar de sus
-    /// bloqueos sería hablar de decisiones que no tomamos nosotros.
+    /// Los perfiles ajenos ya **no** se descartan: se clasifican.
+    ///
+    /// Antes se tiraban acá, y eso era lo que dejaba a los más de mil
+    /// quinientos perfiles del sistema bloqueando sin aviso y sin forma de
+    /// permitir nada — la razón por la que había que tenerlos en modo aviso.
+    /// Ahora llegan, y `es_nuestro` decide a qué flujo van.
     #[test]
-    fn los_perfiles_ajenos_se_ignoran() {
+    fn un_perfil_ajeno_llega_y_se_clasifica_como_ajeno() {
         let ajeno = REAL.replace("vasak-appimage", "usr.bin.man");
-        assert_eq!(parsear(&ajeno), None);
+        let d = parsear(&ajeno).expect("la denegación tiene que llegar");
+        assert_eq!(d.perfil, "usr.bin.man");
+        assert!(!es_nuestro(&d.perfil));
+    }
+
+    /// Y los nuestros siguen distinguiéndose.
+    #[test]
+    fn los_nuestros_se_reconocen_como_nuestros() {
+        assert!(es_nuestro("vasak-appimage"));
+        assert!(es_nuestro(&crate::excepcion::nombre_de("/home/ana/x.AppImage")));
+        for ajeno in ["firefox", "usr.bin.man", "dbus-system", "vasak", "appimage"] {
+            assert!(!es_nuestro(ajeno), "«{ajeno}» no es nuestro");
+        }
     }
 
     #[test]

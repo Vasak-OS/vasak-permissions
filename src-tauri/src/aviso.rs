@@ -21,6 +21,7 @@ fn icono_de(resource_id: &str) -> &'static str {
     match resource_id {
         "microphone" => "audio-input-microphone",
         "credentials" => "dialog-password",
+        "file" => "dialog-warning",
         _ => "camera-web",
     }
 }
@@ -36,6 +37,14 @@ fn icono_de(resource_id: &str) -> &'static str {
 /// únicos para los que hay texto traducido: cualquier otro terminaría mostrando
 /// la clave cruda.
 pub fn se_avisa_de(resource_id: &str) -> bool {
+    // `file` no es un `Resource` y no debe serlo: el sujeto del aviso es una
+    // ruta, y una variante que lleve una ruta adentro tendría cardinalidad
+    // infinita y se colaría en el almacén de decisiones y en la lista de
+    // recursos de Configuración. Se acepta acá, que es donde importa: hay texto
+    // traducido para él.
+    if resource_id == "file" {
+        return true;
+    }
     matches!(
         Resource::from_id(resource_id),
         Some(Resource::Camera) | Some(Resource::Microphone) | Some(Resource::Credentials)
@@ -49,6 +58,16 @@ pub fn se_avisa_de(resource_id: &str) -> bool {
 /// `{0}` tal cual.
 pub fn texto(plantilla: &str, nombre_de_la_app: &str) -> String {
     plantilla.replace("{0}", nombre_de_la_app)
+}
+
+/// Igual, con un segundo dato: la ruta que se bloqueó.
+///
+/// Va en el cuerpo y no en el título porque una ruta larga empujaría afuera el
+/// nombre de la aplicación, que es lo primero que la persona necesita leer.
+pub fn texto_con_detalle(plantilla: &str, nombre_de_la_app: &str, detalle: &str) -> String {
+    plantilla
+        .replace("{0}", nombre_de_la_app)
+        .replace("{1}", detalle)
 }
 
 /// Muestra el aviso.
@@ -69,12 +88,15 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
     // credenciales sería directamente falso — diría que se impidió el acceso a
     // la cámara cuando lo que se impidió fue leer tus claves. Un aviso que
     // explica mal lo que pasó es peor que uno escueto.
-    let cuerpo = app
-        .i18n()
-        .translate(&format!("blocked.body-{}", aviso.resource_id))
-        .or_else(|| app.i18n().translate("blocked.body"))
-        .unwrap_or("")
-        .to_string();
+    let cuerpo = {
+        let plantilla = app
+            .i18n()
+            .translate(&format!("blocked.body-{}", aviso.resource_id))
+            .or_else(|| app.i18n().translate("blocked.body"))
+            .unwrap_or("")
+            .to_string();
+        texto_con_detalle(&plantilla, &aviso.application.display_name, &aviso.detail)
+    };
 
     let connection = match zbus::Connection::session().await {
         Ok(connection) => connection,
@@ -114,6 +136,31 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El aviso genérico: el sujeto es una ruta, no un recurso con nombre.
+    #[test]
+    fn se_avisa_de_un_bloqueo_de_archivo() {
+        assert!(se_avisa_de("file"));
+    }
+
+    /// Y el cuerpo pone las dos cosas: quién y qué archivo.
+    #[test]
+    fn el_cuerpo_lleva_la_aplicacion_y_la_ruta() {
+        let texto = texto_con_detalle(
+            "Un perfil le impidió abrir {1}. Fue {0}.",
+            "Firefox",
+            "/etc/shadow",
+        );
+        assert_eq!(texto, "Un perfil le impidió abrir /etc/shadow. Fue Firefox.");
+    }
+
+    /// Una plantilla a la que le falte un marcador no puede romper el aviso ni
+    /// dejar un «{1}» a la vista de la persona.
+    #[test]
+    fn una_plantilla_incompleta_no_deja_marcadores_sueltos() {
+        assert_eq!(texto_con_detalle("Se bloqueó algo", "App", "/x"), "Se bloqueó algo");
+        assert_eq!(texto_con_detalle("{0} falló", "App", "/x"), "App falló");
+    }
 
     #[test]
     fn el_nombre_de_la_aplicacion_reemplaza_al_marcador() {

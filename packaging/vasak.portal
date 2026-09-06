@@ -1,9 +1,17 @@
 [portal]
 DBusName=org.freedesktop.impl.portal.desktop.vasak
-# Only the permission dialog. Screen capture and screenshots stay with
-# xdg-desktop-portal-wlr, which is what actually knows how to capture a wlroots
-# compositor's output — implementing them here would mean reimplementing that.
-Interfaces=org.freedesktop.impl.portal.Access;
+# El diálogo de permisos y la captura de pantalla.
+#
+# La captura no se implementa acá: se pregunta acá y se reenvía a
+# xdg-desktop-portal-wlr, que es el que sabe capturar la salida de un compositor
+# wlroots. Está en el medio porque wlr no tiene diálogo de permiso —sólo un
+# selector de monitor, que no dice qué aplicación pide, no se recuerda y no se
+# puede revocar—, así que sin esto una aplicación que pedía capturar la pantalla
+# la recibía sin que se le preguntara nada a nadie.
+#
+# Las capturas de pantalla sueltas (Screenshot) siguen siendo de wlr: las dispara
+# la persona con una tecla, no una aplicación a sus espaldas.
+Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.ScreenCast;
 # `Vasak`, que es lo que la sesión exporta en XDG_CURRENT_DESKTOP. Decía
 # «VasakOS» y no coincidía con nada, así que ni por este camino —el obsoleto— el
 # portal elegía este backend: caía en «last-resort fallback» y todos los permisos

@@ -99,8 +99,15 @@ pub async fn serve(app: AppHandle) -> Result<zbus::Connection, String> {
         .map_err(|e| format!("no se pudo abrir el bus de sesión: {e}"))?
         .name(BACKEND_NAME)
         .map_err(|e| format!("no se pudo tomar el nombre {BACKEND_NAME}: {e}"))?
-        .serve_at(BACKEND_PATH, AccessBackend { app })
+        .serve_at(BACKEND_PATH, AccessBackend { app: app.clone() })
         .map_err(|e| format!("no se pudo publicar el backend del portal: {e}"))?
+        // La captura de pantalla, en el mismo nombre y el mismo camino: el
+        // portal busca todas las interfaces de un backend ahí.
+        .serve_at(
+            BACKEND_PATH,
+            crate::portal_screencast::ScreenCastBackend { app },
+        )
+        .map_err(|e| format!("no se pudo publicar el backend de captura: {e}"))?
         .build()
         .await
         .map_err(|e| format!("no se pudo conectar al bus de sesión: {e}"))
