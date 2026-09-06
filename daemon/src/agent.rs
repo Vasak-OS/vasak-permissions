@@ -130,6 +130,38 @@ pub async fn avisar_de_bloqueo(
     application: &vasak_permissions_protocol::Application,
     resource: &vasak_permissions_protocol::Resource,
 ) {
+    avisar(connection, agents, uid, application, &resource.as_id(), String::new()).await
+}
+
+/// Avisa de un bloqueo que no es de un recurso con nombre.
+///
+/// Los perfiles del sistema niegan **rutas**, no cámaras ni micrófonos, así que
+/// no hay un `Resource` que nombrar: el sujeto del aviso es el archivo, y va en
+/// `detail`.
+///
+/// No se agregó una variante al enumerado a propósito. `Resource` es lo que la
+/// política guarda y lo que la pantalla lista por aplicación; una variante que
+/// lleve una ruta adentro tendría cardinalidad infinita y se colaría en el
+/// almacén de decisiones, en `check_resource` y en la lista de recursos de
+/// Configuración, donde no tiene sentido.
+pub async fn avisar_de_archivo(
+    connection: &zbus::Connection,
+    agents: &SharedAgents,
+    uid: u32,
+    application: &vasak_permissions_protocol::Application,
+    ruta: &str,
+) {
+    avisar(connection, agents, uid, application, "file", ruta.to_string()).await
+}
+
+async fn avisar(
+    connection: &zbus::Connection,
+    agents: &SharedAgents,
+    uid: u32,
+    application: &vasak_permissions_protocol::Application,
+    resource_id: &str,
+    detail: String,
+) {
     let Some(agent) = agents.lock().await.agent_for(uid) else {
         tracing::debug!("Sin agente para el usuario {uid}; el aviso se descarta");
         return;
@@ -137,8 +169,8 @@ pub async fn avisar_de_bloqueo(
 
     let aviso = PermissionRequest {
         application: application.clone(),
-        resource_id: resource.as_id(),
-        detail: String::new(),
+        resource_id: resource_id.to_string(),
+        detail,
     };
     let Ok(payload) = serde_json::to_string(&aviso) else {
         return;

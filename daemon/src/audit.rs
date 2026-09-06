@@ -309,16 +309,36 @@ pub async fn vigilar(
             let programa = crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento)
                 .map(|r| r.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            crate::local::anotar(
+            let primera_vez = crate::local::anotar(
                 &pendientes,
                 crate::local::Bloqueo {
                     perfil: denegacion.perfil.clone(),
                     ruta: denegacion.ruta.clone(),
                     mascara: denegacion.mascara.clone(),
-                    programa,
+                    programa: programa.clone(),
                     veces: 1,
                 },
             );
+
+            // Se avisa la primera vez y no en cada reintento. Un programa
+            // bloqueado suele reintentar en bucle, y una notificación por
+            // intento haría que la persona apague los avisos — con lo cual el
+            // próximo, el que sí importaba, tampoco se vería.
+            if primera_vez {
+                let aplicacion = crate::identity::describe_path(if programa.is_empty() {
+                    &denegacion.perfil
+                } else {
+                    &programa
+                });
+                crate::agent::avisar_de_archivo(
+                    &connection,
+                    &agents,
+                    denegacion.uid,
+                    &aplicacion,
+                    &denegacion.ruta,
+                )
+                .await;
+            }
             continue;
         }
 

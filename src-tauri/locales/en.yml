@@ -54,9 +54,13 @@ blocked:
   camera: "{0} tried to use the camera"
   microphone: "{0} tried to use the microphone"
   credentials: "{0} tried to use your keys"
+  file: "{0} could not open a file"
   body: >-
     VasakOS blocked it: applications the system did not install have no access
     to the camera or the microphone.
+  body-file: >-
+    A security profile stopped it from opening {1}. If you expected this, you
+    can allow it in Settings, under Privacy and security.
   body-credentials: >-
     VasakOS blocked it. No application the system did not install can read your
     SSH and GPG keys, the keyring or your saved logins, nor ask the agents to
