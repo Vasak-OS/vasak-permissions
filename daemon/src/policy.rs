@@ -21,6 +21,13 @@ const POLICY_DIR: &str = "/var/lib/vasak-permissions";
 struct StoredApplication {
     display_name: String,
     provenance: Provenance,
+    /// Si este programa consulta al servicio antes de usar el recurso.
+    ///
+    /// Con `default` para que una política escrita antes de que este campo
+    /// existiera se siga leyendo: sale en `false`, que es lo que valía hasta
+    /// ahora — todo lo anotado venía de observar un bloqueo.
+    #[serde(default)]
+    asks: bool,
     /// Resource id → decision.
     decisions: BTreeMap<String, Decision>,
 }
@@ -43,13 +50,27 @@ impl UserPolicy {
 
     /// Records an answer, replacing whatever was decided before for the same
     /// program and resource.
-    pub fn record(&mut self, application: &Application, resource_id: &str, decision: Decision) {
+    /// Anota una decisión.
+    ///
+    /// `pregunto` dice **de dónde vino**: `true` si el programa consultó al
+    /// servicio, `false` si lo que se observó fue un bloqueo del kernel. No es
+    /// un detalle contable — decide si la pantalla puede ofrecer cambiarla,
+    /// porque un programa que pregunta respeta la respuesta aunque ningún
+    /// perfil lo limite.
+    pub fn record(
+        &mut self,
+        application: &Application,
+        resource_id: &str,
+        decision: Decision,
+        pregunto: bool,
+    ) {
         let entry = self
             .applications
             .entry(application.binary_path.clone())
             .or_insert_with(|| StoredApplication {
                 display_name: application.display_name.clone(),
                 provenance: application.provenance,
+                asks: false,
                 decisions: BTreeMap::new(),
             });
 
@@ -57,6 +78,9 @@ impl UserPolicy {
         // from the user's home into a system path by a later install.
         entry.display_name = application.display_name.clone();
         entry.provenance = application.provenance;
+        // Una vez que preguntó, sigue siendo de los que preguntan: que después
+        // se le fije la decisión desde la pantalla no lo convierte en otra cosa.
+        entry.asks = entry.asks || pregunto;
 
         entry.decisions.insert(resource_id.to_string(), decision);
     }
@@ -75,6 +99,7 @@ impl UserPolicy {
                     display_name: stored.display_name.clone(),
                     provenance: stored.provenance,
                 },
+                asks: stored.asks,
                 decisions: stored.decisions.clone(),
             })
             .collect()
@@ -185,6 +210,50 @@ mod tests {
         }
     }
 
+    /// Preguntar y ser bloqueado son dos orígenes distintos, y la pantalla
+    /// necesita distinguirlos: un programa del sistema no tiene perfil que lo
+    /// limite, así que su interruptor no serviría de nada **salvo** que sea de
+    /// los que preguntan — y entonces sí.
+    #[test]
+    fn se_recuerda_si_el_programa_pregunta() {
+        let mut politica = UserPolicy::default();
+        politica.record(&application("/usr/bin/vasak-connect"), "camera", Decision::Allowed, true);
+        politica.record(&application("/home/x/a.AppImage"), "camera", Decision::Denied, false);
+
+        let entradas = politica.entries();
+        let pregunta = |ruta: &str| {
+            entradas.iter().find(|e| e.application.binary_path == ruta).unwrap().asks
+        };
+        assert!(pregunta("/usr/bin/vasak-connect"));
+        assert!(!pregunta("/home/x/a.AppImage"));
+    }
+
+    /// Y no deja de serlo porque después se le fije la decisión desde la
+    /// pantalla. Si se perdiera, el interruptor se apagaría solo justo después
+    /// de usarlo, y no habría forma de volver atrás.
+    #[test]
+    fn fijar_la_decision_a_mano_no_lo_degrada() {
+        let mut politica = UserPolicy::default();
+        let app = application("/usr/bin/vasak-connect");
+        politica.record(&app, "camera", Decision::Allowed, true);
+        politica.record(&app, "camera", Decision::Denied, false);
+
+        assert!(politica.entries()[0].asks, "dejó de figurar como que pregunta");
+        assert_eq!(politica.decision("/usr/bin/vasak-connect", "camera"), Decision::Denied);
+    }
+
+    /// Una política escrita antes de que este campo existiera se sigue
+    /// leyendo, y sale como lo que valía hasta ahora: todo venía de observar
+    /// un bloqueo.
+    #[test]
+    fn una_politica_vieja_se_lee_sin_el_campo() {
+        let vieja = r#"{"applications":{"/home/x/a.AppImage":{
+            "display_name":"a","provenance":"unverified","decisions":{"camera":"denied"}}}}"#;
+        let politica: UserPolicy = serde_json::from_str(vieja).expect("se lee");
+        assert!(!politica.entries()[0].asks);
+        assert_eq!(politica.decision("/home/x/a.AppImage", "camera"), Decision::Denied);
+    }
+
     #[test]
     fn a_program_nobody_decided_on_is_unknown_not_denied() {
         let policy = UserPolicy::default();
@@ -200,10 +269,10 @@ mod tests {
         let mut policy = UserPolicy::default();
         let app = application("/usr/bin/meet");
 
-        policy.record(&app, "camera", Decision::Allowed);
+        policy.record(&app, "camera", Decision::Allowed, false);
         assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Allowed);
 
-        policy.record(&app, "camera", Decision::Denied);
+        policy.record(&app, "camera", Decision::Denied, false);
         assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Denied);
         assert_eq!(policy.entries().len(), 1, "still one entry for the program");
     }
@@ -214,7 +283,7 @@ mod tests {
         let mut policy = UserPolicy::default();
         let app = application("/usr/bin/meet");
 
-        policy.record(&app, "camera", Decision::Allowed);
+        policy.record(&app, "camera", Decision::Allowed, false);
 
         assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Allowed);
         assert_eq!(
@@ -226,7 +295,7 @@ mod tests {
     #[test]
     fn forgetting_a_program_makes_it_ask_again() {
         let mut policy = UserPolicy::default();
-        policy.record(&application("/usr/bin/meet"), "camera", Decision::Denied);
+        policy.record(&application("/usr/bin/meet"), "camera", Decision::Denied, false);
 
         assert!(policy.forget("/usr/bin/meet"));
         assert_eq!(
@@ -242,8 +311,8 @@ mod tests {
         let store = PolicyStore::at(dir.path().to_path_buf());
 
         let mut policy = UserPolicy::default();
-        policy.record(&application("/usr/bin/meet"), "camera", Decision::Allowed);
-        policy.record(&application("/usr/bin/meet"), "microphone", Decision::Denied);
+        policy.record(&application("/usr/bin/meet"), "camera", Decision::Allowed, false);
+        policy.record(&application("/usr/bin/meet"), "microphone", Decision::Denied, false);
         store.save(1000, &policy).expect("save");
 
         let reloaded = store.load(1000).expect("load");
@@ -279,7 +348,7 @@ mod tests {
         let store = PolicyStore::at(dir.path().to_path_buf());
 
         let mut first = UserPolicy::default();
-        first.record(&application("/usr/bin/meet"), "camera", Decision::Allowed);
+        first.record(&application("/usr/bin/meet"), "camera", Decision::Allowed, false);
         store.save(1000, &first).expect("save");
 
         assert_eq!(
