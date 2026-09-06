@@ -55,11 +55,24 @@ pub struct Denegacion {
     pub momento: std::time::Duration,
 }
 
-/// Los perfiles cuyos bloqueos avisamos.
+/// El perfil general, el que confina a toda aplicación sin excepción propia.
+const PERFIL_GENERAL: &str = "vasak-appimage";
+
+/// Si el bloqueo lo produjo un perfil nuestro.
 ///
-/// Sólo los nuestros: el paquete `apparmor` trae 145 perfiles de terceros, y
+/// Se filtra porque el sistema trae más de quinientos perfiles de terceros, y
 /// avisar de los suyos sería ruido sobre decisiones que no tomamos nosotros.
-const NUESTROS_PERFILES: &[&str] = &["vasak-appimage"];
+///
+/// Los de excepción cuentan igual que el general, y omitirlos era un agujero
+/// silencioso: apenas se le concede algo a una aplicación se le escribe su
+/// propio perfil, y desde ahí el kernel informa **ese** nombre. Con el filtro
+/// mirando sólo el general, conceder la cámara dejaba mudos todos los demás
+/// bloqueos de esa aplicación —se le negaba la clave de SSH, no aparecía aviso
+/// ni entrada en la lista, y no había forma de concederle nada más—. Conceder
+/// un permiso no puede apagar los avisos de los otros.
+fn es_nuestro(perfil: &str) -> bool {
+    perfil == PERFIL_GENERAL || perfil.starts_with(crate::excepcion::PREFIJO)
+}
 
 /// Saca el valor de `clave="valor"` de una línea del registro.
 fn texto_de<'l>(linea: &'l str, clave: &str) -> Option<&'l str> {
@@ -90,7 +103,7 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
         return None;
     }
     let perfil = texto_de(linea, "profile")?;
-    if !NUESTROS_PERFILES.contains(&perfil) {
+    if !es_nuestro(perfil) {
         return None;
     }
     Some(Denegacion {
@@ -503,6 +516,46 @@ mod tests {
     /// `Duration::from_secs_f64`; el aviso de bloqueos quedaba muerto en
     /// silencio para el resto de la sesión.
     /// Las rutas que el kernel informa cuando se bloquea una credencial.
+    /// El bloqueo bajo un perfil de excepción tiene que llegar igual.
+    ///
+    /// Apenas se le concede algo a una aplicación se le escribe su propio
+    /// perfil, y a partir de ahí el kernel informa **ese** nombre. Si el filtro
+    /// sólo acepta el general, conceder la cámara deja mudos todos los demás
+    /// bloqueos de esa aplicación: se le niega la clave de SSH, no aparece
+    /// aviso, no aparece en la lista, y no hay forma de concederle nada más.
+    /// Conceder un permiso no puede apagar los avisos de los otros.
+    /// Y los perfiles ajenos se siguen descartando.
+    ///
+    /// Importa más ahora que el sistema envía más de quinientos perfiles de
+    /// terceros: sin este filtro, cada bloqueo de cualquiera de ellos saldría
+    /// como un aviso de VasakOS sobre una decisión que no tomamos, y la persona
+    /// aprendería a ignorarlos — que es la forma de arruinar un aviso que sí
+    /// importa.
+    #[test]
+    fn un_perfil_ajeno_se_descarta() {
+        for perfil in ["firefox", "thunderbird", "dbus-system", "vasak", "appimage"] {
+            let linea = format!(
+                "audit(1788539628.817:1): apparmor=\"DENIED\" operation=\"open\" \
+                 profile=\"{perfil}\" name=\"/home/ana/.ssh/id\" pid=1 comm=\"x\" \
+                 requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=1000"
+            );
+            assert!(parsear(&linea).is_none(), "no debería avisar de «{perfil}»");
+        }
+    }
+
+    #[test]
+    fn un_bloqueo_bajo_un_perfil_de_excepcion_no_se_descarta() {
+        let nombre = crate::excepcion::nombre_de("/home/ana/Apps/cosa.AppImage");
+        let linea = format!(
+            "audit(1788539628.817:36077): apparmor=\"DENIED\" operation=\"open\" \
+             profile=\"{nombre}\" name=\"/home/ana/.ssh/id_ed25519\" pid=4242 \
+             comm=\"cosa\" requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=1000"
+        );
+        let d = parsear(&linea).expect("la denegación tiene que llegar");
+        assert_eq!(d.ruta, "/home/ana/.ssh/id_ed25519");
+        assert_eq!(recurso_de(&d.ruta), Some(Resource::Credentials));
+    }
+
     #[test]
     fn una_credencial_se_reconoce() {
         for ruta in [

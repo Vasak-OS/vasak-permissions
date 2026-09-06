@@ -66,8 +66,15 @@ const AMBIGUOS: &[char] = &['*', '?', '[', ']', '{', '}', '"', '\\', '\n', '\r']
 /// La codificación es reversible —cada `_` de la ruta original se duplica—, así
 /// que dos rutas distintas nunca dan el mismo nombre. Sin eso, `/a/b` y `/a_b`
 /// colisionarían y una excepción pisaría a la otra.
+/// Con qué empieza el nombre de todo perfil de excepción.
+///
+/// Es también lo que el vigilante del registro usa para reconocerlos, así que
+/// vive acá y no escrito dos veces: separarlos dejaría los bloqueos de una
+/// aplicación con excepción sin aviso ninguno.
+pub const PREFIJO: &str = "vasak-permitida";
+
 pub fn nombre_de(ruta: &str) -> String {
-    let mut nombre = String::from("vasak-permitida");
+    let mut nombre = String::from(PREFIJO);
     for c in ruta.chars() {
         match c {
             '_' => nombre.push_str("__"),

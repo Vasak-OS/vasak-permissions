@@ -53,11 +53,11 @@ resources:
 blocked:
   camera: "{0} tried to use the camera"
   microphone: "{0} tried to use the microphone"
-  credentials: "{0} tried to read your keys"
+  credentials: "{0} tried to use your keys"
   body: >-
     VasakOS blocked it: applications the system did not install have no access
     to the camera or the microphone.
   body-credentials: >-
     VasakOS blocked it. No application the system did not install can read your
-    SSH and GPG keys, the keyring, or your saved logins. If you were not
-    expecting this, close the application.
+    SSH and GPG keys, the keyring or your saved logins, nor ask the agents to
+    sign on its behalf. If you were not expecting this, close the application.
