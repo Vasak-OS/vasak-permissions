@@ -88,6 +88,15 @@ pub enum Resource {
     Location,
     /// Reading the keyboard globally: keyloggers and global shortcuts alike.
     InputCapture,
+    /// Reading the files that prove who you are: SSH and GPG keys, the
+    /// keyring's database, the tokens under `~/.config` that log you into
+    /// things.
+    ///
+    /// Grouped into one decision on purpose. Splitting them would ask the
+    /// person a question they cannot answer usefully — nobody trusts a program
+    /// with their GPG key but not their SSH key — and each extra switch makes
+    /// the list longer without making anyone safer.
+    Credentials,
     /// Access to one capability of the user's online accounts.
     #[serde(rename = "account")]
     Account(AccountResource),
@@ -156,7 +165,10 @@ impl Resource {
     pub fn decision_has_effect(&self) -> bool {
         matches!(
             self,
-            Resource::Account(_) | Resource::Camera | Resource::Microphone
+            Resource::Account(_)
+                | Resource::Camera
+                | Resource::Microphone
+                | Resource::Credentials
         )
     }
 
@@ -172,6 +184,7 @@ impl Resource {
             Resource::ScreenCapture => "screen-capture".into(),
             Resource::Location => "location".into(),
             Resource::InputCapture => "input-capture".into(),
+            Resource::Credentials => "credentials".into(),
             Resource::Account(capability) => format!("account.{}", capability.as_id()),
         }
     }
@@ -187,6 +200,7 @@ impl Resource {
             "screen-capture" => Some(Resource::ScreenCapture),
             "location" => Some(Resource::Location),
             "input-capture" => Some(Resource::InputCapture),
+            "credentials" => Some(Resource::Credentials),
             _ => None,
         }
     }

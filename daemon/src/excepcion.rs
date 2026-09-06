@@ -66,8 +66,15 @@ const AMBIGUOS: &[char] = &['*', '?', '[', ']', '{', '}', '"', '\\', '\n', '\r']
 /// La codificación es reversible —cada `_` de la ruta original se duplica—, así
 /// que dos rutas distintas nunca dan el mismo nombre. Sin eso, `/a/b` y `/a_b`
 /// colisionarían y una excepción pisaría a la otra.
+/// Con qué empieza el nombre de todo perfil de excepción.
+///
+/// Es también lo que el vigilante del registro usa para reconocerlos, así que
+/// vive acá y no escrito dos veces: separarlos dejaría los bloqueos de una
+/// aplicación con excepción sin aviso ninguno.
+pub const PREFIJO: &str = "vasak-permitida";
+
 pub fn nombre_de(ruta: &str) -> String {
-    let mut nombre = String::from("vasak-permitida");
+    let mut nombre = String::from(PREFIJO);
     for c in ruta.chars() {
         match c {
             '_' => nombre.push_str("__"),
@@ -88,9 +95,39 @@ pub fn nombre_de(ruta: &str) -> String {
 /// Tiene que ser lo mismo que hay en `/etc/apparmor.d/vasak-appimage`: si allá
 /// se agrega una negación y acá no, una excepción parcial la levantaría sin
 /// querer.
-const NEGACIONES: &[(Resource, &str)] = &[
-    (Resource::Camera, "audit deny /dev/video* rwk,"),
-    (Resource::Microphone, "audit deny /dev/snd/pcmC*D*c rwk,"),
+pub(crate) const NEGACIONES: &[(Resource, &[&str])] = &[
+    (Resource::Camera, &["audit deny /dev/video* rwk,"]),
+    (Resource::Microphone, &["audit deny /dev/snd/pcmC*D*c rwk,"]),
+    // Las credenciales son varias reglas y una sola decisión. Están juntas
+    // porque preguntarlas por separado sería pedirle a la persona que
+    // distinga entre confiarle a un programa su clave de SSH y confiarle la
+    // de GPG, que es una distinción que nadie hace.
+    //
+    // `rwkl` y no `rwk`: sin la `l` se puede crear un enlace duro al archivo
+    // desde fuera del directorio negado y leerlo por ahí, que deja la valla
+    // en decorado.
+    (
+        Resource::Credentials,
+        &[
+            "audit deny @{HOME}/.ssh/** rwkl,",
+            "audit deny @{HOME}/.gnupg/** rwkl,",
+            // El llavero del escritorio: su base guarda todas las contraseñas
+            // de la sesión.
+            "audit deny @{HOME}/.local/share/vasak-keyring/** rwkl,",
+            // El agente de SSH es peor que la clave: con el socket no hace
+            // falta leer ningún archivo para firmar con ella.
+            "audit deny /run/user/*/ssh-agent.socket rw,",
+            "audit deny /run/user/*/gnupg/** rw,",
+            // Los que valen una sesión entera sin ser una clave.
+            "audit deny @{HOME}/.netrc rwkl,",
+            "audit deny @{HOME}/.git-credentials rwkl,",
+            "audit deny @{HOME}/.npmrc rwkl,",
+            "audit deny @{HOME}/.aws/** rwkl,",
+            "audit deny @{HOME}/.kube/** rwkl,",
+            "audit deny @{HOME}/.config/gh/** rwkl,",
+            "audit deny @{HOME}/.docker/config.json rwkl,",
+        ],
+    ),
 ];
 
 /// El texto del perfil de excepción para esa ruta.
@@ -113,7 +150,8 @@ pub fn perfil_para(ruta: &str, permitidos: &[Resource]) -> Result<String, Motivo
     let negaciones: String = NEGACIONES
         .iter()
         .filter(|(recurso, _)| !permitidos.contains(recurso))
-        .map(|(_, regla)| format!("\n  {regla}\n"))
+        .flat_map(|(_, reglas)| reglas.iter())
+        .map(|regla| format!("\n  {regla}\n"))
         .collect();
 
     Ok(format!(
@@ -258,6 +296,65 @@ mod tests {
     /// Lo concedido sale de la política guardada, no de lo que se acaba de
     /// tocar: si no, cambiar el micrófono reescribiría el perfil olvidando que
     /// la cámara ya estaba permitida.
+    /// Permitir las credenciales las levanta **todas**: es una sola decisión.
+    #[test]
+    fn permitir_credenciales_levanta_todas_sus_negaciones() {
+        let con = perfil_para("/home/x/a.AppImage", &[Resource::Credentials]).unwrap();
+        assert!(!con.contains(".ssh"), "quedó negado ~/.ssh");
+        assert!(!con.contains(".gnupg"));
+        assert!(!con.contains("ssh-agent"));
+        assert!(!con.contains("vasak-keyring"));
+        // Y no toca lo otro: quien permitió las claves no permitió la cámara.
+        assert!(con.contains("deny /dev/video*"));
+    }
+
+    /// Y no permitirlas las mantiene todas, sin que se escape ninguna.
+    #[test]
+    fn sin_permiso_se_niegan_todas_las_credenciales() {
+        let sin = perfil_para("/home/x/a.AppImage", &[Resource::Camera]).unwrap();
+        let reglas = NEGACIONES
+            .iter()
+            .find(|(r, _)| *r == Resource::Credentials)
+            .unwrap()
+            .1;
+        for regla in reglas {
+            assert!(sin.contains(regla), "falta en el perfil: {regla}");
+        }
+    }
+
+    /// El agente de SSH se niega junto con la clave.
+    ///
+    /// Negar `~/.ssh` y dejar el socket del agente sería seguridad de mentira:
+    /// con el socket no hace falta leer ningún archivo para firmar con la
+    /// clave. Van juntos o no sirve ninguno.
+    #[test]
+    fn el_agente_va_con_la_clave() {
+        let reglas = NEGACIONES
+            .iter()
+            .find(|(r, _)| *r == Resource::Credentials)
+            .unwrap()
+            .1;
+        assert!(reglas.iter().any(|r| r.contains(".ssh/")));
+        assert!(reglas.iter().any(|r| r.contains("ssh-agent.socket")));
+    }
+
+    /// Los enlaces duros cuentan.
+    ///
+    /// Sin la `l`, se puede crear un enlace al archivo desde afuera del
+    /// directorio negado y leerlo por ahí — la valla queda de decorado. Los
+    /// sockets van sin `l` porque no se enlazan.
+    #[test]
+    fn las_negaciones_de_archivo_cubren_el_enlace_duro() {
+        let reglas = NEGACIONES
+            .iter()
+            .find(|(r, _)| *r == Resource::Credentials)
+            .unwrap()
+            .1;
+        for regla in reglas.iter().filter(|r| r.contains("@{HOME}")) {
+            assert!(regla.contains("rwkl,"), "sin enlace duro: {regla}");
+        }
+    }
+
     #[test]
     fn lo_permitido_se_lee_de_la_politica_entera() {
         let mut politica = crate::policy::UserPolicy::default();
@@ -336,11 +433,31 @@ mod tests {
     }
 
     /// Y el caso completo sí devuelve todo.
+    ///
+    /// «Completo» se recorre desde la tabla y no se escribe a mano: con la
+    /// lista fija, agregar una negación nueva dejaba esta prueba pasando por
+    /// la razón equivocada —seguiría permitiendo sólo dos cosas y afirmando
+    /// que no queda ninguna negación—. Pasó al sumar las credenciales.
     #[test]
-    fn permitir_los_dos_no_deja_ninguna_negacion() {
-        let ambos =
-            perfil_para("/home/x/a.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
-        assert!(!ambos.contains("deny"));
+    fn permitirlo_todo_no_deja_ninguna_negacion() {
+        let todos: Vec<Resource> = NEGACIONES.iter().map(|(r, _)| r.clone()).collect();
+        let completo = perfil_para("/home/x/a.AppImage", &todos).unwrap();
+        assert!(
+            !completo.contains("deny"),
+            "quedó una negación con todo permitido:\n{completo}"
+        );
+    }
+
+    /// Una excepción vacía tiene que negar **todo** lo de la tabla, no sólo lo
+    /// que alguien se acordó de listar acá.
+    #[test]
+    fn una_excepcion_vacia_niega_todo_lo_de_la_tabla() {
+        let ninguno = perfil_para("/home/x/a.AppImage", &[]).unwrap();
+        for (_, reglas) in NEGACIONES {
+            for regla in *reglas {
+                assert!(ninguno.contains(regla), "falta en el perfil: {regla}");
+            }
+        }
     }
 
     #[test]
