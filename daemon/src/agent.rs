@@ -130,7 +130,16 @@ pub async fn avisar_de_bloqueo(
     application: &vasak_permissions_protocol::Application,
     resource: &vasak_permissions_protocol::Resource,
 ) {
-    avisar(connection, agents, uid, application, &resource.as_id(), String::new()).await
+    avisar(
+        connection,
+        agents,
+        uid,
+        application,
+        &resource.as_id(),
+        String::new(),
+        String::new(),
+    )
+    .await
 }
 
 /// Avisa de un bloqueo que no es de un recurso con nombre.
@@ -149,9 +158,19 @@ pub async fn avisar_de_archivo(
     agents: &SharedAgents,
     uid: u32,
     application: &vasak_permissions_protocol::Application,
+    perfil: &str,
     ruta: &str,
 ) {
-    avisar(connection, agents, uid, application, "file", ruta.to_string()).await
+    avisar(
+        connection,
+        agents,
+        uid,
+        application,
+        "file",
+        ruta.to_string(),
+        perfil.to_string(),
+    )
+    .await
 }
 
 async fn avisar(
@@ -161,6 +180,7 @@ async fn avisar(
     application: &vasak_permissions_protocol::Application,
     resource_id: &str,
     detail: String,
+    profile: String,
 ) {
     let Some(agent) = agents.lock().await.agent_for(uid) else {
         tracing::debug!("Sin agente para el usuario {uid}; el aviso se descarta");
@@ -171,6 +191,7 @@ async fn avisar(
         application: application.clone(),
         resource_id: resource_id.to_string(),
         detail,
+        profile,
     };
     let Ok(payload) = serde_json::to_string(&aviso) else {
         return;

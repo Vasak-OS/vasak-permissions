@@ -70,11 +70,75 @@ pub fn texto_con_detalle(plantilla: &str, nombre_de_la_app: &str, detalle: &str)
         .replace("{1}", detalle)
 }
 
+// ── Decidir desde el propio aviso ────────────────────────────────────────────
+
+/// Qué se decide si alguien aprieta un botón del aviso.
+///
+/// Se guarda por identificador de notificación porque es lo único que
+/// `ActionInvoked` trae: la señal dice qué notificación y qué botón, nada más.
+#[derive(Clone)]
+pub struct Pendiente {
+    pub resource_id: String,
+    pub detail: String,
+    pub profile: String,
+    pub binary_path: String,
+}
+
+pub type Avisados = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Pendiente>>>;
+
+/// Cuántos avisos se recuerdan a la vez.
+///
+/// Sin techo, un aluvión de bloqueos dejaría el mapa creciendo para siempre con
+/// avisos que nadie va a contestar. Al llenarse se olvida el más viejo: si
+/// alguien aprieta un botón de un aviso ya olvidado, no pasa nada y la decisión
+/// sigue disponible en Configuración, que es donde de verdad vive.
+const AVISOS_RECORDADOS: usize = 32;
+
+fn recordar(avisados: &Avisados, id: u32, pendiente: Pendiente) {
+    let Ok(mut mapa) = avisados.lock() else { return };
+    if mapa.len() >= AVISOS_RECORDADOS {
+        if let Some(&viejo) = mapa.keys().min() {
+            mapa.remove(&viejo);
+        }
+    }
+    mapa.insert(id, pendiente);
+}
+
+/// Si el daemon de notificaciones sabe mostrar botones.
+///
+/// Se pregunta en vez de darlo por hecho: no todos los daemons los soportan, y
+/// mandar botones a uno que no puede mostrarlos deja un aviso que promete una
+/// decisión que no se puede tomar. Ahí es mejor el aviso a secas, que ya manda
+/// a Configuración.
+pub async fn hay_botones(connection: &zbus::Connection) -> bool {
+    let Ok(reply) = connection
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "GetCapabilities",
+            &(),
+        )
+        .await
+    else {
+        return false;
+    };
+    reply
+        .body()
+        .deserialize::<Vec<String>>()
+        .map(|c| c.iter().any(|x| x == "actions"))
+        .unwrap_or(false)
+}
+
+/// Las claves de los botones. Viajan por el bus, así que se nombran una vez.
+pub const ACCION_PERMITIR: &str = "permitir";
+pub const ACCION_NO: &str = "no";
+
 /// Muestra el aviso.
 ///
 /// Si algo falla —no hay daemon de notificaciones, no hay bus de sesión— se
 /// registra y se sigue. Un aviso perdido no justifica romper nada.
-pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
+pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest, avisados: &Avisados) {
     let clave = format!("blocked.{}", aviso.resource_id);
     let plantilla = app
         .i18n()
@@ -106,6 +170,21 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
         }
     };
 
+    // Los botones, si el daemon sabe mostrarlos. Van en pares: clave, etiqueta.
+    //
+    // «Permitir» pide la contraseña de administrador cuando se aprieta, porque
+    // conceder pasa por polkit. Por eso la etiqueta no promete que sea
+    // inmediato: quien la lea tiene que esperar que le pregunten.
+    let etiquetas = (
+        traducir(app, "blocked.allow"),
+        traducir(app, "blocked.deny"),
+    );
+    let acciones: Vec<&str> = if hay_botones(&connection).await {
+        vec![ACCION_PERMITIR, &etiquetas.0, ACCION_NO, &etiquetas.1]
+    } else {
+        Vec::new()
+    };
+
     // La firma de org.freedesktop.Notifications.Notify. El 0 de `replaces_id`
     // es «no reemplaces ninguna anterior», y el -1 de `expire_timeout` deja que
     // el daemon decida cuánto dura.
@@ -115,11 +194,11 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
         icono_de(&aviso.resource_id),
         resumen.as_str(),
         cuerpo.as_str(),
-        Vec::<&str>::new(),
+        acciones.clone(),
         std::collections::HashMap::<&str, zbus::zvariant::Value>::new(),
         -1i32,
     );
-    if let Err(error) = connection
+    match connection
         .call_method(
             Some("org.freedesktop.Notifications"),
             "/org/freedesktop/Notifications",
@@ -129,8 +208,141 @@ pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest) {
         )
         .await
     {
-        eprintln!("[vasak-permissions-agent] no se pudo mostrar el aviso: {error}");
+        Ok(reply) => {
+            // Sin botones no hay nada que recordar: nadie va a apretar nada.
+            if acciones.is_empty() {
+                return;
+            }
+            if let Ok(id) = reply.body().deserialize::<u32>() {
+                recordar(
+                    avisados,
+                    id,
+                    Pendiente {
+                        resource_id: aviso.resource_id.clone(),
+                        detail: aviso.detail.clone(),
+                        profile: aviso.profile.clone(),
+                        binary_path: aviso.application.binary_path.clone(),
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("[vasak-permissions-agent] no se pudo mostrar el aviso: {error}");
+        }
     }
+}
+
+fn traducir(app: &AppHandle, clave: &str) -> String {
+    app.i18n().translate(clave).unwrap_or(clave).to_string()
+}
+
+/// Escucha los botones del aviso y ejecuta lo que se apretó.
+///
+/// Nunca termina; se lanza como tarea de fondo. Si la señal no se puede
+/// suscribir, se registra y se sale: sin esto los botones no hacen nada, pero
+/// el aviso sigue mostrándose y Configuración sigue funcionando.
+///
+/// `sistema` es la conexión al servicio de permisos, que vive en el bus del
+/// sistema; los avisos y sus botones están en el de sesión. Un proceso, dos
+/// buses, porque los dos trabajos viven en lugares distintos.
+pub async fn escuchar_botones(
+    sesion: zbus::Connection,
+    sistema: zbus::Connection,
+    avisados: Avisados,
+) {
+    use futures_util::StreamExt;
+
+    let mut flujo = match zbus::MessageStream::for_match_rule(
+        zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.freedesktop.Notifications")
+            .and_then(|b| b.member("ActionInvoked"))
+            .expect("la regla de coincidencia está escrita a mano y es válida")
+            .build(),
+        &sesion,
+        None,
+    )
+    .await
+    {
+        Ok(flujo) => flujo,
+        Err(error) => {
+            eprintln!("[vasak-permissions-agent] sin señales de los botones: {error}");
+            return;
+        }
+    };
+
+    while let Some(Ok(mensaje)) = flujo.next().await {
+        let Ok((id, accion)) = mensaje.body().deserialize::<(u32, String)>() else {
+            continue;
+        };
+        // Se saca del mapa al atenderlo: el daemon puede repetir la señal si la
+        // persona apreta dos veces, y conceder dos veces pediría la contraseña
+        // dos veces para nada.
+        let Some(pendiente) = avisados.lock().ok().and_then(|mut m| m.remove(&id)) else {
+            continue;
+        };
+        atender(&sistema, &accion, &pendiente).await;
+    }
+}
+
+/// Hace lo que el botón dice.
+///
+/// Un bloqueo genérico se decide por perfil y ruta; uno de un recurso con
+/// nombre, por programa y recurso. Son dos caminos porque son dos cosas: el
+/// primero autoriza un archivo concreto, el segundo una capacidad.
+async fn atender(sistema: &zbus::Connection, accion: &str, pendiente: &Pendiente) {
+    let generico = !pendiente.profile.is_empty();
+
+    let resultado = match (accion, generico) {
+        (ACCION_PERMITIR, true) => llamar(
+            sistema,
+            "AllowBlocked",
+            &(pendiente.profile.as_str(), pendiente.detail.as_str()),
+        )
+        .await,
+        (ACCION_NO, true) => llamar(
+            sistema,
+            "DismissBlocked",
+            &(pendiente.profile.as_str(), pendiente.detail.as_str()),
+        )
+        .await,
+        (ACCION_PERMITIR, false) => llamar(
+            sistema,
+            "SetPermission",
+            &(pendiente.binary_path.as_str(), pendiente.resource_id.as_str(), true),
+        )
+        .await,
+        (ACCION_NO, false) => llamar(
+            sistema,
+            "SetPermission",
+            &(pendiente.binary_path.as_str(), pendiente.resource_id.as_str(), false),
+        )
+        .await,
+        _ => return, // otro botón, o el «default» de algunos daemons
+    };
+
+    if let Err(error) = resultado {
+        // Que la autenticación se rechace es lo normal, no una falla. Queda en
+        // el diario y nada más: no hay dónde mostrar un error de un aviso que
+        // ya se cerró, y la decisión sigue disponible en Configuración.
+        eprintln!("[vasak-permissions-agent] no se pudo aplicar «{accion}»: {error}");
+    }
+}
+
+async fn llamar<A>(sistema: &zbus::Connection, metodo: &str, argumentos: &A) -> zbus::Result<()>
+where
+    A: serde::Serialize + zbus::zvariant::DynamicType + Sync,
+{
+    sistema
+        .call_method(
+            Some(vasak_permissions_protocol::SERVICE_NAME),
+            vasak_permissions_protocol::SERVICE_PATH,
+            Some(vasak_permissions_protocol::SERVICE_INTERFACE),
+            metodo,
+            argumentos,
+        )
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

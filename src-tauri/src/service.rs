@@ -23,6 +23,8 @@ const MAX_ATTEMPTS: u32 = 20;
 
 struct Agent {
     app: AppHandle,
+    /// Los avisos que están en pantalla con botones, y qué decide cada uno.
+    avisados: crate::aviso::Avisados,
 }
 
 #[interface(name = "ar.net.vasak.os.PermissionAgent")]
@@ -65,7 +67,10 @@ impl Agent {
         }
 
         let app = self.app.clone();
-        tauri::async_runtime::spawn(async move { crate::aviso::mostrar(&app, &aviso).await });
+        let avisados = self.avisados.clone();
+        tauri::async_runtime::spawn(
+            async move { crate::aviso::mostrar(&app, &aviso, &avisados).await },
+        );
         Ok(())
     }
 }
@@ -91,13 +96,28 @@ fn service_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
 }
 
 pub async fn connect_and_register(app: AppHandle) -> Result<(), String> {
+    let avisados: crate::aviso::Avisados = Default::default();
+
     let connection = service_bus()
         .map_err(|e| format!("no se pudo abrir el bus del sistema: {e}"))?
-        .serve_at(AGENT_PATH, Agent { app: app.clone() })
+        .serve_at(
+            AGENT_PATH,
+            Agent { app: app.clone(), avisados: avisados.clone() },
+        )
         .map_err(|e| format!("no se pudo publicar el agente: {e}"))?
         .build()
         .await
         .map_err(|e| format!("no se pudo conectar al bus del sistema: {e}"))?;
+
+    // Los botones del aviso: la señal llega por el bus de **sesión** y lo que
+    // hay que llamar vive en el del sistema, así que la escucha necesita las
+    // dos conexiones. Si no se puede suscribir, los botones no hacen nada y
+    // Configuración sigue siendo la vía — por eso no se aborta el arranque.
+    if let Ok(sesion) = zbus::Connection::session().await {
+        let sistema = connection.clone();
+        let avisados = avisados.clone();
+        tauri::async_runtime::spawn(crate::aviso::escuchar_botones(sesion, sistema, avisados));
+    }
 
     // Held by the app for as long as it runs. Dropping it would close the
     // connection, and the service would be left calling back on a name that no

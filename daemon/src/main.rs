@@ -146,6 +146,9 @@ impl PermissionService {
                 }
 
                 let request = PermissionRequest {
+                    // Este camino es el de los recursos con nombre, que no
+                    // vienen de un perfil: la decisión se guarda por programa.
+                    profile: String::new(),
                     application: application.clone(),
                     resource_id: resource_id.to_string(),
                     detail,

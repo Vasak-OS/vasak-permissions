@@ -342,10 +342,11 @@ pub async fn vigilar(
                         let agents = agents.clone();
                         let uid = denegacion.uid;
                         let ruta = denegacion.ruta.clone();
+                        let perfil = denegacion.perfil.clone();
                         tokio::spawn(async move {
                             let _permiso = permiso;
                             crate::agent::avisar_de_archivo(
-                                &connection, &agents, uid, &aplicacion, &ruta,
+                                &connection, &agents, uid, &aplicacion, &perfil, &ruta,
                             )
                             .await;
                         });
