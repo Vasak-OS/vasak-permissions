@@ -591,6 +591,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&raiz);
     }
 
+    /// Si la escritura falla, el archivo que ya estaba tiene que quedar intacto.
+    ///
+    /// Es la razón entera de escribir por temporal: sin eso, `write` trunca el
+    /// destino antes de fallar y se pierde lo que ya estaba concedido — la
+    /// persona perdería permisos que había dado, sin tocarlos.
+    ///
+    /// El fallo se fuerza ocupando la ruta del temporal con un **directorio**,
+    /// que hace que `std::fs::write` falle sin llegar al `rename`. Es
+    /// determinista y no depende de permisos ni de llenar el disco.
+    #[test]
+    fn si_falla_la_escritura_no_se_pierde_lo_anterior() {
+        let raiz = tmp("escritura-fallida");
+        let primera = regla_para("/home/ana/uno", "r").unwrap();
+        conceder_en("firefox", &primera, &raiz).unwrap();
+        assert_eq!(concedidas_en("firefox", &raiz), vec![primera.clone()]);
+
+        // Ocupar la ruta del temporal para que la próxima escritura no pueda.
+        let temporal = raiz.join(format!(".firefox.{}", std::process::id()));
+        std::fs::create_dir(&temporal).unwrap();
+
+        let segunda = regla_para("/home/ana/dos", "r").unwrap();
+        let resultado = conceder_en("firefox", &segunda, &raiz);
+
+        assert!(resultado.is_err(), "debería fallar: el temporal está ocupado");
+        assert_eq!(
+            concedidas_en("firefox", &raiz),
+            vec![primera],
+            "se perdió lo que ya estaba concedido"
+        );
+
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// Y si el `rename` es el que falla, tampoco.
+    ///
+    /// Se fuerza poniendo un **directorio** en el destino: `rename` de un
+    /// archivo sobre un directorio no se puede. Cubre el otro lado de la
+    /// operación, que es el que de verdad reemplaza.
+    #[test]
+    fn si_falla_el_reemplazo_no_queda_temporal() {
+        let raiz = tmp("reemplazo-fallido");
+        std::fs::create_dir_all(&raiz).unwrap();
+        // El destino ocupado por un directorio.
+        std::fs::create_dir(raiz.join("firefox")).unwrap();
+
+        let regla = regla_para("/home/ana/x", "r").unwrap();
+        let resultado = conceder_en("firefox", &regla, &raiz);
+
+        assert!(resultado.is_err(), "debería fallar: el destino es un directorio");
+        let sobrantes: Vec<_> = std::fs::read_dir(&raiz)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(sobrantes.is_empty(), "quedó un temporal tirado: {sobrantes:?}");
+
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
     fn bloqueo(perfil: &str, ruta: &str) -> Bloqueo {
         bloqueo_de(1000, perfil, ruta)
     }
