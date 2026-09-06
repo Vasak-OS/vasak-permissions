@@ -495,7 +495,10 @@ async fn registrar_el_intento(
     if politica.decision(&aplicacion.binary_path, &recurso.as_id()) != Decision::Unknown {
         return;
     }
-    politica.record(aplicacion, &recurso.as_id(), Decision::Denied);
+    // `false`: esto no lo preguntó nadie, se observó un bloqueo del
+    // kernel. Es lo que distingue una aplicación confinada por un perfil de
+    // una que consulta y respeta la respuesta.
+    politica.record(aplicacion, &recurso.as_id(), Decision::Denied, false);
     if let Err(error) = store.save(uid, &politica) {
         tracing::warn!("No se pudo anotar el bloqueo de {}: {error}", aplicacion.binary_path);
     }
@@ -551,7 +554,7 @@ mod tests {
         let app = una_app("/home/x/a.AppImage");
 
         let mut politica = store.load(1000).unwrap();
-        politica.record(&app, "camera", Decision::Allowed);
+        politica.record(&app, "camera", Decision::Allowed, false);
         store.save(1000, &politica).unwrap();
 
         registrar_en(&store, &app, &Resource::Camera).await;

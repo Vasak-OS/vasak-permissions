@@ -171,7 +171,9 @@ impl PermissionService {
                 // next attempt, and the person could never settle it.
                 let _guard = self.write_lock.lock().await;
                 let mut policy = self.store.load(subject.uid).map_err(FdoError::Failed)?;
-                policy.record(&application, resource_id, Decision::from_answer(answer));
+                // `true`: llegó acá porque el programa preguntó, así que va a
+                // respetar lo que se conteste aunque ningún perfil lo limite.
+                policy.record(&application, resource_id, Decision::from_answer(answer), true);
                 self.store
                     .save(subject.uid, &policy)
                     .map_err(FdoError::Failed)?;
@@ -298,7 +300,9 @@ impl PermissionService {
         // Lo que estaba concedido antes, para poder volver atrás si el guardado
         // falla después de haber tocado el perfil.
         let antes = excepcion::permitidos_de(&policy, &binary_path);
-        policy.record(&application, &resource_id, Decision::from_answer(allowed));
+        // `false`: esto es la pantalla fijando una decisión, no el programa
+        // preguntando. Si ya era de los que preguntan, `record` lo conserva.
+        policy.record(&application, &resource_id, Decision::from_answer(allowed), false);
         let ahora = excepcion::permitidos_de(&policy, &binary_path);
 
         // Primero el perfil, después el archivo de decisiones.

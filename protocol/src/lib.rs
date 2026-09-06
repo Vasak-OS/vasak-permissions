@@ -287,6 +287,23 @@ pub struct Application {
 /// One stored decision, as listed by the settings interface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionEntry {
+    /// Si este programa **nos pregunta** antes de usar el recurso.
+    ///
+    /// Separa las dos formas en que una decisión llega a hacerse cumplir, que
+    /// la procedencia sola no distingue:
+    ///
+    /// - Un programa que el sistema no instaló se confina con un perfil, y
+    ///   permitirle algo le escribe una excepción. Ahí lo hace cumplir el
+    ///   kernel, sin que el programa colabore.
+    /// - Un programa del sistema como `vasak-connect` no tiene perfil que lo
+    ///   limite, pero **consulta** antes de encender la cámara del teléfono y
+    ///   respeta la respuesta. Su decisión se hace cumplir igual.
+    ///
+    /// Sin esta distinción, la pantalla apagaba el interruptor de todo lo que
+    /// vino con el sistema —correcto para lo primero, y para lo segundo dejaba
+    /// un permiso concedido que no había forma de retirar.
+    #[serde(default)]
+    pub asks: bool,
     pub application: Application,
     /// Resource ids (`Resource::as_id`) mapped to what was decided.
     pub decisions: std::collections::BTreeMap<String, Decision>,

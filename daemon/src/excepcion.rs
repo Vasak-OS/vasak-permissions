@@ -359,8 +359,8 @@ mod tests {
     fn lo_permitido_se_lee_de_la_politica_entera() {
         let mut politica = crate::policy::UserPolicy::default();
         let app = una_app("/home/x/a.AppImage");
-        politica.record(&app, "camera", Decision::Allowed);
-        politica.record(&app, "microphone", Decision::Denied);
+        politica.record(&app, "camera", Decision::Allowed, false);
+        politica.record(&app, "microphone", Decision::Denied, false);
 
         let permitidos = permitidos_de(&politica, "/home/x/a.AppImage");
         assert_eq!(permitidos, vec![Resource::Camera]);
@@ -379,8 +379,8 @@ mod tests {
     fn los_recursos_que_apparmor_no_niega_no_entran() {
         let mut politica = crate::policy::UserPolicy::default();
         let app = una_app("/home/x/a.AppImage");
-        politica.record(&app, "screen-capture", Decision::Allowed);
-        politica.record(&app, "account.email", Decision::Allowed);
+        politica.record(&app, "screen-capture", Decision::Allowed, false);
+        politica.record(&app, "account.email", Decision::Allowed, false);
 
         assert!(permitidos_de(&politica, "/home/x/a.AppImage").is_empty());
     }
