@@ -9,6 +9,7 @@ mod dialog;
 mod aviso;
 mod locales;
 mod portal;
+mod portal_screencast;
 mod service;
 
 use tauri::Manager;

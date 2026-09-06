@@ -65,3 +65,10 @@ blocked:
     VasakOS blocked it. No application the system did not install can read your
     SSH and GPG keys, the keyring or your saved logins, nor ask the agents to
     sign on its behalf. If you were not expecting this, close the application.
+
+screencast:
+  title: Allow it to share your screen?
+  subtitle: It will see everything you have open for as long as it lasts.
+  body: >-
+    If you accept, you will then choose which screen. You can stop sharing at
+    any time from the panel indicator.

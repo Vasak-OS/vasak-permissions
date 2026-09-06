@@ -66,3 +66,10 @@ blocked:
     leer tus claves de SSH y GPG, el llavero ni los accesos guardados, ni
     pedirle a los agentes que firmen por ella. Si no esperabas esto, cerrá la
     aplicación.
+
+screencast:
+  title: ¿Le permitís compartir tu pantalla?
+  subtitle: Va a ver todo lo que tengas abierto mientras dure.
+  body: >-
+    Si aceptás, después vas a elegir qué pantalla. Podés dejar de compartir en
+    cualquier momento desde el indicador de la barra.
