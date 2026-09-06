@@ -11,6 +11,7 @@
 //! neither, which is exactly why the online-accounts list it replaces was
 //! decorative — anyone could edit the file and grant themselves anything.
 
+mod local;
 mod procesos;
 mod audit;
 mod excepcion;
