@@ -369,39 +369,55 @@ pub async fn vigilar(
             continue;
         };
 
-        // El proceso suele estar vivo, y entonces se lo identifica directo.
+        // Con qué ruta se nombra a la aplicación.
         //
-        // Pero muchas veces ya no está, **precisamente porque se le negó lo que
-        // necesitaba**: a un programa al que le cortan la cámara es normal que
-        // salga en el acto. Para ese caso está la caché, que anotó su ruta
-        // cuando arrancó. Sin ella, el caso más común se perdía entero: ni
-        // aviso ni anotación, y la aplicación no aparecía nunca en la lista,
-        // así que no había forma de concederle nada.
-        let aplicacion = match crate::identity::PinnedCaller::capture(
-            denegacion.pid,
-            denegacion.uid,
-        ) {
-            Ok(proceso) => proceso.describe(),
-            Err(_) => match crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento) {
-                Some(ruta) => {
-                    tracing::debug!(
-                        "El proceso {} ya no está; se lo nombra por lo recordado",
-                        denegacion.pid
-                    );
-                    crate::identity::describe_path(&ruta.to_string_lossy())
+        // Primero lo recordado y el proceso vivo después — el mismo orden que
+        // usa el aviso de los perfiles ajenos, unas líneas más arriba, y por
+        // una razón más fuerte que la simetría.
+        //
+        // La caché del conector anota **cada** exec, y sólo los que están bajo
+        // el directorio de una persona: justo los que estos perfiles enganchan.
+        // `/proc/<pid>/exe`, en cambio, dice el **último** exec, que no tiene
+        // por qué ser el que hizo que AppArmor enganchara el perfil. Un
+        // AppImage monta su squashfs y ejecuta su `AppRun`, que casi siempre es
+        // un script de shell, y el shell reemplaza la imagen del mismo proceso:
+        // sigue confinado por el mismo perfil y su `exe` ya dice
+        // `/usr/bin/bash`. No hay ningún proceso padre al que subir, porque no
+        // hubo `fork` — sólo `exec`.
+        //
+        // Medido: el aviso salía como «bash quiso usar tus claves».
+        //
+        // Y el nombre no es sólo el texto del aviso. Sobre él se escribe la
+        // excepción, así que permitir habría dejado un perfil de AppArmor
+        // enganchado a `/usr/bin/bash`: el shell del sistema entero, por
+        // querer darle permiso a una aplicación.
+        //
+        // Que el proceso siga vivo importa igual: muchas veces ya no está,
+        // **precisamente porque se le negó lo que necesitaba** —a un programa
+        // al que le cortan la cámara es normal que salga en el acto—, y ahí lo
+        // recordado es lo único que queda.
+        let recordada = crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento)
+            .map(|ruta| ruta.to_string_lossy().into_owned());
+        let viva = crate::identity::PinnedCaller::capture(denegacion.pid, denegacion.uid)
+            .ok()
+            .map(|proceso| proceso.binary_path());
+
+        let Some(ruta) = nombre_confiable(recordada, viva.clone()) else {
+            // Sin nombre no se avisa ni se anota. Un aviso que no nombra a
+            // nadie asusta sin informar, y anotar sobre el nombre equivocado es
+            // peor que no anotar: sobre ese nombre se escribe la excepción.
+            tracing::warn!(
+                "Se bloqueó '{}' al proceso {} y no se pudo saber qué aplicación es{}",
+                denegacion.ruta,
+                denegacion.pid,
+                match viva {
+                    Some(exe) => format!(" (quedó '{exe}', que no es donde estos perfiles enganchan)"),
+                    None => String::from(" (ya no existe y no se recuerda)"),
                 }
-                None => {
-                    // Ni vivo ni recordado. Un aviso que no nombra a nadie
-                    // asusta sin informar, así que no se manda.
-                    tracing::info!(
-                        "Se bloqueó '{}' al proceso {}, que ya no existe y no se recuerda",
-                        denegacion.ruta,
-                        denegacion.pid
-                    );
-                    continue;
-                }
-            },
+            );
+            continue;
         };
+        let aplicacion = crate::identity::describe_path(&ruta);
 
         // El uid va en la clave: si dos personas con sesión abierta usan la
         // misma aplicación, callar a una no puede callar a la otra.
@@ -472,6 +488,30 @@ pub async fn vigilar(
     }
 }
 
+/// Con qué ruta se nombra la aplicación de un bloqueo, si se puede saber.
+///
+/// `recordada` es la que anotó el conector de procesos al ejecutarse; `viva` es
+/// la que tiene el proceso ahora mismo. La primera gana porque es la del exec
+/// que hizo que el perfil enganchara, y la segunda puede ser la de un exec
+/// posterior dentro del mismo proceso.
+///
+/// Hay una carrera que esto no puede cerrar: el conector lee `/proc/<pid>/exe`
+/// cuando le llega el aviso de exec, y si el proceso ya hizo el segundo exec
+/// para entonces, lee el intérprete y no anota nada. Se cae del lado bueno —sin
+/// nombre no se avisa, en vez de avisar mal— pero el aviso se pierde. Cerrarla
+/// pide que el aviso del kernel traiga la ruta, y no la trae.
+///
+/// Devuelve `None` cuando lo que queda no está bajo el directorio de una
+/// persona. Estos perfiles **sólo** enganchan ahí, así que una ruta de sistema
+/// significa que no averiguamos cuál es la aplicación —quedó el intérprete—, y
+/// no hay nada honesto que hacer con eso: el nombre no es sólo el texto del
+/// aviso, es a qué se engancha la excepción si alguien aprieta «Permitir».
+fn nombre_confiable(recordada: Option<String>, viva: Option<String>) -> Option<String> {
+    recordada
+        .or(viva)
+        .filter(|ruta| crate::procesos::interesa(std::path::Path::new(ruta)))
+}
+
 /// Anota en la política que esta aplicación pidió el recurso y no lo tenía.
 async fn registrar_el_intento(
     store: &crate::policy::PolicyStore,
@@ -509,6 +549,73 @@ mod tests {
     use super::*;
 
     use vasak_permissions_protocol::{Application, Decision, Provenance};
+
+    /// El caso que rompía todo, medido en un equipo de verdad.
+    ///
+    /// Un AppImage monta su squashfs y ejecuta su `AppRun`, que casi siempre es
+    /// un script de shell. El shell reemplaza la imagen del **mismo** proceso,
+    /// así que sigue confinado por el mismo perfil y su `/proc/<pid>/exe` ya
+    /// dice `/usr/bin/bash`. No hay padre al que subir: no hubo `fork`.
+    ///
+    /// El aviso salía como «bash quiso usar tus claves», y permitir habría
+    /// escrito la excepción enganchada a `/usr/bin/bash` — un perfil de
+    /// AppArmor sobre el shell del sistema entero.
+    #[test]
+    fn gana_lo_recordado_sobre_el_interprete_que_quedo_en_exe() {
+        let ruta = nombre_confiable(
+            Some("/home/pato/Apps/App Monitor.AppImage".into()),
+            Some("/usr/bin/bash".into()),
+        );
+        assert_eq!(ruta.as_deref(), Some("/home/pato/Apps/App Monitor.AppImage"));
+    }
+
+    /// Sin nada recordado, el intérprete no sirve como nombre.
+    ///
+    /// Pasa cuando el propio archivo que engancha el perfil es un script: el
+    /// conector lee `/proc/<pid>/exe` después del exec y ahí ya está el
+    /// intérprete, así que no lo anota —no está bajo el directorio de una
+    /// persona— y no queda nada de dónde sacar la aplicación.
+    ///
+    /// Antes que nombrar mal, no se nombra: sobre este nombre se escribe la
+    /// excepción.
+    #[test]
+    fn sin_nada_recordado_el_interprete_no_alcanza() {
+        assert_eq!(nombre_confiable(None, Some("/usr/bin/bash".into())), None);
+        assert_eq!(nombre_confiable(None, Some("/usr/bin/python3".into())), None);
+    }
+
+    /// Un programa propio del usuario que no pasó por ningún intérprete se
+    /// sigue nombrando por el proceso vivo, que es lo que había antes.
+    #[test]
+    fn el_proceso_vivo_sirve_cuando_esta_donde_el_perfil_engancha() {
+        assert_eq!(
+            nombre_confiable(None, Some("/home/pato/Apps/cosa.AppImage".into())),
+            Some("/home/pato/Apps/cosa.AppImage".to_string())
+        );
+        assert_eq!(
+            nombre_confiable(None, Some("/root/Apps/cosa.AppImage".into())),
+            Some("/root/Apps/cosa.AppImage".to_string())
+        );
+    }
+
+    /// Ni recordado ni vivo: no hay a quién nombrar.
+    #[test]
+    fn sin_nada_no_hay_nombre() {
+        assert_eq!(nombre_confiable(None, None), None);
+    }
+
+    /// Lo recordado también se comprueba, no se cree porque sí.
+    ///
+    /// El conector ya filtra por el directorio de la persona, así que esto no
+    /// debería pasar — y por eso mismo se comprueba acá y no se confía en que
+    /// el filtro de allá no cambie.
+    #[test]
+    fn lo_recordado_tambien_tiene_que_estar_donde_el_perfil_engancha() {
+        assert_eq!(
+            nombre_confiable(Some("/usr/bin/bash".into()), Some("/home/pato/x.AppImage".into())),
+            None
+        );
+    }
 
     fn una_app(ruta: &str) -> Application {
         Application {
