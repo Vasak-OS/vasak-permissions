@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use zbus::interface;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
@@ -57,7 +57,15 @@ const RESPONSE_CANCELLED: u32 = 1;
 /// Algo salió mal y no fue la persona quien dijo que no.
 const RESPONSE_ERROR: u32 = 2;
 
-/// Lo que devuelve un método del backend.
+/// Lo que contesta un método del portal: `(response, results)`.
+///
+/// Sirve para leer la respuesta de `xdpw`, **no** para declarar el retorno de
+/// nuestros métodos. zbus mira el tipo de retorno tal como está escrito: una
+/// tupla literal la reparte en dos valores de salida —`ua{sv}`, que es lo que
+/// pide la especificación— y un alias con nombre lo trata como un valor solo,
+/// y lo serializa envuelto en una estructura: `(ua{sv})`.
+///
+/// La diferencia no se ve leyendo el código y rompe el portal entero.
 pub type Respuesta = (u32, HashMap<String, OwnedValue>);
 
 fn vacio() -> HashMap<String, OwnedValue> {
@@ -95,12 +103,18 @@ where
 }
 
 /// El backend que el portal ve.
-pub struct ScreenCastBackend {
-    pub app: AppHandle,
+///
+/// Genérico sobre el runtime de Tauri —con `Wry`, el de verdad, por omisión—
+/// nada más que para poder construirlo en una prueba: `tauri::test::mock_app`
+/// da un `AppHandle` de otro runtime, y sin esto no hay forma de mirar la
+/// firma que esta interfaz expone por el bus. Es justo lo que hay que mirar:
+/// las dos veces que estuvo mal, compilaba igual.
+pub struct ScreenCastBackend<R: Runtime = tauri::Wry> {
+    pub app: AppHandle<R>,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
-impl ScreenCastBackend {
+impl<R: Runtime> ScreenCastBackend<R> {
     /// Se reenvía tal cual: crear la sesión no concede nada todavía.
     async fn create_session(
         &self,
@@ -109,7 +123,7 @@ impl ScreenCastBackend {
         session_handle: OwnedObjectPath,
         app_id: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Respuesta {
+    ) -> (u32, HashMap<String, OwnedValue>) {
         let respuesta = reenviar(
             connection,
             "CreateSession",
@@ -139,7 +153,7 @@ impl ScreenCastBackend {
         session_handle: OwnedObjectPath,
         app_id: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Respuesta {
+    ) -> (u32, HashMap<String, OwnedValue>) {
         let pregunta = PortalQuestion {
             app_id: app_id.clone(),
             title: traducir(&self.app, "screencast.title"),
@@ -171,7 +185,7 @@ impl ScreenCastBackend {
         app_id: String,
         parent_window: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Respuesta {
+    ) -> (u32, HashMap<String, OwnedValue>) {
         reenviar(
             connection,
             "Start",
@@ -196,7 +210,7 @@ impl ScreenCastBackend {
         propiedad_de_wlr("AvailableCursorModes").await.unwrap_or(1)
     }
 
-    #[zbus(property)]
+    #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         // La versión que este backend implementa, no la de wlr: es lo que
         // decimos saber contestar.
@@ -230,7 +244,7 @@ impl SesionReenviada {
     #[zbus(signal)]
     async fn closed(emisor: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 
-    #[zbus(property)]
+    #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
         1
     }
@@ -252,7 +266,7 @@ async fn propiedad_de_wlr(nombre: &str) -> Option<u32> {
     reply.body().deserialize::<OwnedValue>().ok()?.downcast_ref::<u32>().ok()
 }
 
-fn traducir(app: &AppHandle, clave: &str) -> String {
+fn traducir<R: Runtime>(app: &AppHandle<R>, clave: &str) -> String {
     use tauri_plugin_i18n_vsk::PluginI18nExt;
     app.i18n().translate(clave).unwrap_or(clave).to_string()
 }
@@ -271,6 +285,75 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zbus::object_server::Interface;
+
+    /// La introspección que el portal lee de una interfaz nuestra.
+    fn firma<I: Interface>(interfaz: &I) -> String {
+        let mut xml = String::new();
+        interfaz.introspect_to_writer(&mut xml, 0);
+        xml
+    }
+
+    /// Los métodos contestan dos valores, no una estructura con dos adentro.
+    ///
+    /// Escrito como `-> Respuesta` —un alias— zbus lo tomaba por un valor solo
+    /// y lo serializaba envuelto: `(ua{sv})` donde la especificación pide
+    /// `ua{sv}`. Compila igual, se lee igual, y el portal no puede leer la
+    /// respuesta. No hay tipo de Rust que ate esto: la única forma de mirarlo
+    /// es la firma que sale por el bus.
+    #[test]
+    fn los_metodos_contestan_dos_valores_sueltos() {
+        let app = tauri::test::mock_app();
+        let backend = ScreenCastBackend { app: app.handle().clone() };
+        let xml = firma(&backend);
+
+        for metodo in ["CreateSession", "SelectSources", "Start"] {
+            let bloque = bloque_del_metodo(&xml, metodo);
+            let salidas: Vec<&str> = bloque
+                .lines()
+                .filter(|l| l.contains(r#"direction="out""#))
+                .collect();
+            assert_eq!(
+                salidas.len(),
+                2,
+                "{metodo} tiene que sacar dos valores y saca {}:\n{bloque}",
+                salidas.len()
+            );
+            assert!(salidas[0].contains(r#"type="u""#), "{metodo}: {}", salidas[0]);
+            assert!(salidas[1].contains(r#"type="a{sv}""#), "{metodo}: {}", salidas[1]);
+        }
+    }
+
+    /// La propiedad se llama `version`, con minúscula.
+    ///
+    /// zbus renombra a PascalCase salvo que se le diga el nombre, así que salía
+    /// `Version`. El portal lee `version`, no la encontraba, tomaba el backend
+    /// por versión 0 y no lo usaba — sin un error en ningún lado: compartir
+    /// pantalla simplemente no hacía nada.
+    #[test]
+    fn la_version_se_anuncia_con_el_nombre_que_el_portal_busca() {
+        let app = tauri::test::mock_app();
+        let backend = ScreenCastBackend { app: app.handle().clone() };
+        let xml = firma(&backend);
+        assert!(xml.contains(r#"<property name="version""#), "{xml}");
+        assert!(!xml.contains(r#"<property name="Version""#), "{xml}");
+
+        let sesion = SesionReenviada {
+            destino: OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1/2")
+                .unwrap(),
+        };
+        let xml = firma(&sesion);
+        assert!(xml.contains(r#"<property name="version""#), "{xml}");
+        assert!(!xml.contains(r#"<property name="Version""#), "{xml}");
+    }
+
+    /// El trozo de XML de un método, del `<method name=…>` a su cierre.
+    fn bloque_del_metodo<'a>(xml: &'a str, metodo: &str) -> &'a str {
+        let abre = format!(r#"<method name="{metodo}">"#);
+        let desde = xml.find(&abre).unwrap_or_else(|| panic!("falta {metodo}:\n{xml}"));
+        let hasta = xml[desde..].find("</method>").expect("método sin cerrar") + desde;
+        &xml[desde..hasta]
+    }
 
     /// Si `xdg-desktop-portal-wlr` no está en el bus, no hay nada que probar y
     /// eso no es una falla: en una máquina de compilación no corre ninguna

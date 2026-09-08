@@ -54,7 +54,7 @@ pub struct DialogState {
 /// One question at a time: a second request while a dialog is open is refused
 /// rather than queued or stacked. Two permission dialogs on screen at once is
 /// how people click the wrong one, and the caller can always ask again.
-pub async fn ask(app: &AppHandle, question: Question) -> bool {
+pub async fn ask<R: tauri::Runtime>(app: &AppHandle<R>, question: Question) -> bool {
     let state = app.state::<DialogState>();
     let (sender, receiver) = oneshot::channel();
 
@@ -106,7 +106,7 @@ fn summary(state: &tauri::State<'_, DialogState>) -> String {
     }
 }
 
-fn open_window(app: &AppHandle) -> tauri::Result<()> {
+fn open_window<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
         window.show()?;
         window.set_focus()?;
@@ -135,7 +135,7 @@ fn open_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Resolves whatever is pending and hides the window.
-fn clear(app: &AppHandle, allowed: bool) {
+fn clear<R: tauri::Runtime>(app: &AppHandle<R>, allowed: bool) {
     let state = app.state::<DialogState>();
 
     if let Ok(mut pending) = state.pending.lock() {
