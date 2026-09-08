@@ -38,8 +38,19 @@ fn hay_parser() -> bool {
 fn compila(texto: &str) -> Result<(), String> {
     let archivo = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::fs::write(archivo.path(), texto).map_err(|e| e.to_string())?;
+    // La caché va a un directorio nuestro y no al del sistema.
+    //
+    // VasakOS activa `write-cache` en parser.conf para no recompilar los
+    // perfiles en cada arranque, y con eso puesto el parser intenta escribir en
+    // /var/cache/apparmor —que es de root, y tiene que serlo: una caché de
+    // política que un usuario pueda escribir es política que root carga al
+    // arrancar—. Sin esto, la prueba falla por no poder escribir ahí y parece
+    // que el perfil no compila.
+    let cache = tempfile::tempdir().map_err(|e| e.to_string())?;
     let salida = Command::new("apparmor_parser")
         .arg("-Q")
+        .arg("--cache-loc")
+        .arg(cache.path())
         .arg(archivo.path())
         .output()
         .map_err(|e| e.to_string())?;
