@@ -41,11 +41,18 @@ DeviceAllow=/dev/kmsg r
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-# AF_NETLINK además de AF_UNIX: por ahí llega el conector de procesos del
-# kernel, que avisa de cada arranque y es lo que permite nombrar a un programa
-# que ya se cerró. Netlink no sale del equipo —es un canal con el kernel—, así
-# que esto no le abre la red al servicio.
+# AF_NETLINK además de AF_UNIX. Por ahí llegan dos cosas del kernel: el
+# conector de procesos, que avisa de cada arranque y es lo que permite nombrar a
+# un programa que ya se cerró, y el registro de auditoría, que es de donde salen
+# las denegaciones sin pasar por el cupo de `printk`. Netlink no sale del equipo
+# —es un canal con el kernel—, así que esto no le abre la red al servicio.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# No hay `CapabilityBoundingSet` a propósito, y si algún día se agrega tiene que
+# dejar `CAP_AUDIT_READ`: es la que permite escuchar el grupo multicast del
+# registro de auditoría. Sin ella el `bind` falla con EPERM, el servicio se cae
+# al lector de `/dev/kmsg` —que descarta el 96% de los registros, medido— y lo
+# único que lo delata es una línea en el diario.
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

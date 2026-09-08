@@ -53,6 +53,12 @@ pub struct Denegacion {
     /// reciclado devolvería la aplicación que heredó el número en vez de la que
     /// fue bloqueada.
     pub momento: std::time::Duration,
+    /// El número de serie que el kernel le puso al evento.
+    ///
+    /// Es único mientras el equipo esté encendido, y es lo que permite que la
+    /// misma denegación llegue por los dos caminos —el registro del kernel y
+    /// el socket de auditoría— y se avise una sola vez.
+    pub serie: u64,
     /// Qué permisos se le negaron, tal como los informa el kernel.
     ///
     /// Hace falta para conceder exactamente eso y no más: un programa al que
@@ -127,10 +133,29 @@ pub fn parsear(linea: &str) -> Option<Denegacion> {
         // es el archivo. Para saber a quién avisarle hace falta el primero.
         uid: numero_de(linea, "fsuid")?,
         momento: momento_de(linea).unwrap_or_default(),
+        serie: serie_de(linea).unwrap_or_default(),
         // Si el kernel no la trae, `r` es la suposición más chica: se concede
         // lo mínimo y, si hacía falta más, vuelve a aparecer un bloqueo.
         mascara: texto_de(linea, "denied_mask").unwrap_or("r").to_string(),
     })
+}
+
+/// El número de serie del evento, el que va después de los dos puntos en
+/// `audit(1788539628.817:36077)`.
+///
+/// El kernel lo asigna una vez por evento y no se repite mientras el equipo
+/// esté encendido. Es lo que permite leer las denegaciones por dos caminos a la
+/// vez y avisar una sola.
+///
+/// Cuando no está —una línea de otra forma— se devuelve `None`, y quien llame
+/// decide. Cero no sirve como «no hay»: sería un valor como cualquier otro y
+/// dos líneas sin serie se descartarían entre sí.
+pub fn serie_de(linea: &str) -> Option<u64> {
+    let inicio = linea.find("audit(")? + "audit(".len();
+    let resto = &linea[inicio..];
+    let desde = resto.find(':')? + 1;
+    let hasta = resto[desde..].find(')')? + desde;
+    resto[desde..hasta].parse().ok()
 }
 
 /// Cuándo ocurrió la denegación, según la marca del propio registro.
@@ -253,6 +278,54 @@ fn cupo() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     CUPO.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AVISOS_A_LA_VEZ)))
 }
 
+/// Los números de serie ya atendidos, para no avisar dos veces del mismo
+/// bloqueo cuando llega por los dos caminos.
+///
+/// Con techo y en orden de llegada: interesa lo reciente, y las dos copias de
+/// un evento llegan con milisegundos de diferencia. Un conjunto sin límite
+/// crecería toda la sesión para no volver a servir nunca.
+struct Vistas {
+    orden: std::collections::VecDeque<u64>,
+    conjunto: std::collections::HashSet<u64>,
+}
+
+impl Vistas {
+    /// Cuántas se recuerdan.
+    ///
+    /// Holgado a propósito: entre las dos copias de un evento pueden colarse
+    /// muchas otras, y recordar de menos hace que el aviso salga duplicado —
+    /// que es el defecto que esto viene a evitar.
+    const TECHO: usize = 4096;
+
+    fn nueva() -> Self {
+        Self {
+            orden: std::collections::VecDeque::with_capacity(Self::TECHO),
+            conjunto: std::collections::HashSet::with_capacity(Self::TECHO),
+        }
+    }
+
+    /// Si esta serie no se había visto. La anota de paso.
+    ///
+    /// La serie cero es «el registro no la traía», y no identifica nada: se
+    /// deja pasar siempre. Descartar por ella juntaría eventos que no tienen
+    /// nada que ver.
+    fn es_nueva(&mut self, serie: u64) -> bool {
+        if serie == 0 {
+            return true;
+        }
+        if !self.conjunto.insert(serie) {
+            return false;
+        }
+        self.orden.push_back(serie);
+        if self.orden.len() > Self::TECHO {
+            if let Some(vieja) = self.orden.pop_front() {
+                self.conjunto.remove(&vieja);
+            }
+        }
+        true
+    }
+}
+
 /// Sigue el registro del kernel y avisa de lo que nuestros perfiles bloquean.
 ///
 /// Nunca termina; se lanza como tarea de fondo. Si `/dev/kmsg` no se puede
@@ -268,6 +341,20 @@ pub async fn vigilar(
 ) {
     let (envio, mut recepcion) = tokio::sync::mpsc::channel::<Denegacion>(64);
 
+    // El socket de auditoría, que es el camino bueno: no pasa por `printk` ni
+    // por su cupo, que descartaba el 96% de los registros. Si no se puede
+    // abrir, lo dice y queda el de abajo.
+    let envio_netlink = envio.clone();
+    std::thread::spawn(move || crate::auditnl::escuchar(envio_netlink));
+
+    // Y `/dev/kmsg`, que se sigue leyendo aunque el otro haya arrancado bien.
+    //
+    // No es redundancia por las dudas: si el socket se abriera y el kernel no
+    // entregara nada, con un solo lector nos quedaríamos sin ninguna denegación
+    // **y con el diario diciendo que estamos escuchando**. Con los dos, el peor
+    // caso es el de antes. Lo repetido se descarta más abajo por número de
+    // serie.
+    //
     // La lectura de /dev/kmsg bloquea a la espera del próximo mensaje, así que
     // vive en un hilo aparte y manda por el canal lo que reconoce.
     std::thread::spawn(move || {
@@ -300,7 +387,14 @@ pub async fn vigilar(
     });
 
     let mut recientes: HashMap<(u32, String, String), Instant> = HashMap::new();
+    let mut vistas = Vistas::nueva();
     while let Some(denegacion) = recepcion.recv().await {
+        // La misma denegación puede llegar por los dos caminos. El número de
+        // serie lo pone el kernel una vez por evento, así que alcanza para
+        // reconocerla — y sin él, cada bloqueo produciría dos avisos.
+        if !vistas.es_nueva(denegacion.serie) {
+            continue;
+        }
         // Un bloqueo de un perfil ajeno —de los más de mil quinientos que trae
         // el sistema— no tiene un recurso con nombre: lo que se puede ofrecer
         // desbloquear es la ruta concreta. Antes se descartaba, y eso dejaba a
@@ -549,6 +643,55 @@ mod tests {
     use super::*;
 
     use vasak_permissions_protocol::{Application, Decision, Provenance};
+
+    /// La serie del evento, que es lo que distingue una denegación de otra.
+    #[test]
+    fn de_la_marca_sale_el_numero_de_serie() {
+        assert_eq!(serie_de("audit(1788539628.817:36077): apparmor=\"DENIED\""), Some(36077));
+        // Sin milésimas también.
+        assert_eq!(serie_de("audit(1788539628:5): x"), Some(5));
+    }
+
+    /// Una línea sin marca no tiene serie, y eso no es cero.
+    ///
+    /// Cero como «no hay» juntaría entre sí todas las líneas raras y haría
+    /// desaparecer avisos.
+    #[test]
+    fn sin_marca_no_hay_serie() {
+        assert_eq!(serie_de("apparmor=\"DENIED\" profile=\"x\""), None);
+        assert_eq!(serie_de("audit(1788539628.817"), None);
+        assert_eq!(serie_de("audit(1788539628.817:no-es-un-numero): x"), None);
+    }
+
+    /// La misma denegación por los dos caminos se atiende una sola vez.
+    #[test]
+    fn la_misma_serie_no_se_atiende_dos_veces() {
+        let mut vistas = Vistas::nueva();
+        assert!(vistas.es_nueva(36077));
+        assert!(!vistas.es_nueva(36077));
+        assert!(vistas.es_nueva(36078));
+    }
+
+    /// La serie cero no identifica nada y no descarta nada.
+    #[test]
+    fn la_serie_cero_siempre_pasa() {
+        let mut vistas = Vistas::nueva();
+        assert!(vistas.es_nueva(0));
+        assert!(vistas.es_nueva(0));
+    }
+
+    /// El recuerdo tiene techo y se olvida por orden de llegada.
+    #[test]
+    fn no_se_recuerdan_series_sin_limite() {
+        let mut vistas = Vistas::nueva();
+        for serie in 1..=(Vistas::TECHO as u64 + 10) {
+            assert!(vistas.es_nueva(serie));
+        }
+        assert_eq!(vistas.conjunto.len(), Vistas::TECHO);
+        // Las primeras ya se olvidaron; las últimas siguen.
+        assert!(vistas.es_nueva(1));
+        assert!(!vistas.es_nueva(Vistas::TECHO as u64 + 10));
+    }
 
     /// El caso que rompía todo, medido en un equipo de verdad.
     ///

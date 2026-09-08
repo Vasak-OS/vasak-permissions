@@ -14,6 +14,7 @@
 mod local;
 mod procesos;
 mod audit;
+mod auditnl;
 mod excepcion;
 mod agent;
 mod identity;
