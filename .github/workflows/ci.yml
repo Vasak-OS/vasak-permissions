@@ -9,6 +9,12 @@ on:
 
 jobs:
   app:
+    # Sólo lectura, que es todo lo que estos chequeos necesitan: clonan,
+    # instalan dependencias y comprueban. El workflow llamado declara lo mismo
+    # —es donde corre el trabajo y donde el permiso importa— y esto pone el
+    # techo desde acá: un llamado no puede pedir más de lo que el llamador le da.
+    permissions:
+      contents: read
     uses: Vasak-OS/.github/.github/workflows/app.yml@main
     with:
       # El daemon y el protocolo no dependen de Tauri, así que sus pruebas
