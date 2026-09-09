@@ -114,7 +114,7 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// Las aplicaciones de correo, calendario, contactos y chats todavía no
 /// existen. Cada una entra acá el día que se escriba, con su capacidad y
 /// ninguna más.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 4] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 5] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
@@ -151,6 +151,18 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 4] = [
     // Nextcloud entrega las dos cosas con la misma credencial, así que sin esta
     // línea la separación sería una convención y no un límite.
     ("/usr/bin/vasak-calendar", &["account.calendar"]),
+    // La aplicación de correo. **Nada**, y es la más expuesta de todas.
+    //
+    // Lo que muestra lo escribió cualquiera que sepa la dirección de la persona:
+    // es la superficie más grande del escritorio. Y a la vez es la que menos
+    // tiene para perder, porque no lee el correo — se lo pide ya interpretado a
+    // `vasak-accounts-sync`, que sí tiene `account.email` y no dibuja nada.
+    //
+    // Esta línea es lo que convierte ese reparto en un límite. Sin ella, un
+    // `vasak-mail` reemplazado podría pedir `account.email` y la persona vería un
+    // diálogo pidiéndole permiso para algo que la aplicación de verdad nunca
+    // necesitó — y que si concede, entrega la contraseña de su casilla.
+    ("/usr/bin/vasak-mail", &[]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -675,7 +687,31 @@ mod tests_alcance {
         }
     }
 
-    /// El caso más fuerte de la lista: alcance vacío.
+    /// La aplicación de correo tampoco puede pedir nada, y es el caso que más
+    /// se gana.
+    ///
+    /// Es la más expuesta del escritorio —lo que muestra lo escribió cualquiera
+    /// que sepa la dirección de la persona— y no lee el correo: se lo pide ya
+    /// interpretado al sincronizador. Sin esta línea, una copia reemplazada
+    /// podría pedir `account.email` y la persona vería un diálogo pidiéndole
+    /// permiso para algo que la aplicación de verdad nunca necesitó.
+    #[test]
+    fn el_correo_no_puede_pedir_ni_el_correo() {
+        let correo = "/usr/bin/vasak-mail";
+
+        assert_eq!(scope_of(correo), Some(&[][..]));
+        for recurso in [
+            "account.email",
+            "account.contacts",
+            "account.calendar",
+            "account.drive",
+            "credentials",
+        ] {
+            assert!(!may_request(correo, recurso), "no tenía que poder pedir '{recurso}'");
+        }
+    }
+
+    /// El primero de los dos alcances vacíos, que son el caso más fuerte.
     ///
     /// La pantalla de configuración administra las cuentas y no las usa, así que
     /// no puede pedir **nada**. Una configuración reemplazada no llega a ningún
