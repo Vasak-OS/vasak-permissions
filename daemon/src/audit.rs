@@ -644,6 +644,90 @@ mod tests {
 
     use vasak_permissions_protocol::{Application, Decision, Provenance};
 
+    // ── Pruebas de propiedad ────────────────────────────────────────────
+    //
+    // Estos analizadores leen lo que escribe el kernel sobre lo que hizo
+    // **cualquier** programa del equipo, y corren como root. La ruta que
+    // aparece en un registro la elige quien intentó abrirla, así que buena
+    // parte de la entrada la controla quien está siendo bloqueado.
+    //
+    // Un pánico acá no se ve: se lleva el hilo que lee el registro, el resto
+    // del servicio sigue en pie, y a partir de ese momento **ningún bloqueo
+    // vuelve a avisar**. Ya pasó una vez —`Duration::from_secs_f64` entra en
+    // pánico con `inf`, con `NaN` y con cualquier valor que no entre en un
+    // `u64`, y las tres cosas se escriben con dígitos y un punto— y por eso
+    // estas pruebas existen.
+    proptest::proptest! {
+        /// Ninguna cadena, venga como venga, hace caer al analizador.
+        #[test]
+        fn parsear_nunca_entra_en_panico(linea in ".*") {
+            let _ = parsear(&linea);
+        }
+
+        /// Ni las que tienen la forma de un registro con los campos al voleo,
+        /// que es lo que una cadena al azar casi nunca alcanza a producir.
+        #[test]
+        fn una_linea_con_forma_de_registro_tampoco(
+            marca in ".{0,40}",
+            perfil in ".{0,40}",
+            ruta in ".{0,60}",
+            pid in ".{0,20}",
+            uid in ".{0,20}",
+            mascara in ".{0,10}",
+        ) {
+            let linea = format!(
+                "audit({marca}): apparmor=\"DENIED\" operation=\"open\" \
+                 profile=\"{perfil}\" name=\"{ruta}\" pid={pid} \
+                 denied_mask=\"{mascara}\" fsuid={uid}"
+            );
+            let _ = parsear(&linea);
+        }
+
+        /// La marca de tiempo, que es por donde ya se coló un pánico.
+        #[test]
+        fn el_momento_nunca_entra_en_panico(marca in ".{0,60}") {
+            let _ = momento_de(&format!("audit({marca}): x"));
+        }
+
+        /// Los números escritos como coma flotante son el caso que rompió:
+        /// `inf`, `NaN` y `1e30` pasan cualquier guarda de signo.
+        #[test]
+        fn ninguna_marca_numerica_rara_entra_en_panico(
+            marca in "(inf|-inf|NaN|nan|[0-9]{0,25}(\\.[0-9]{0,25})?(e[+-]?[0-9]{0,4})?)"
+        ) {
+            let _ = momento_de(&format!("audit({marca}:1): x"));
+            let _ = serie_de(&format!("audit(1.0:{marca}): x"));
+        }
+
+        /// Y la serie.
+        #[test]
+        fn la_serie_nunca_entra_en_panico(marca in ".{0,60}") {
+            let _ = serie_de(&format!("audit({marca}): x"));
+        }
+
+        /// Lo que sale de una línea con forma válida tiene que ser coherente:
+        /// si dice que la hubo, los campos que la identifican están.
+        #[test]
+        fn lo_que_devuelve_esta_completo(
+            perfil in "[a-zA-Z0-9_.-]{1,30}",
+            ruta in "/[a-zA-Z0-9_./-]{0,50}",
+            pid in 1u32..1_000_000,
+            uid in 0u32..70000,
+        ) {
+            let linea = format!(
+                "audit(1788876866.510:49055): apparmor=\"DENIED\" operation=\"open\" \
+                 profile=\"{perfil}\" name=\"{ruta}\" pid={pid} \
+                 denied_mask=\"r\" fsuid={uid}"
+            );
+            let d = parsear(&linea).expect("una línea con todos los campos se lee");
+            proptest::prop_assert_eq!(d.perfil, perfil);
+            proptest::prop_assert_eq!(d.ruta, ruta);
+            proptest::prop_assert_eq!(d.pid, pid);
+            proptest::prop_assert_eq!(d.uid, uid);
+            proptest::prop_assert_eq!(d.serie, 49055);
+        }
+    }
+
     /// La serie del evento, que es lo que distingue una denegación de otra.
     #[test]
     fn de_la_marca_sale_el_numero_de_serie() {
