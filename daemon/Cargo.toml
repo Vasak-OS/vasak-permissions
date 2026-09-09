@@ -23,4 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 
 [dev-dependencies]
+# Para las pruebas de propiedad sobre los analizadores privilegiados: generan
+# entradas al voleo y reducen el caso que falla hasta el mínimo que lo
+# reproduce. Corre en Rust estable, así que entra en la CI como una prueba más
+# —a diferencia de `cargo-fuzz`, que pide nightly—.
+proptest = "1"
+
 tempfile = "3"

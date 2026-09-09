@@ -10,3 +10,9 @@ on:
 jobs:
   app:
     uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    with:
+      # El daemon y el protocolo no dependen de Tauri, así que sus pruebas
+      # corren en un runner pelado. Entre ellas están las de propiedad sobre
+      # los analizadores que leen el registro del kernel — que es entrada que
+      # elige, en parte, el programa al que se está bloqueando.
+      pruebas_rust: -p vasak-permissions-daemon -p vasak-permissions-protocol

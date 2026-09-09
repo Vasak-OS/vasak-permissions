@@ -262,6 +262,60 @@ mod tests {
         assert_eq!(texto_de_mensaje(&m), Some(UNA_DENEGACION));
     }
 
+    // ── Pruebas de propiedad ────────────────────────────────────────────
+    //
+    // Esto lee bytes crudos de un socket del kernel y hace aritmética de
+    // desplazamientos con un largo que declara quien envía. Es exactamente la
+    // forma de un desbordamiento de lectura, y corre como root.
+    proptest::proptest! {
+        /// Ninguna secuencia de bytes hace caer al lector ni lo saca del
+        /// mensaje. Si devuelve texto, ese texto sale de adentro del buffer.
+        #[test]
+        fn ningun_mensaje_entra_en_panico_ni_lee_de_mas(bytes in proptest::collection::vec(proptest::num::u8::ANY, 0..600)) {
+            if let Some(texto) = texto_de_mensaje(&bytes) {
+                proptest::prop_assert!(texto.len() <= bytes.len() - CABECERA);
+            }
+        }
+
+        /// Y con la forma de un mensaje de verdad, que es lo que una secuencia
+        /// al azar casi nunca alcanza a producir: encabezado válido, largo
+        /// mentido y carga arbitraria.
+        #[test]
+        fn un_mensaje_con_el_largo_mentido_tampoco(
+            tipo in proptest::num::u16::ANY,
+            largo in proptest::num::u32::ANY,
+            carga in proptest::collection::vec(proptest::num::u8::ANY, 0..300),
+        ) {
+            let mut m = Vec::with_capacity(CABECERA + carga.len());
+            m.extend_from_slice(&largo.to_ne_bytes());
+            m.extend_from_slice(&tipo.to_ne_bytes());
+            m.extend_from_slice(&0u16.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&carga);
+            if let Some(texto) = texto_de_mensaje(&m) {
+                proptest::prop_assert!(texto.len() <= carga.len());
+            }
+        }
+
+        /// Y lo que salga de acá lo tiene que poder digerir el analizador de
+        /// siempre, que es a donde va.
+        #[test]
+        fn lo_que_sale_lo_come_el_analizador(carga in ".{0,200}") {
+            let mut m = Vec::new();
+            let largo = CABECERA + carga.len();
+            m.extend_from_slice(&(largo as u32).to_ne_bytes());
+            m.extend_from_slice(&1400u16.to_ne_bytes());
+            m.extend_from_slice(&0u16.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(carga.as_bytes());
+            if let Some(texto) = texto_de_mensaje(&m) {
+                let _ = crate::audit::parsear(texto);
+            }
+        }
+    }
+
     /// Un largo por debajo del encabezado tampoco.
     #[test]
     fn un_largo_imposible_se_descarta() {
