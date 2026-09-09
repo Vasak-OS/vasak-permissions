@@ -71,6 +71,110 @@ pub fn is_delegate(binary_path: &str) -> bool {
         })
 }
 
+/// Hasta dónde puede llegar a pedir cada aplicación del sistema.
+///
+/// ── Qué problema resuelve ───────────────────────────────────────────────────
+///
+/// Sin esto, el reparto de capacidades entre aplicaciones es una convención y
+/// nada más: el gestor de archivos podría pedir `account.email`, y la persona
+/// —que confía en el gestor de archivos, porque es del sistema— diría que sí.
+/// Bastaría con reemplazar ese binario para llegar al correo con un diálogo que
+/// se ve exactamente igual que cualquier otro.
+///
+/// Con la lista, un programa que pide algo fuera de su alcance **no genera un
+/// diálogo**: se le niega y punto. No es una pregunta para la persona — que el
+/// gestor de archivos pida el correo no es una decisión que ella tenga que
+/// tomar, es un fallo o un ataque.
+///
+/// ── Qué restringe y qué no ──────────────────────────────────────────────────
+///
+/// Sólo a los que están en la lista. Un programa que no figura queda como
+/// siempre: puede pedir cualquier cosa y la persona decide. No se puede
+/// enumerar todo lo que alguien puede instalar, y una lista que negara lo no
+/// enumerado dejaría al sistema sin poder correr nada de terceros.
+///
+/// O sea: esto **acota** a las aplicaciones propias, no **habilita** a nadie.
+/// Estar en la lista con un recurso no lo concede — lo sigue decidiendo la
+/// persona—; estar en la lista sin él lo impide antes de preguntar.
+///
+/// ── Por qué está compilada y no en un archivo ───────────────────────────────
+///
+/// Por lo mismo que [`DELEGATE_BINARIES`]: es un límite de seguridad, no un
+/// catálogo. Un archivo en `/etc` lo puede cambiar root, que es quien instala
+/// las aplicaciones de todos modos, así que no gana nada; y tenerlo acá deja
+/// una sola cosa que auditar, al lado de la otra lista de la misma clase.
+///
+/// ── Cómo agregar una aplicación ─────────────────────────────────────────────
+///
+/// Una entrada por binario, con la ruta absoluta bajo `/usr/bin` y los
+/// identificadores exactos que devuelve [`Resource::as_id`]. Un test comprueba
+/// que cada identificador exista, porque uno mal escrito no falla: no empareja
+/// con nada, y el alcance queda más chico de lo que se quiso.
+///
+/// Las aplicaciones de correo, calendario, contactos y chats todavía no
+/// existen. Cada una entra acá el día que se escriba, con su capacidad y
+/// ninguna más.
+pub const SCOPED_BINARIES: [(&str, &[&str]); 2] = [
+    // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
+    // No al correo, ni al calendario, ni a los contactos: eso es de las
+    // aplicaciones que les corresponden.
+    ("/usr/bin/vasak-file-manager", &["account.drive"]),
+    // Nada, y no es un descuido.
+    //
+    // La pantalla de configuración **administra** las cuentas —las agrega, las
+    // quita, muestra qué aplicaciones tienen acceso— y no las usa. Los comandos
+    // que leían el token de una cuenta estaban registrados sin que nada los
+    // llamara, y se quitaron junto con esta línea.
+    //
+    // Vacío la vuelve el caso más fuerte de la lista: una configuración
+    // reemplazada no llega a ningún token, y ni siquiera puede preguntar.
+    //
+    // Ojo con lo que **no** limita, porque de otra forma esto asustaría: pedir
+    // un recurso es una cosa y administrar la política es otra. `ListPermissions`
+    // y `SetPermission` no pasan por acá, así que la pantalla sigue pudiendo
+    // conceder y quitar permisos de **otros** programas, que es su trabajo. Lo
+    // único que no puede es concederse algo a sí misma.
+    ("/usr/bin/vasak-settings", &[]),
+];
+
+/// Si `binary_path` puede llegar a pedir `resource_id`.
+///
+/// Verdadero para todo lo que no esté en la lista: ver arriba por qué.
+pub fn may_request(binary_path: &str, resource_id: &str) -> bool {
+    match scope_of(binary_path) {
+        Some(alcance) => alcance.contains(&resource_id),
+        None => true,
+    }
+}
+
+/// El alcance declarado de un binario, o `None` si no tiene ninguno.
+///
+/// En compilaciones de depuración se empareja además por nombre de archivo, para
+/// poder ejercitar el límite desde una copia de trabajo sin instalar nada. Queda
+/// fuera de release por completo y no detrás de un `if`: emparejar por nombre
+/// haría que cualquier `vasak-file-manager` en cualquier carpeta contara como el
+/// del sistema, y eso invierte el sentido de la lista.
+pub fn scope_of(binary_path: &str) -> Option<&'static [&'static str]> {
+    if let Some((_, alcance)) = SCOPED_BINARIES
+        .iter()
+        .find(|(instalado, _)| *instalado == binary_path)
+    {
+        return Some(alcance);
+    }
+
+    #[cfg(debug_assertions)]
+    if std::env::var_os("VASAK_PERMISSIONS_TEST_ROOT").is_some() {
+        let nombre = std::path::Path::new(binary_path).file_name();
+        if let Some((_, alcance)) = SCOPED_BINARIES.iter().find(|(instalado, _)| {
+            std::path::Path::new(instalado).file_name() == nombre
+        }) {
+            return Some(alcance);
+        }
+    }
+
+    None
+}
+
 // ── Resources ───────────────────────────────────────────────────────────────
 
 /// Something an application can ask to use.
@@ -460,5 +564,159 @@ mod policy_tests {
             "la política instalada no deja al servicio llamar al agente; \
              falta la regla: {rule}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_alcance {
+    use super::*;
+
+    /// El caso que motivó la lista: el gestor de archivos llega a los discos en
+    /// la nube y a nada más.
+    #[test]
+    fn el_gestor_de_archivos_solo_llega_a_los_discos_en_la_nube() {
+        let gestor = "/usr/bin/vasak-file-manager";
+
+        assert!(may_request(gestor, "account.drive"));
+
+        for prohibido in [
+            "account.email",
+            "account.calendar",
+            "account.contacts",
+            "account.chat",
+            "account.tasks",
+            "camera",
+            "microphone",
+            "credentials",
+        ] {
+            assert!(
+                !may_request(gestor, prohibido),
+                "el gestor de archivos no tenía que poder pedir '{prohibido}'"
+            );
+        }
+    }
+
+    /// La lista **acota** a las aplicaciones propias, no habilita a nadie. Un
+    /// programa que no figura queda como siempre: pide, y la persona decide.
+    ///
+    /// Sin esta propiedad el sistema no podría correr nada de terceros, porque
+    /// no se puede enumerar todo lo que alguien instala.
+    #[test]
+    fn un_programa_que_no_figura_puede_pedir_cualquier_cosa() {
+        for ajeno in [
+            "/usr/bin/thunderbird",
+            "/usr/bin/evolution",
+            "/home/alguien/.local/bin/algo",
+            "",
+        ] {
+            assert!(may_request(ajeno, "account.email"), "{ajeno}");
+            assert!(may_request(ajeno, "camera"), "{ajeno}");
+            assert_eq!(scope_of(ajeno), None, "{ajeno} no debería tener alcance");
+        }
+    }
+
+    /// El caso más fuerte de la lista: alcance vacío.
+    ///
+    /// La pantalla de configuración administra las cuentas y no las usa, así que
+    /// no puede pedir **nada**. Una configuración reemplazada no llega a ningún
+    /// token y ni siquiera puede preguntar.
+    #[test]
+    fn configuracion_no_puede_pedir_nada() {
+        let configuracion = "/usr/bin/vasak-settings";
+
+        assert_eq!(scope_of(configuracion), Some(&[][..]));
+        for recurso in [
+            "account.email",
+            "account.drive",
+            "account.calendar",
+            "camera",
+            "microphone",
+            "credentials",
+        ] {
+            assert!(
+                !may_request(configuracion, recurso),
+                "configuración no tenía que poder pedir '{recurso}'"
+            );
+        }
+    }
+
+    /// Y lo que el alcance vacío **no** limita, que es lo que hace que no rompa
+    /// la pantalla: pedir un recurso es una cosa y administrar la política es
+    /// otra. `ListPermissions` y `SetPermission` no consultan esta lista contra
+    /// quien llama, sino contra el programa que se está administrando.
+    ///
+    /// El test vive acá porque el riesgo es que alguien lea «alcance vacío» y
+    /// crea que la configuración quedó sin poder hacer su trabajo.
+    #[test]
+    fn el_alcance_vacio_no_le_impide_administrar_a_otros() {
+        // Administrar al gestor de archivos dentro de su alcance sigue siendo
+        // posible: lo que se consulta es el binario administrado, no el que
+        // administra.
+        assert!(may_request("/usr/bin/vasak-file-manager", "account.drive"));
+        // Y a un programa de terceros, cualquier cosa.
+        assert!(may_request("/usr/bin/thunderbird", "account.email"));
+    }
+
+    /// Estar en la lista con un recurso no lo concede: lo sigue decidiendo la
+    /// persona. Lo único que hace la lista es impedir lo que no está.
+    #[test]
+    fn tener_alcance_no_es_tener_permiso() {
+        // `may_request` habla de lo que se puede *pedir*. El sí o el no lo
+        // sigue dando la política del usuario, que es otro archivo y otro
+        // camino: este test está acá para que nadie confunda las dos cosas al
+        // leer la lista.
+        assert!(may_request("/usr/bin/vasak-file-manager", "account.drive"));
+        assert_eq!(
+            scope_of("/usr/bin/vasak-file-manager"),
+            Some(&["account.drive"][..]),
+        );
+    }
+
+    /// Un identificador mal escrito en la lista no falla: no empareja con nada,
+    /// y el alcance queda más chico de lo que se quiso — o sea, la aplicación
+    /// deja de andar sin que nadie sepa por qué. Por eso se comprueba que cada
+    /// uno exista de verdad.
+    #[test]
+    fn todos_los_recursos_de_la_lista_existen() {
+        for (binario, alcance) in SCOPED_BINARIES {
+            for id in alcance {
+                let recurso = Resource::from_id(id);
+                assert!(
+                    recurso.is_some(),
+                    "'{id}' del alcance de {binario} no es un recurso conocido"
+                );
+                // Y de ida y vuelta, para que el identificador escrito a mano
+                // sea exactamente el que el servicio usa en el bus y en disco.
+                assert_eq!(
+                    recurso.unwrap().as_id(),
+                    *id,
+                    "'{id}' no es la forma canónica del recurso"
+                );
+            }
+        }
+    }
+
+    /// Las rutas son absolutas y bajo `/usr/bin`, que necesita root para
+    /// escribir. Una ruta que el usuario pueda escribir haría que la lista
+    /// acotara a un programa que él mismo puede reemplazar, lo que no acota
+    /// nada.
+    #[test]
+    fn las_rutas_de_la_lista_estan_donde_solo_root_escribe() {
+        for (binario, _) in SCOPED_BINARIES {
+            assert!(
+                binario.starts_with("/usr/bin/"),
+                "{binario} no está en /usr/bin"
+            );
+        }
+    }
+
+    /// Sin duplicados: dos entradas para el mismo binario harían que el alcance
+    /// dependiera de cuál se encuentra primero.
+    #[test]
+    fn no_hay_binarios_repetidos_en_la_lista() {
+        let mut vistos = std::collections::BTreeSet::new();
+        for (binario, _) in SCOPED_BINARIES {
+            assert!(vistos.insert(binario), "{binario} está dos veces");
+        }
     }
 }

@@ -119,6 +119,23 @@ impl PermissionService {
     ) -> zbus::fdo::Result<bool> {
         let application = subject.describe();
 
+        // Antes que nada, incluso antes de mirar lo que ya se decidió: si el
+        // programa está pidiendo algo fuera de su alcance declarado, no hay
+        // pregunta que hacer.
+        //
+        // Que el gestor de archivos pida el correo no es una decisión de la
+        // persona — es un fallo o un ataque—, y mostrarle un diálogo la pondría
+        // a autorizar exactamente lo que la lista existe para impedir. Se niega
+        // sin preguntar y sin guardar nada.
+        if !vasak_permissions_protocol::may_request(&application.binary_path, resource_id) {
+            tracing::warn!(
+                "FUERA DE ALCANCE — {} pidió '{resource_id}', que no está entre \
+                 los recursos que puede usar. Se deniega sin preguntar",
+                application.binary_path,
+            );
+            return Ok(false);
+        }
+
         let stored = self
             .store
             .load(subject.uid)
@@ -288,6 +305,22 @@ impl PermissionService {
         allowed: bool,
     ) -> zbus::fdo::Result<()> {
         check_resource(&resource_id)?;
+
+        // Conceder algo fuera del alcance de un programa se rechaza acá también,
+        // y no sólo en `decide`.
+        //
+        // Si no, la pantalla podría escribir «permitido» sobre un recurso que el
+        // programa no puede pedir: `decide` lo negaría igual, así que quedaría un
+        // interruptor encendido que no hace nada — la clase de mentira que este
+        // servicio existe para no contar. Negarlo sí se acepta: no cambia el
+        // resultado, pero tampoco engaña a nadie.
+        if allowed && !vasak_permissions_protocol::may_request(&binary_path, &resource_id) {
+            return Err(FdoError::AccessDenied(format!(
+                "{binary_path} no puede usar '{resource_id}': está fuera de los \
+                 recursos que esa aplicación tiene declarados, así que permitirlo \
+                 no tendría ningún efecto"
+            )));
+        }
 
         let caller = caller_of(connection, &header).await?;
         polkit::authorize(connection, &caller).await?;

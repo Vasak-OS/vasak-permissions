@@ -90,17 +90,40 @@ impl UserPolicy {
         self.applications.remove(binary_path).is_some()
     }
 
+    /// Lo que la pantalla muestra.
+    ///
+    /// Se sacan las decisiones que caen fuera del alcance declarado del
+    /// programa. No es cosmética: `decide` niega esos recursos sin mirar lo
+    /// guardado, así que el interruptor no haría nada en ninguna de sus dos
+    /// posiciones — y un interruptor que parece protección sin serlo es peor
+    /// que ninguno.
+    ///
+    /// Pasa con lo que quedó decidido **antes** de que el programa tuviera
+    /// alcance: esas decisiones siguen en el archivo, sin efecto. No se borran
+    /// acá porque leer no debería escribir; si el alcance se amplía más
+    /// adelante, vuelven a valer y vuelven a mostrarse.
     pub fn entries(&self) -> Vec<PermissionEntry> {
         self.applications
             .iter()
-            .map(|(binary_path, stored)| PermissionEntry {
-                application: Application {
-                    binary_path: binary_path.clone(),
-                    display_name: stored.display_name.clone(),
-                    provenance: stored.provenance,
-                },
-                asks: stored.asks,
-                decisions: stored.decisions.clone(),
+            .map(|(binary_path, stored)| {
+                let decisions = stored
+                    .decisions
+                    .iter()
+                    .filter(|(resource_id, _)| {
+                        vasak_permissions_protocol::may_request(binary_path, resource_id)
+                    })
+                    .map(|(resource_id, decision)| (resource_id.clone(), *decision))
+                    .collect();
+
+                PermissionEntry {
+                    application: Application {
+                        binary_path: binary_path.clone(),
+                        display_name: stored.display_name.clone(),
+                        provenance: stored.provenance,
+                    },
+                    asks: stored.asks,
+                    decisions,
+                }
             })
             .collect()
     }
@@ -208,6 +231,51 @@ mod tests {
             display_name: "Test".into(),
             provenance: Provenance::SystemInstalled,
         }
+    }
+
+    /// Una decisión fuera del alcance del programa no se muestra.
+    ///
+    /// Puede existir en el archivo: quedó de antes de que ese programa tuviera
+    /// alcance declarado. Pero `decide` la niega sin mirar lo guardado, así que
+    /// el interruptor no haría nada en ninguna de sus dos posiciones — y un
+    /// interruptor que parece protección sin serlo es peor que ninguno.
+    #[test]
+    fn lo_que_esta_fuera_del_alcance_no_llega_a_la_pantalla() {
+        let gestor = "/usr/bin/vasak-file-manager";
+        let mut politica = UserPolicy::default();
+
+        // Lo que sí puede pedir, y lo que le quedó decidido de antes.
+        politica.record(&application(gestor), "account.drive", Decision::Allowed, true);
+        politica.record(&application(gestor), "account.email", Decision::Allowed, true);
+
+        let entrada = politica
+            .entries()
+            .into_iter()
+            .find(|e| e.application.binary_path == gestor)
+            .expect("la aplicación tiene que seguir figurando");
+
+        assert!(entrada.decisions.contains_key("account.drive"));
+        assert!(
+            !entrada.decisions.contains_key("account.email"),
+            "no puede mostrarse un permiso que decide() niega igual"
+        );
+
+        // Y no se borra del archivo: leer no escribe, y si el alcance se
+        // amplía más adelante la decisión vuelve a valer.
+        assert!(politica.decision(gestor, "account.email").is_allowed());
+    }
+
+    /// Un programa que no está en la lista sigue mostrando todo lo suyo: la
+    /// lista acota a las aplicaciones propias, no esconde las de terceros.
+    #[test]
+    fn un_programa_sin_alcance_muestra_todas_sus_decisiones() {
+        let ajeno = "/home/alguien/.local/bin/algo";
+        let mut politica = UserPolicy::default();
+        politica.record(&application(ajeno), "account.email", Decision::Allowed, true);
+        politica.record(&application(ajeno), "camera", Decision::Denied, true);
+
+        let entrada = politica.entries().into_iter().next().unwrap();
+        assert_eq!(entrada.decisions.len(), 2);
     }
 
     /// Preguntar y ser bloqueado son dos orígenes distintos, y la pantalla
