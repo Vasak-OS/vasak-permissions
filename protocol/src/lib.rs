@@ -114,7 +114,7 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// Las aplicaciones de correo, calendario, contactos y chats todavía no
 /// existen. Cada una entra acá el día que se escriba, con su capacidad y
 /// ninguna más.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 2] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 3] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
@@ -135,6 +135,15 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 2] = [
     // conceder y quitar permisos de **otros** programas, que es su trabajo. Lo
     // único que no puede es concederse algo a sí misma.
     ("/usr/bin/vasak-settings", &[]),
+    // El bucle que mantiene al día el correo. Corre con la cuenta de la
+    // persona, aparte del servicio de cuentas, porque habla IMAP con servidores
+    // ajenos y eso no puede pasar por un proceso de root.
+    //
+    // Sólo el correo: el calendario es de la aplicación de calendario y los
+    // contactos de la suya. Que viva en el mismo repositorio que el servicio no
+    // le da nada — le pide los tokens por el mismo camino que cualquier otra
+    // aplicación, y este límite lo alcanza igual.
+    ("/usr/bin/vasak-accounts-sync", &["account.email"]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -612,6 +621,27 @@ mod tests_alcance {
             assert!(may_request(ajeno, "account.email"), "{ajeno}");
             assert!(may_request(ajeno, "camera"), "{ajeno}");
             assert_eq!(scope_of(ajeno), None, "{ajeno} no debería tener alcance");
+        }
+    }
+
+    /// El bucle de correo llega al correo y a nada más.
+    ///
+    /// Corre aparte del servicio de cuentas y con la cuenta de la persona, así
+    /// que es una aplicación como cualquier otra a los ojos de esta lista — y le
+    /// corresponde el mismo trato.
+    #[test]
+    fn el_bucle_de_correo_solo_llega_al_correo() {
+        let sync = "/usr/bin/vasak-accounts-sync";
+
+        assert!(may_request(sync, "account.email"));
+        for prohibido in [
+            "account.calendar",
+            "account.contacts",
+            "account.drive",
+            "account.chat",
+            "credentials",
+        ] {
+            assert!(!may_request(sync, prohibido), "no tenía que poder pedir '{prohibido}'");
         }
     }
 

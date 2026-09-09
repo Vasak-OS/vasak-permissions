@@ -87,6 +87,12 @@ recurso es una cosa y administrar la política es otra. `ListPermissions` y
 quien administra, así que la configuración sigue pudiendo conceder y quitar
 permisos de otros programas. Lo único que no puede es concederse algo a sí misma.
 
+El bucle que mantiene al día el correo —`vasak-accounts-sync`— también está en
+la lista, con `account.email` y nada más. Corre con la cuenta de la persona y
+aparte del servicio de cuentas, así que a los ojos de esta lista es una
+aplicación como cualquier otra y le corresponde el mismo trato: que viva en el
+mismo repositorio que el servicio no le da nada.
+
 Las aplicaciones de correo, calendario, contactos y chats todavía no existen.
 Cada una entra en la lista el día que se escriba, con su capacidad y ninguna
 más.
