@@ -114,7 +114,7 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// Las aplicaciones de correo, calendario, contactos y chats todavía no
 /// existen. Cada una entra acá el día que se escriba, con su capacidad y
 /// ninguna más.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 3] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 4] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
@@ -144,6 +144,13 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 3] = [
     // le da nada — le pide los tokens por el mismo camino que cualquier otra
     // aplicación, y este límite lo alcanza igual.
     ("/usr/bin/vasak-accounts-sync", &["account.email"]),
+    // El calendario. Lee los eventos por CalDAV de las cuentas conectadas.
+    //
+    // No los contactos, aunque vivan en el mismo servidor y detrás de la misma
+    // contraseña: la agenda es de la aplicación de contactos. Un servidor
+    // Nextcloud entrega las dos cosas con la misma credencial, así que sin esta
+    // línea la separación sería una convención y no un límite.
+    ("/usr/bin/vasak-calendar", &["account.calendar"]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -642,6 +649,29 @@ mod tests_alcance {
             "credentials",
         ] {
             assert!(!may_request(sync, prohibido), "no tenía que poder pedir '{prohibido}'");
+        }
+    }
+
+    /// El calendario llega al calendario y a nada más.
+    ///
+    /// Los contactos son el caso que importa: viven en el mismo servidor y
+    /// detrás de la misma contraseña que los calendarios, así que sin esta línea
+    /// la separación entre las dos aplicaciones sería una convención y no un
+    /// límite.
+    #[test]
+    fn el_calendario_no_llega_a_los_contactos() {
+        let calendario = "/usr/bin/vasak-calendar";
+
+        assert!(may_request(calendario, "account.calendar"));
+        for prohibido in [
+            "account.contacts",
+            "account.email",
+            "account.drive",
+            "account.chat",
+            "account.tasks",
+            "credentials",
+        ] {
+            assert!(!may_request(calendario, prohibido), "no tenía que poder pedir '{prohibido}'");
         }
     }
 
