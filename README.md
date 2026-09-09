@@ -76,6 +76,17 @@ instala, y negar lo no enumerado dejaría al sistema sin poder correr nada de
 terceros. Y estar en la lista con un recurso tampoco lo concede: lo sigue
 decidiendo la persona.
 
+**Un alcance puede ser vacío**, y el de la pantalla de configuración lo es. Esa
+pantalla administra las cuentas —las agrega, las quita, muestra qué aplicaciones
+tienen acceso— y no las usa, así que no puede pedir ningún recurso: una
+configuración reemplazada no llega a ningún token y ni siquiera puede preguntar.
+
+Lo que el alcance vacío **no** limita, porque de otra forma asustaría: pedir un
+recurso es una cosa y administrar la política es otra. `ListPermissions` y
+`SetPermission` consultan el alcance del programa **administrado**, no el de
+quien administra, así que la configuración sigue pudiendo conceder y quitar
+permisos de otros programas. Lo único que no puede es concederse algo a sí misma.
+
 Las aplicaciones de correo, calendario, contactos y chats todavía no existen.
 Cada una entra en la lista el día que se escriba, con su capacidad y ninguna
 más.

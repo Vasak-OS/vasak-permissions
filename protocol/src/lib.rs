@@ -114,11 +114,27 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// Las aplicaciones de correo, calendario, contactos y chats todavía no
 /// existen. Cada una entra acá el día que se escriba, con su capacidad y
 /// ninguna más.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 1] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 2] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
     ("/usr/bin/vasak-file-manager", &["account.drive"]),
+    // Nada, y no es un descuido.
+    //
+    // La pantalla de configuración **administra** las cuentas —las agrega, las
+    // quita, muestra qué aplicaciones tienen acceso— y no las usa. Los comandos
+    // que leían el token de una cuenta estaban registrados sin que nada los
+    // llamara, y se quitaron junto con esta línea.
+    //
+    // Vacío la vuelve el caso más fuerte de la lista: una configuración
+    // reemplazada no llega a ningún token, y ni siquiera puede preguntar.
+    //
+    // Ojo con lo que **no** limita, porque de otra forma esto asustaría: pedir
+    // un recurso es una cosa y administrar la política es otra. `ListPermissions`
+    // y `SetPermission` no pasan por acá, así que la pantalla sigue pudiendo
+    // conceder y quitar permisos de **otros** programas, que es su trabajo. Lo
+    // único que no puede es concederse algo a sí misma.
+    ("/usr/bin/vasak-settings", &[]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -589,14 +605,56 @@ mod tests_alcance {
     fn un_programa_que_no_figura_puede_pedir_cualquier_cosa() {
         for ajeno in [
             "/usr/bin/thunderbird",
+            "/usr/bin/evolution",
             "/home/alguien/.local/bin/algo",
-            "/usr/bin/vasak-settings",
             "",
         ] {
             assert!(may_request(ajeno, "account.email"), "{ajeno}");
             assert!(may_request(ajeno, "camera"), "{ajeno}");
             assert_eq!(scope_of(ajeno), None, "{ajeno} no debería tener alcance");
         }
+    }
+
+    /// El caso más fuerte de la lista: alcance vacío.
+    ///
+    /// La pantalla de configuración administra las cuentas y no las usa, así que
+    /// no puede pedir **nada**. Una configuración reemplazada no llega a ningún
+    /// token y ni siquiera puede preguntar.
+    #[test]
+    fn configuracion_no_puede_pedir_nada() {
+        let configuracion = "/usr/bin/vasak-settings";
+
+        assert_eq!(scope_of(configuracion), Some(&[][..]));
+        for recurso in [
+            "account.email",
+            "account.drive",
+            "account.calendar",
+            "camera",
+            "microphone",
+            "credentials",
+        ] {
+            assert!(
+                !may_request(configuracion, recurso),
+                "configuración no tenía que poder pedir '{recurso}'"
+            );
+        }
+    }
+
+    /// Y lo que el alcance vacío **no** limita, que es lo que hace que no rompa
+    /// la pantalla: pedir un recurso es una cosa y administrar la política es
+    /// otra. `ListPermissions` y `SetPermission` no consultan esta lista contra
+    /// quien llama, sino contra el programa que se está administrando.
+    ///
+    /// El test vive acá porque el riesgo es que alguien lea «alcance vacío» y
+    /// crea que la configuración quedó sin poder hacer su trabajo.
+    #[test]
+    fn el_alcance_vacio_no_le_impide_administrar_a_otros() {
+        // Administrar al gestor de archivos dentro de su alcance sigue siendo
+        // posible: lo que se consulta es el binario administrado, no el que
+        // administra.
+        assert!(may_request("/usr/bin/vasak-file-manager", "account.drive"));
+        // Y a un programa de terceros, cualquier cosa.
+        assert!(may_request("/usr/bin/thunderbird", "account.email"));
     }
 
     /// Estar en la lista con un recurso no lo concede: lo sigue decidiendo la
