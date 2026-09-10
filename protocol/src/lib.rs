@@ -114,7 +114,7 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// Las aplicaciones de correo, calendario, contactos y chats todavía no
 /// existen. Cada una entra acá el día que se escriba, con su capacidad y
 /// ninguna más.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 5] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
@@ -163,6 +163,15 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 5] = [
     // diálogo pidiéndole permiso para algo que la aplicación de verdad nunca
     // necesitó — y que si concede, entrega la contraseña de su casilla.
     ("/usr/bin/vasak-mail", &[]),
+    // La libreta de direcciones. El otro lado de la línea que separa los
+    // contactos de los calendarios.
+    //
+    // Con esta entrada la lista queda simétrica: `vasak-calendar` puede pedir
+    // los eventos y no la agenda, y `vasak-contacts` la agenda y no los
+    // eventos. Sin las dos, el límite lo tendría sólo una de ellas — y las dos
+    // llegan al mismo servidor con la misma contraseña, así que alcanzaba con
+    // reemplazar la que no estaba acotada.
+    ("/usr/bin/vasak-contacts", &["account.contacts"]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -684,6 +693,30 @@ mod tests_alcance {
             "credentials",
         ] {
             assert!(!may_request(calendario, prohibido), "no tenía que poder pedir '{prohibido}'");
+        }
+    }
+
+    /// El otro lado de la línea que separa los contactos de los calendarios.
+    ///
+    /// Con las dos entradas la lista queda simétrica: el calendario llega a los
+    /// eventos y no a la agenda, y la agenda a los contactos y no a los
+    /// eventos. Con una sola, alcanzaba con reemplazar la aplicación que no
+    /// estaba acotada — las dos llegan al mismo servidor con la misma
+    /// contraseña.
+    #[test]
+    fn los_contactos_no_llegan_al_calendario() {
+        let contactos = "/usr/bin/vasak-contacts";
+
+        assert!(may_request(contactos, "account.contacts"));
+        for prohibido in [
+            "account.calendar",
+            "account.email",
+            "account.drive",
+            "account.chat",
+            "account.tasks",
+            "credentials",
+        ] {
+            assert!(!may_request(contactos, prohibido), "no tenía que poder pedir '{prohibido}'");
         }
     }
 
