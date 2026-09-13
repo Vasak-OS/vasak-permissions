@@ -11,15 +11,15 @@
 //! neither, which is exactly why the online-accounts list it replaces was
 //! decorative — anyone could edit the file and grant themselves anything.
 
-mod local;
-mod procesos;
+mod agent;
 mod audit;
 mod auditnl;
 mod excepcion;
-mod agent;
 mod identity;
+mod local;
 mod policy;
 mod polkit;
+mod procesos;
 mod throttle;
 
 use std::sync::Arc;
@@ -79,10 +79,7 @@ fn check_resource(resource_id: &str) -> Result<(), FdoError> {
 }
 
 /// Pins the caller of the current message and resolves who it is.
-async fn caller_of(
-    connection: &Connection,
-    header: &Header<'_>,
-) -> Result<PinnedCaller, FdoError> {
+async fn caller_of(connection: &Connection, header: &Header<'_>) -> Result<PinnedCaller, FdoError> {
     let sender = header
         .sender()
         .ok_or_else(|| FdoError::Failed("el mensaje no tiene remitente".into()))?;
@@ -105,7 +102,6 @@ async fn caller_of(
     // executable, the process could exit and its number be handed to another.
     PinnedCaller::capture(pid, uid).map_err(FdoError::Failed)
 }
-
 
 impl PermissionService {
     /// Looks up the stored answer, asks the user when there is none, and
@@ -191,7 +187,12 @@ impl PermissionService {
                 let mut policy = self.store.load(subject.uid).map_err(FdoError::Failed)?;
                 // `true`: llegó acá porque el programa preguntó, así que va a
                 // respetar lo que se conteste aunque ningún perfil lo limite.
-                policy.record(&application, resource_id, Decision::from_answer(answer), true);
+                policy.record(
+                    &application,
+                    resource_id,
+                    Decision::from_answer(answer),
+                    true,
+                );
                 self.store
                     .save(subject.uid, &policy)
                     .map_err(FdoError::Failed)?;
@@ -275,7 +276,8 @@ impl PermissionService {
             ));
         }
 
-        self.decide(connection, &subject, &resource_id, detail).await
+        self.decide(connection, &subject, &resource_id, detail)
+            .await
     }
 
     /// Everything decided for the calling user, as JSON, for the settings
@@ -337,7 +339,12 @@ impl PermissionService {
         let antes = excepcion::permitidos_de(&policy, &binary_path);
         // `false`: esto es la pantalla fijando una decisión, no el programa
         // preguntando. Si ya era de los que preguntan, `record` lo conserva.
-        policy.record(&application, &resource_id, Decision::from_answer(allowed), false);
+        policy.record(
+            &application,
+            &resource_id,
+            Decision::from_answer(allowed),
+            false,
+        );
         let ahora = excepcion::permitidos_de(&policy, &binary_path);
 
         // Primero el perfil, después el archivo de decisiones.
@@ -387,7 +394,9 @@ impl PermissionService {
         let mut policy = self.store.load(caller.uid).map_err(FdoError::Failed)?;
         policy.forget(&binary_path);
 
-        self.store.save(caller.uid, &policy).map_err(FdoError::Failed)
+        self.store
+            .save(caller.uid, &policy)
+            .map_err(FdoError::Failed)
     }
 
     /// Lo que algún perfil bloqueó y todavía nadie decidió.
@@ -490,7 +499,6 @@ impl PermissionService {
         let _guard = self.write_lock.lock().await;
         crate::local::revocar_y_recargar(&profile, &rule, &crate::local::raiz())
             .map_err(FdoError::Failed)
-
     }
 
     /// Lo que ya se le permitió a un perfil, para poder retirarlo.
@@ -524,7 +532,10 @@ impl PermissionService {
             .register(caller.uid, &caller.binary_path(), sender, object_path)
             .map_err(FdoError::AccessDenied)?;
 
-        tracing::info!("Agente de permisos registrado para el usuario {}", caller.uid);
+        tracing::info!(
+            "Agente de permisos registrado para el usuario {}",
+            caller.uid
+        );
         Ok(())
     }
 }
@@ -583,8 +594,7 @@ fn service_bus() -> zbus::Result<zbus::connection::Builder<'static>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -614,7 +624,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    tokio::spawn(watch_for_departed_agents(connection.clone(), agents.clone()));
+    tokio::spawn(watch_for_departed_agents(
+        connection.clone(),
+        agents.clone(),
+    ));
     // Avisa de lo que los perfiles de AppArmor bloquean. Sin esto, el bloqueo
     // es correcto pero invisible: se ve una cámara que no anda y nadie sabe por
     // qué.

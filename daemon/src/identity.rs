@@ -150,7 +150,10 @@ fn provenance_of(executable: &Path) -> Provenance {
         return Provenance::Unverified;
     }
 
-    if SYSTEM_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+    if SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
         Provenance::SystemInstalled
     } else {
         Provenance::Unverified
@@ -270,7 +273,6 @@ mod tests {
         assert!(!delegate_may_speak_for(1000, 0), "y root menos todavía");
     }
 
-
     /// The pairing of PID and start time is what makes a delegated request
     /// safe. A delegate hands over a number it saw a moment ago; if only the
     /// number were checked, a process that exited and had its number reused
@@ -297,7 +299,10 @@ mod tests {
     #[test]
     fn programs_the_user_can_replace_are_marked_unverified() {
         // Real files, so the existence check is not what decides the outcome.
-        assert_eq!(provenance_of(Path::new("/usr/bin/env")), Provenance::SystemInstalled);
+        assert_eq!(
+            provenance_of(Path::new("/usr/bin/env")),
+            Provenance::SystemInstalled
+        );
         assert_eq!(
             provenance_of(Path::new("/home/someone/.local/bin/tool")),
             Provenance::Unverified
@@ -319,7 +324,11 @@ mod tests {
     fn a_desktop_entry_gives_the_program_its_real_name() {
         let entry = "[Desktop Entry]\nName=Reproductor\nExec=/usr/bin/vasak-resonance %U\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
@@ -328,7 +337,11 @@ mod tests {
     fn an_entry_for_another_program_is_not_used() {
         let entry = "[Desktop Entry]\nName=Otra cosa\nExec=/usr/bin/something-else\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             None
         );
     }
@@ -343,7 +356,11 @@ mod tests {
                      [Desktop Action New]\n\
                      Name=Ventana nueva\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
@@ -353,7 +370,11 @@ mod tests {
     fn an_exec_without_a_path_still_matches() {
         let entry = "[Desktop Entry]\nName=Reproductor\nExec=vasak-resonance\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
