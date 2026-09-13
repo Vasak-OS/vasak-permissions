@@ -265,10 +265,11 @@ impl PermissionService {
         let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
             .map_err(FdoError::InvalidArgs)?;
 
-        // A delegate must not be able to ask about a process belonging to
-        // somebody else, or one user's answer would be recorded in another
-        // user's policy.
-        if subject.uid != delegate.uid {
+        // Un delegado sin privilegios queda confinado a su propio usuario. El
+        // de sistema —root, que es como corre el de cuentas porque los tokens
+        // viven en archivos de root— habla por cualquiera: es el único que
+        // puede, y para eso existe. Ver `delegate_may_speak_for`.
+        if !crate::identity::delegate_may_speak_for(delegate.uid, subject.uid) {
             return Err(FdoError::AccessDenied(
                 "el proceso indicado pertenece a otro usuario".into(),
             ));
