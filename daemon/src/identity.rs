@@ -17,6 +17,47 @@ use vasak_permissions_protocol::{Application, Provenance};
 /// property that makes remembering an answer safe.
 const SYSTEM_PREFIXES: [&str; 3] = ["/usr/", "/opt/", "/bin/"];
 
+/// Si un delegado puede preguntar por un proceso de este usuario.
+///
+/// ── El bug que esto arregla ─────────────────────────────────────────────────
+///
+/// La regla era `subject.uid == delegate.uid` a secas, y con eso **ninguna
+/// aplicación pudo usar jamás una cuenta en línea**: el calendario, el correo,
+/// los contactos y el gestor de archivos recibían
+///
+///     org.freedesktop.DBus.Error.AccessDenied:
+///     el proceso indicado pertenece a otro usuario
+///
+/// sin que se mostrara un solo diálogo, porque la negativa llega antes de
+/// preguntarle a nadie.
+///
+/// El único delegado de la lista es `/usr/bin/vasak-accounts`, y corre como
+/// root a propósito: los tokens viven en archivos de root, que es justamente lo
+/// que impide que un programa del usuario los lea por su cuenta. O sea que el
+/// delegado siempre tiene uid 0 y el sujeto siempre es un proceso del usuario:
+/// la igualdad no podía darse nunca.
+///
+/// No se vio antes porque en desarrollo los dos corren con el mismo usuario
+/// —ahí la comparación es verdadera— y porque esta regla no tenía ninguna
+/// prueba. Se rompe sólo instalado, que es donde nadie la estaba mirando.
+///
+/// ── Qué se conserva ─────────────────────────────────────────────────────────
+///
+/// Lo que la regla quería evitar sigue evitado, y por dos caminos. El de fondo
+/// es que `decide` carga y guarda la política con el uid del **sujeto**, así
+/// que la respuesta de una persona nunca se escribe en la carpeta de otra,
+/// venga de donde venga la pregunta.
+///
+/// Y queda el cerco para un delegado sin privilegios: alguien puede correr una
+/// copia de `/usr/bin/vasak-accounts` como su propio usuario —pasa
+/// `is_delegate`, que mira la ruta del binario y no quién lo ejecuta— y desde
+/// ahí preguntar por procesos ajenos. Eso filtraría la decisión de otra persona
+/// en el valor de retorno, y le abriría diálogos en su sesión. Un delegado no
+/// privilegiado sigue confinado a su propio usuario.
+pub fn delegate_may_speak_for(delegate_uid: u32, subject_uid: u32) -> bool {
+    delegate_uid == 0 || delegate_uid == subject_uid
+}
+
 /// A caller whose PID has been pinned open.
 ///
 /// While the `pidfd` is held the kernel cannot reuse that PID for another
@@ -109,7 +150,10 @@ fn provenance_of(executable: &Path) -> Provenance {
         return Provenance::Unverified;
     }
 
-    if SYSTEM_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+    if SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
         Provenance::SystemInstalled
     } else {
         Provenance::Unverified
@@ -201,6 +245,33 @@ pub fn describe_path(binary_path: &str) -> Application {
 mod tests {
     use super::*;
 
+    /// El delegado de sistema tiene que poder hablar por el usuario.
+    ///
+    /// Es el caso real y el que estaba roto: `/usr/bin/vasak-accounts` corre
+    /// como root —los tokens viven en archivos de root— y pregunta por el
+    /// calendario, el correo o los contactos, que corren como la persona. Con
+    /// la regla vieja, `uid 0 != uid 1000` y **ninguna aplicación pudo usar
+    /// nunca una cuenta en línea**: `AccessDenied` antes de mostrar un solo
+    /// diálogo.
+    #[test]
+    fn el_delegado_de_sistema_habla_por_cualquier_usuario() {
+        assert!(delegate_may_speak_for(0, 1000));
+        assert!(delegate_may_speak_for(0, 1001));
+        assert!(delegate_may_speak_for(0, 0));
+    }
+
+    /// Y el que no es de sistema sigue confinado a su propio usuario.
+    ///
+    /// `is_delegate` mira la ruta del binario, no quién lo ejecuta, así que
+    /// alguien puede correr una copia como su propio usuario. Desde ahí,
+    /// preguntar por un proceso ajeno filtraría la decisión de otra persona en
+    /// el valor de retorno y le abriría diálogos en su sesión.
+    #[test]
+    fn un_delegado_sin_privilegios_no_puede_preguntar_por_otro_usuario() {
+        assert!(delegate_may_speak_for(1000, 1000), "su propio usuario, sí");
+        assert!(!delegate_may_speak_for(1000, 1001), "el de al lado, no");
+        assert!(!delegate_may_speak_for(1000, 0), "y root menos todavía");
+    }
 
     /// The pairing of PID and start time is what makes a delegated request
     /// safe. A delegate hands over a number it saw a moment ago; if only the
@@ -228,7 +299,10 @@ mod tests {
     #[test]
     fn programs_the_user_can_replace_are_marked_unverified() {
         // Real files, so the existence check is not what decides the outcome.
-        assert_eq!(provenance_of(Path::new("/usr/bin/env")), Provenance::SystemInstalled);
+        assert_eq!(
+            provenance_of(Path::new("/usr/bin/env")),
+            Provenance::SystemInstalled
+        );
         assert_eq!(
             provenance_of(Path::new("/home/someone/.local/bin/tool")),
             Provenance::Unverified
@@ -250,7 +324,11 @@ mod tests {
     fn a_desktop_entry_gives_the_program_its_real_name() {
         let entry = "[Desktop Entry]\nName=Reproductor\nExec=/usr/bin/vasak-resonance %U\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
@@ -259,7 +337,11 @@ mod tests {
     fn an_entry_for_another_program_is_not_used() {
         let entry = "[Desktop Entry]\nName=Otra cosa\nExec=/usr/bin/something-else\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             None
         );
     }
@@ -274,7 +356,11 @@ mod tests {
                      [Desktop Action New]\n\
                      Name=Ventana nueva\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
@@ -284,7 +370,11 @@ mod tests {
     fn an_exec_without_a_path_still_matches() {
         let entry = "[Desktop Entry]\nName=Reproductor\nExec=vasak-resonance\n";
         assert_eq!(
-            matching_entry_name(entry, Path::new("/usr/bin/vasak-resonance"), "vasak-resonance"),
+            matching_entry_name(
+                entry,
+                Path::new("/usr/bin/vasak-resonance"),
+                "vasak-resonance"
+            ),
             Some("Reproductor".into())
         );
     }
