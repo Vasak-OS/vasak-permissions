@@ -444,4 +444,64 @@ mod tests {
         let store = PolicyStore::at(dir.path().to_path_buf());
         assert!(store.load(4242).expect("load").entries().is_empty());
     }
+
+    /// Lo decidido por el portal se guarda, se lee y llega a la pantalla.
+    ///
+    /// Es el recorrido entero del cambio, del lado del almacén: la clave del
+    /// portal no es una ruta, y el archivo, el filtro de alcance y la lista que
+    /// lee Configuración tienen que tratarla igual que a cualquier otra. Si
+    /// `entries()` la dejara afuera, la decisión se guardaría y no habría forma
+    /// de retirarla — que es media mitad del problema que esto viene a
+    /// arreglar.
+    #[test]
+    fn lo_decidido_por_el_portal_llega_a_la_pantalla() {
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+        let app = Application {
+            binary_path: key.clone(),
+            display_name: "com.google.Chrome".into(),
+            provenance: Provenance::Unverified,
+        };
+
+        let mut politica = UserPolicy::default();
+        politica.record(&app, "screen-capture", Decision::Allowed, true);
+        politica.record(&app, "camera", Decision::Denied, true);
+
+        assert!(politica.decision(&key, "screen-capture").is_allowed());
+        assert!(!politica.decision(&key, "camera").is_allowed());
+
+        let entrada = politica
+            .entries()
+            .into_iter()
+            .find(|e| e.application.binary_path == key)
+            .expect("la identidad del portal tiene que figurar");
+
+        assert_eq!(entrada.decisions.get("screen-capture"), Some(&Decision::Allowed));
+        assert_eq!(entrada.decisions.get("camera"), Some(&Decision::Denied));
+        // `asks` en verdadero: el portal pregunta antes de entregar el recurso y
+        // respeta la respuesta. Sin esto la pantalla mostraría el interruptor
+        // apagado, por no encontrar un perfil que lo sostenga.
+        assert!(entrada.asks);
+    }
+
+    /// Y se puede olvidar, que es lo que deja volver a preguntar.
+    #[test]
+    fn una_identidad_del_portal_se_puede_olvidar() {
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+        let mut politica = UserPolicy::default();
+        politica.record(
+            &Application {
+                binary_path: key.clone(),
+                display_name: "com.google.Chrome".into(),
+                provenance: Provenance::Unverified,
+            },
+            "screen-capture",
+            Decision::Allowed,
+            true,
+        );
+
+        assert!(politica.forget(&key));
+        assert_eq!(politica.decision(&key, "screen-capture"), Decision::Unknown);
+    }
 }

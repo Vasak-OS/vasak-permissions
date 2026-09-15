@@ -511,4 +511,26 @@ mod tests {
             "el nombre del perfil quedó con caracteres que AppArmor no acepta: {nombre}"
         );
     }
+
+    /// Una identidad del portal no puede tener perfil, y eso es correcto.
+    ///
+    /// Esta prueba existe para sostener la rama que `set_permission` tiene del
+    /// otro lado. `portal:com.google.Chrome` no es una ruta absoluta, así que
+    /// acá se rechaza —bien rechazado: no hay archivo al que enganchar un
+    /// perfil—. Pero si el camino de la pantalla no la saltara antes de llegar,
+    /// ese rechazo volvería como «no se pudo guardar la decisión» y el
+    /// interruptor de Configuración fallaría siempre.
+    ///
+    /// O sea: el día que alguien saque esa rama, esto sigue en verde y la
+    /// pantalla se rompe. Por eso el comentario está en los dos lados.
+    #[test]
+    fn una_identidad_del_portal_no_tiene_perfil() {
+        let key = vasak_permissions_protocol::portal_key("com.google.Chrome")
+            .expect("identidad válida");
+
+        assert_eq!(
+            perfil_para(&key, &[Resource::Camera]),
+            Err(Motivo::NoEsAbsoluta)
+        );
+    }
 }

@@ -232,7 +232,30 @@ fn matching_entry_name(contents: &str, executable: &Path, file_name: &str) -> Op
 
 /// Describes a program by path alone, for entries the settings screen manages
 /// on behalf of a program that is not currently running.
+///
+/// Atiende también las identidades del portal, que no son rutas. Hacerlo acá y
+/// no en cada llamador es lo que impide que una de ellas termine tratada como
+/// un archivo: `display_name_for` le sacaría el «nombre de archivo» a
+/// `portal:com.google.Chrome` y `provenance_of` diría que no existe en el disco
+/// —que es cierto y no significa nada—, y la pantalla mostraría las dos cosas
+/// como si fueran un programa que no encontró.
 pub fn describe_path(binary_path: &str) -> Application {
+    if let Some(app_id) = vasak_permissions_protocol::portal_app_id(binary_path) {
+        return Application {
+            binary_path: binary_path.to_string(),
+            // El `app_id` tal cual. Resolverlo contra los `.desktop` para
+            // sacarle un nombre lindo es trabajo de la pantalla, que ya lo hace
+            // para los iconos y que puede equivocarse sin consecuencias; acá
+            // una resolución fallida dejaría la entrada sin nombre.
+            display_name: app_id.to_string(),
+            // No verificada, y es la parte importante de esta rama. Este nombre
+            // lo declaró la aplicación llamando al registro del portal y no lo
+            // comprobó nadie, así que decir cualquier otra cosa sería afirmar
+            // algo que no se sabe.
+            provenance: Provenance::Unverified,
+        };
+    }
+
     let path = PathBuf::from(binary_path);
     Application {
         binary_path: binary_path.to_string(),
@@ -385,5 +408,37 @@ mod tests {
             display_name_for(Path::new("/usr/bin/definitely-not-installed-xyz")),
             "definitely-not-installed-xyz"
         );
+    }
+
+    /// Una identidad del portal se describe como lo que es.
+    ///
+    /// Sin la rama que la atiende, `display_name_for` le sacaría el «nombre de
+    /// archivo» a `portal:com.google.Chrome` —o sea, la cadena entera— y
+    /// `provenance_of` diría «no verificada» por la razón equivocada: porque no
+    /// existe ese archivo en el disco. Da la misma respuesta por casualidad, y
+    /// una casualidad no es algo sobre lo que apoyar una pantalla de seguridad.
+    #[test]
+    fn una_identidad_del_portal_se_describe_como_tal() {
+        let key = vasak_permissions_protocol::portal_key("com.google.Chrome")
+            .expect("identidad válida");
+        let app = describe_path(&key);
+
+        assert_eq!(app.binary_path, "portal:com.google.Chrome");
+        assert_eq!(app.display_name, "com.google.Chrome");
+        assert_eq!(app.provenance, Provenance::Unverified);
+    }
+
+    /// Y nunca verificada, que es lo que esta rama tiene que sostener.
+    ///
+    /// El `app_id` lo declara la propia aplicación y no lo comprueba nadie.
+    /// Marcarlo como instalado por el sistema —aunque el nombre sea el de un
+    /// programa que sí lo está— afirmaría algo que no se sabe.
+    #[test]
+    fn ninguna_identidad_del_portal_queda_verificada() {
+        for app_id in ["com.google.Chrome", "ar.net.vasak.os.Settings", "cualquiera"] {
+            let key =
+                vasak_permissions_protocol::portal_key(app_id).expect("identidad válida");
+            assert_eq!(describe_path(&key).provenance, Provenance::Unverified, "{app_id}");
+        }
     }
 }

@@ -29,6 +29,19 @@ pub const AGENT_INTERFACE: &str = "ar.net.vasak.os.PermissionAgent";
 /// requires root, so no program running as you can occupy this path.
 pub const AGENT_BINARY: &str = "/usr/bin/vasak-permissions-agent";
 
+/// Los dos métodos que el agente llama por las decisiones del portal.
+///
+/// Acá y no sueltos en cada punta porque son un contrato entre dos procesos que
+/// se compilan por separado: el agente los llama por su nombre en una cadena, y
+/// del lado del servicio los genera zbus a partir del nombre de la función. Un
+/// renombre en cualquiera de los dos lados compila perfecto y deja al agente
+/// llamando a un método que no existe — o sea, preguntando siempre y sin
+/// guardar nada, que se ve exactamente igual que el comportamiento viejo.
+///
+/// Una prueba del demonio comprueba que la interfaz exporte estos nombres.
+pub const PORTAL_DECISION_METHOD: &str = "PortalDecision";
+pub const RECORD_PORTAL_DECISION_METHOD: &str = "RecordPortalDecision";
+
 /// polkit action guarding every change made from the settings interface.
 ///
 /// Without it, any program could call `SetPermission` and grant itself what it
@@ -212,6 +225,92 @@ pub fn scope_of(binary_path: &str) -> Option<&'static [&'static str]> {
     None
 }
 
+// ── Identidades del portal ──────────────────────────────────────────────────
+
+/// El prefijo de la clave con la que se guarda lo que se decidió para una
+/// aplicación que llegó por el portal de escritorio.
+///
+/// Las decisiones de este servicio se guardan contra la **ruta del ejecutable**,
+/// leída de `/proc` y por lo tanto imposible de falsificar. Por el portal esa
+/// identidad no llega: quien llama al backend es `xdg-desktop-portal`, no la
+/// aplicación, y lo único que pasa de ella es un `app_id`.
+///
+/// Son dos espacios de nombres distintos y el prefijo es lo que los mantiene
+/// separados. No pueden chocar —una ruta empieza con `/`— y quien lea el
+/// archivo de política ve de un vistazo cuáles de las entradas están sostenidas
+/// por una identidad verificada y cuáles no.
+pub const PORTAL_PREFIX: &str = "portal:";
+
+/// Lo más largo que se acepta como `app_id`.
+///
+/// No hay límite en la especificación. Existe porque esto termina siendo una
+/// clave en un archivo JSON y un renglón en una pantalla, y un identificador de
+/// un megabyte no es una aplicación: es alguien probando qué pasa.
+const MAX_APP_ID: usize = 255;
+
+/// La clave con la que se guarda lo decidido para una aplicación del portal, o
+/// `None` si ese `app_id` no sirve como identidad.
+///
+/// ── Lo que esta identidad vale, y lo que no ─────────────────────────────────
+///
+/// El `app_id` lo **declara la propia aplicación**: fuera de un sandbox llega
+/// porque el programa llamó a `Register` en `org.freedesktop.host.portal.Registry`
+/// de `xdg-desktop-portal`, y nadie comprueba que le corresponda. Un programa
+/// puede registrarse como `com.google.Chrome` y heredar lo que Chrome tenga
+/// concedido.
+///
+/// Se usa igual, y la razón es que la alternativa es peor. Sin guardar nada, el
+/// portal vuelve a preguntar cada vez —medido: cuatro diálogos idénticos en
+/// veinte segundos—, y eso no deja a nadie más seguro: enseña a conceder sin
+/// leer, que es la falla que ningún diálogo sobrevive.
+///
+/// Lo que sí se hace es no disimularlo. Estas entradas quedan como
+/// [`Provenance::Unverified`] y se pueden retirar desde Configuración, que es
+/// más de lo que hay hoy.
+///
+/// ── Qué se rechaza ──────────────────────────────────────────────────────────
+///
+/// Un `app_id` vacío —lo que llega de cualquier programa que no se registró— y
+/// cualquiera que lleve algo fuera de letras, dígitos, punto, guion y guion
+/// bajo. No es cosmética: sin eso, un `app_id` con una barra o con un `..` se
+/// vería como una ruta en el archivo de política y en la pantalla, que es
+/// exactamente la confusión que el prefijo existe para evitar.
+///
+/// Lo rechazado no se guarda y no se lee: se pregunta cada vez, que es lo que
+/// pasaba antes de todo esto.
+pub fn portal_key(app_id: &str) -> Option<String> {
+    if app_id.is_empty() || app_id.len() > MAX_APP_ID {
+        return None;
+    }
+
+    let aceptable = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    if !app_id.chars().all(aceptable) {
+        return None;
+    }
+
+    // Un identificador que empieza o termina en punto, o que lleva dos
+    // seguidos, se lee como una ruta relativa en cuanto alguien lo imprima.
+    if app_id.starts_with('.') || app_id.ends_with('.') || app_id.contains("..") {
+        return None;
+    }
+
+    Some(format!("{PORTAL_PREFIX}{app_id}"))
+}
+
+/// Si esta clave es una identidad del portal y no la ruta de un ejecutable.
+///
+/// Lo que cuelga de esta pregunta no es presentación: una identidad del portal
+/// no tiene archivo al que enganchar un perfil de AppArmor, así que el camino
+/// que escribe excepciones tiene que saltearla.
+pub fn is_portal_key(key: &str) -> bool {
+    key.starts_with(PORTAL_PREFIX)
+}
+
+/// El `app_id` de vuelta, para mostrarlo.
+pub fn portal_app_id(key: &str) -> Option<&str> {
+    key.strip_prefix(PORTAL_PREFIX)
+}
+
 // ── Resources ───────────────────────────────────────────────────────────────
 
 /// Something an application can ask to use.
@@ -313,6 +412,29 @@ impl Resource {
         )
     }
 
+    /// Lo mismo, pero para la identidad contra la que se va a guardar.
+    ///
+    /// Hacía falta partirlo porque la respuesta dejó de ser la misma para las
+    /// dos clases de identidad que este servicio maneja, y dar una sola
+    /// habilitaría interruptores muertos en la mitad de los casos.
+    ///
+    /// Contra la **ruta de un ejecutable** vale lo de siempre: lo que cambia
+    /// algo es lo que un perfil de AppArmor niega, más las cuentas.
+    ///
+    /// Contra una **identidad del portal** son otros dos, y no se superponen
+    /// del todo. La cámara y la captura de pantalla las pregunta el portal, y
+    /// desde que el backend consulta lo guardado antes de abrir el diálogo,
+    /// decidirlas cambia lo que pasa la próxima vez. El micrófono y las
+    /// credenciales no: por el portal no llega ninguna de las dos, así que
+    /// guardar una decisión sobre ellas dejaría un interruptor que no mueve
+    /// nada. Las cuentas tampoco — ésas no pasan por el portal en absoluto.
+    pub fn decision_has_effect_for(&self, key: &str) -> bool {
+        if is_portal_key(key) {
+            return matches!(self, Resource::Camera | Resource::ScreenCapture);
+        }
+        self.decision_has_effect()
+    }
+
     /// Stable text form used on the bus and in the stored policy.
     ///
     /// Spelled out by hand rather than derived, because these strings end up in
@@ -395,6 +517,29 @@ impl Decision {
 
     pub fn is_allowed(self) -> bool {
         matches!(self, Decision::Allowed)
+    }
+
+    /// La forma en texto que viaja por el bus.
+    ///
+    /// Escrita a mano, como la de los recursos y por lo mismo: estas tres
+    /// cadenas son un contrato entre el servicio y el agente, y derivarlas de
+    /// los nombres de las variantes dejaría que un cambio de nombre las moviera
+    /// sin que nada se queje.
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Decision::Allowed => "allowed",
+            Decision::Denied => "denied",
+            Decision::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "allowed" => Some(Decision::Allowed),
+            "denied" => Some(Decision::Denied),
+            "unknown" => Some(Decision::Unknown),
+            _ => None,
+        }
     }
 }
 
@@ -847,5 +992,150 @@ mod tests_alcance {
         for (binario, _) in SCOPED_BINARIES {
             assert!(vistos.insert(binario), "{binario} está dos veces");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_portal {
+    use super::*;
+
+    /// El caso real, medido en el diario del agente.
+    #[test]
+    fn un_app_id_de_verdad_sirve_como_identidad() {
+        assert_eq!(
+            portal_key("com.google.Chrome").as_deref(),
+            Some("portal:com.google.Chrome")
+        );
+        assert_eq!(portal_key("org.gnome.Calculator").as_deref(), Some("portal:org.gnome.Calculator"));
+    }
+
+    /// Vacío es lo que llega de todo programa que no se registró, y es la mitad
+    /// de los casos. No es un error: es que no hay identidad, y sin identidad no
+    /// se guarda nada.
+    #[test]
+    fn sin_app_id_no_hay_identidad() {
+        assert_eq!(portal_key(""), None);
+    }
+
+    /// Lo que no se acepta, y el motivo de cada uno.
+    ///
+    /// Todos terminan en lo mismo: una clave que, impresa en el archivo de
+    /// política o en la pantalla, se leería como otra cosa. El prefijo separa
+    /// los dos espacios de nombres y esto es lo que impide volver a juntarlos
+    /// por la puerta de atrás.
+    #[test]
+    fn lo_que_se_leeria_como_una_ruta_se_rechaza() {
+        // Una barra lo haría parecer una ruta adentro del espacio del portal.
+        assert_eq!(portal_key("com.google/Chrome"), None);
+        assert_eq!(portal_key("/usr/bin/vasak-settings"), None);
+        // `..` es lo que convierte un nombre en un recorrido.
+        assert_eq!(portal_key("com..google"), None);
+        assert_eq!(portal_key(".."), None);
+        assert_eq!(portal_key("."), None);
+        assert_eq!(portal_key(".oculto"), None);
+        assert_eq!(portal_key("termina.en.punto."), None);
+        // Un salto de línea partiría en dos cualquier registro que la imprima.
+        assert_eq!(portal_key("com.google\nChrome"), None);
+        assert_eq!(portal_key("con espacio"), None);
+        // Y lo que se ve igual sin serlo: una `а` cirílica no es una `a`.
+        assert_eq!(portal_key("com.google.Chrome\u{0430}"), None);
+    }
+
+    /// Nada desmedido, aunque sea legal carácter por carácter.
+    #[test]
+    fn un_app_id_desmedido_se_rechaza() {
+        let largo = "a".repeat(MAX_APP_ID + 1);
+        assert_eq!(portal_key(&largo), None);
+        // Justo en el límite sí entra: el corte tiene que estar donde dice.
+        assert!(portal_key(&"a".repeat(MAX_APP_ID)).is_some());
+    }
+
+    /// Los dos espacios de nombres no se pueden tocar.
+    ///
+    /// Es la propiedad de la que cuelga todo lo demás: si una identidad del
+    /// portal pudiera escribirse igual que la ruta de un ejecutable, una
+    /// aplicación que se registre con el nombre adecuado heredaría lo que se
+    /// decidió para un binario del sistema.
+    #[test]
+    fn una_identidad_del_portal_nunca_es_una_ruta() {
+        for app_id in ["com.google.Chrome", "usr.bin.vasak-settings", "a"] {
+            let key = portal_key(app_id).expect("identidad válida");
+            assert!(!key.starts_with('/'), "{key}");
+            assert!(is_portal_key(&key), "{key}");
+            assert_eq!(portal_app_id(&key), Some(app_id));
+        }
+    }
+
+    /// Y al revés: una ruta no se confunde con una identidad del portal.
+    #[test]
+    fn una_ruta_no_es_una_identidad_del_portal() {
+        assert!(!is_portal_key("/usr/bin/vasak-settings"));
+        assert_eq!(portal_app_id("/usr/bin/vasak-settings"), None);
+    }
+
+    /// Por el portal llegan dos recursos, y sólo esos dos se guardan.
+    ///
+    /// Anotar el micrófono o las credenciales contra una identidad del portal
+    /// dejaría un interruptor en Configuración que no mueve nada: por ese camino
+    /// no llega ninguno de los dos.
+    #[test]
+    fn por_el_portal_solo_cuentan_la_camara_y_la_pantalla() {
+        let key = portal_key("com.google.Chrome").expect("identidad válida");
+
+        assert!(Resource::Camera.decision_has_effect_for(&key));
+        assert!(Resource::ScreenCapture.decision_has_effect_for(&key));
+
+        assert!(!Resource::Microphone.decision_has_effect_for(&key));
+        assert!(!Resource::Credentials.decision_has_effect_for(&key));
+        assert!(!Resource::Location.decision_has_effect_for(&key));
+        assert!(!Resource::Account(AccountResource::Email).decision_has_effect_for(&key));
+    }
+
+    /// Contra la ruta de un ejecutable no cambió nada.
+    ///
+    /// En particular la captura de pantalla sigue sin contar por ahí: nadie la
+    /// consulta contra un binario, así que guardarla seguiría siendo un
+    /// interruptor muerto. Que ahora cuente por el portal no la habilita acá.
+    #[test]
+    fn contra_un_binario_sigue_valiendo_lo_de_siempre() {
+        let ruta = "/usr/bin/vasak-connect";
+
+        assert!(Resource::Camera.decision_has_effect_for(ruta));
+        assert!(Resource::Microphone.decision_has_effect_for(ruta));
+        assert!(Resource::Credentials.decision_has_effect_for(ruta));
+        assert!(Resource::Account(AccountResource::Email).decision_has_effect_for(ruta));
+
+        assert!(!Resource::ScreenCapture.decision_has_effect_for(ruta));
+        assert!(!Resource::Location.decision_has_effect_for(ruta));
+    }
+
+    /// Las tres decisiones viajan por el bus como texto y vuelven iguales.
+    ///
+    /// Se comprueba el texto exacto y no sólo la ida y vuelta: estas cadenas son
+    /// el contrato con el agente, y cambiarlas haría que un agente viejo lea
+    /// «sin decidir» donde el servicio dijo «denegado» — o sea, que un rechazo
+    /// se vuelva a preguntar.
+    #[test]
+    fn las_decisiones_viajan_como_texto() {
+        assert_eq!(Decision::Allowed.as_id(), "allowed");
+        assert_eq!(Decision::Denied.as_id(), "denied");
+        assert_eq!(Decision::Unknown.as_id(), "unknown");
+
+        for decision in [Decision::Allowed, Decision::Denied, Decision::Unknown] {
+            assert_eq!(Decision::from_id(decision.as_id()), Some(decision));
+        }
+        assert_eq!(Decision::from_id("quizá"), None);
+    }
+
+    /// Una identidad del portal no tiene alcance declarado, así que puede pedir.
+    ///
+    /// `SCOPED_BINARIES` acota aplicaciones propias por su ruta instalada, y una
+    /// identidad del portal no es ninguna de ésas. Si esto diera falso, el
+    /// servicio negaría sin preguntar todo lo que llega por el portal.
+    #[test]
+    fn una_identidad_del_portal_puede_pedir() {
+        let key = portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(may_request(&key, "camera"));
+        assert!(may_request(&key, "screen-capture"));
     }
 }

@@ -96,7 +96,7 @@ impl AgentRegistry {
 /// the user's home called `vasak-permissions-agent` register itself and
 /// approve its own requests — which is the one thing this must prevent.
 #[cfg(not(debug_assertions))]
-fn is_the_agent(binary_path: &str) -> bool {
+pub(crate) fn is_the_agent(binary_path: &str) -> bool {
     binary_path == AGENT_BINARY
 }
 
@@ -104,7 +104,7 @@ fn is_the_agent(binary_path: &str) -> bool {
 /// dialog can be exercised from a working copy. Compiled out of release
 /// entirely rather than guarded at runtime.
 #[cfg(debug_assertions)]
-fn is_the_agent(binary_path: &str) -> bool {
+pub(crate) fn is_the_agent(binary_path: &str) -> bool {
     if binary_path == AGENT_BINARY {
         return true;
     }

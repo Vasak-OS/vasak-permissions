@@ -39,7 +39,14 @@ impl Agent {
             zbus::fdo::Error::InvalidArgs(format!("consulta de permiso inválida: {error}"))
         })?;
 
-        Ok(crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await)
+        // Un booleano, como siempre: por este camino el servicio guarda la
+        // decisión él mismo y no distingue «dijo que no» de «no se pudo
+        // preguntar». Las dos se contestan que no, que es lo seguro.
+        Ok(
+            crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request))
+                .await
+                .permitio(),
+        )
     }
 
     /// Avisa que AppArmor le negó un recurso a una aplicación.

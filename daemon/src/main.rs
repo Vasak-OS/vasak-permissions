@@ -63,14 +63,19 @@ struct PermissionService {
 /// is worse: the person would be asked a question, the answer would be stored,
 /// and it would change nothing — while looking exactly like a decision that
 /// held.
-fn check_resource(resource_id: &str) -> Result<(), FdoError> {
+///
+/// `key` es la identidad contra la que se iba a guardar, y hace falta porque la
+/// respuesta no es la misma para las dos clases que hay. La captura de pantalla
+/// no cambia nada anotada contra la ruta de un ejecutable —nadie la consulta
+/// por ahí— y sí contra una identidad del portal, que es de donde llega.
+fn check_resource(resource_id: &str, key: &str) -> Result<(), FdoError> {
     match Resource::from_id(resource_id) {
-        Some(resource) if resource.decision_has_effect() => Ok(()),
+        Some(resource) if resource.decision_has_effect_for(key) => Ok(()),
         Some(_) => Err(FdoError::NotSupported(format!(
-            "'{resource_id}' todavía no se puede hacer cumplir en VasakOS: \
-             lo entrega PipeWire o el portal de escritorio, que no consultan \
-             este servicio, y no hay perfil que lo niegue. No se guarda ninguna \
-             decisión al respecto."
+            "'{resource_id}' todavía no se puede hacer cumplir en VasakOS para \
+             '{key}': lo entrega PipeWire o el portal de escritorio, que por ese \
+             camino no consultan este servicio, y no hay perfil que lo niegue. \
+             No se guarda ninguna decisión al respecto."
         ))),
         None => Err(FdoError::InvalidArgs(format!(
             "recurso desconocido: '{resource_id}'"
@@ -104,6 +109,28 @@ async fn caller_of(connection: &Connection, header: &Header<'_>) -> Result<Pinne
 }
 
 impl PermissionService {
+    /// Identifica al llamante y exige que sea el agente instalado.
+    ///
+    /// La comprobación es contra una ruta absoluta y nada más, igual que la del
+    /// registro del agente: emparejar por nombre de archivo dejaría que un
+    /// programa llamado `vasak-permissions-agent` en la carpeta de la persona
+    /// se anotara permisos a nombre de cualquier aplicación.
+    async fn solo_el_agente(
+        &self,
+        connection: &Connection,
+        header: &Header<'_>,
+    ) -> Result<PinnedCaller, FdoError> {
+        let caller = caller_of(connection, header).await?;
+        if !crate::agent::is_the_agent(&caller.binary_path()) {
+            return Err(FdoError::AccessDenied(format!(
+                "sólo el agente de permisos puede tocar las decisiones del \
+                 portal; se rechazó {}",
+                caller.binary_path()
+            )));
+        }
+        Ok(caller)
+    }
+
     /// Looks up the stored answer, asks the user when there is none, and
     /// remembers what they said.
     async fn decide(
@@ -228,9 +255,11 @@ impl PermissionService {
         resource_id: String,
         detail: String,
     ) -> zbus::fdo::Result<bool> {
-        check_resource(&resource_id)?;
-
+        // Detrás de identificar al llamante, y no antes: si el recurso se puede
+        // hacer cumplir depende de contra qué identidad se guardaría.
         let caller = caller_of(connection, &header).await?;
+        check_resource(&resource_id, &caller.binary_path())?;
+
         self.decide(connection, &caller, &resource_id, detail).await
     }
 
@@ -253,8 +282,6 @@ impl PermissionService {
         resource_id: String,
         detail: String,
     ) -> zbus::fdo::Result<bool> {
-        check_resource(&resource_id)?;
-
         let delegate = caller_of(connection, &header).await?;
         if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
             return Err(FdoError::AccessDenied(format!(
@@ -265,6 +292,10 @@ impl PermissionService {
 
         let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
             .map_err(FdoError::InvalidArgs)?;
+
+        // Contra el sujeto, que es contra quien se guarda: el delegado sólo
+        // transporta la pregunta.
+        check_resource(&resource_id, &subject.binary_path())?;
 
         // Un delegado sin privilegios queda confinado a su propio usuario. El
         // de sistema —root, que es como corre el de cuentas porque los tokens
@@ -307,7 +338,7 @@ impl PermissionService {
         resource_id: String,
         allowed: bool,
     ) -> zbus::fdo::Result<()> {
-        check_resource(&resource_id)?;
+        check_resource(&resource_id, &binary_path)?;
 
         // Conceder algo fuera del alcance de un programa se rechaza acá también,
         // y no sólo en `decide`.
@@ -334,6 +365,30 @@ impl PermissionService {
         // Describe the target program from the path being managed, not from
         // the caller: the settings screen is editing somebody else's entry.
         let application = identity::describe_path(&binary_path);
+
+        // Una identidad del portal no es un archivo, así que no hay perfil que
+        // tocar: se guarda y se termina.
+        //
+        // No es un atajo. `permitidos_de` diría que la cámara está permitida y
+        // `aplicar` intentaría escribir un perfil enganchado a
+        // `portal:com.google.Chrome`, que no es una ruta absoluta —lo rechaza
+        // `excepcion`, y con razón—, y el error volvería como si no se hubiera
+        // podido guardar la decisión. O sea que sin esta rama el interruptor de
+        // la pantalla fallaría siempre, que es justo lo que este cambio existe
+        // para arreglar.
+        if vasak_permissions_protocol::is_portal_key(&binary_path) {
+            policy.record(
+                &application,
+                &resource_id,
+                Decision::from_answer(allowed),
+                true,
+            );
+            return self
+                .store
+                .save(caller.uid, &policy)
+                .map_err(FdoError::Failed);
+        }
+
         // Lo que estaba concedido antes, para poder volver atrás si el guardado
         // falla después de haber tocado el perfil.
         let antes = excepcion::permitidos_de(&policy, &binary_path);
@@ -397,6 +452,106 @@ impl PermissionService {
         self.store
             .save(caller.uid, &policy)
             .map_err(FdoError::Failed)
+    }
+
+    /// Lo que se decidió para una aplicación que llegó por el portal.
+    ///
+    /// La contesta el backend del portal **antes** de abrir ningún diálogo. Sin
+    /// esto la respuesta se preguntaba y se descartaba: Chrome llegó a pedir
+    /// compartir la pantalla cuatro veces en veinte segundos, y no había nada
+    /// que retirar después.
+    ///
+    /// Devuelve `allowed`, `denied` o `unknown`, que es lo que hay que
+    /// distinguir: sólo el tercero abre el diálogo. Un booleano obligaría a
+    /// convertir «todavía no se decidió» en un «no», y entonces lo que una vez
+    /// se rechazó nunca se volvería a preguntar y lo que nunca se preguntó
+    /// quedaría rechazado para siempre.
+    ///
+    /// **Sólo el agente.** Este método lee la política de quien llama, así que
+    /// contestarle a cualquiera diría qué tiene permitido una persona a
+    /// cualquier programa que sepa hablar D-Bus.
+    async fn portal_decision(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        app_id: String,
+        resource_id: String,
+    ) -> zbus::fdo::Result<String> {
+        let caller = self.solo_el_agente(connection, &header).await?;
+
+        let Some(key) = vasak_permissions_protocol::portal_key(&app_id) else {
+            // Sin identidad utilizable no hay nada guardado que buscar. Se
+            // contesta «sin decidir», que deja al agente preguntando cada vez
+            // —lo de siempre— en vez de inventar una respuesta.
+            return Ok(Decision::Unknown.as_id().to_string());
+        };
+        check_resource(&resource_id, &key)?;
+
+        let decision = self
+            .store
+            .load(caller.uid)
+            .map_err(FdoError::Failed)?
+            .decision(&key, &resource_id);
+
+        Ok(decision.as_id().to_string())
+    }
+
+    /// Anota lo que la persona contestó en el diálogo del portal.
+    ///
+    /// ── Por qué esto no pasa por polkit ─────────────────────────────────────
+    ///
+    /// `SetPermission` sí pasa, y la diferencia no es un descuido. Ahí la
+    /// pantalla de configuración cambia una decisión **ya tomada**, y sin
+    /// autenticar cualquier programa podría concederse lo que se le acababa de
+    /// negar. Acá lo que se anota es la respuesta que la persona acaba de dar
+    /// en un diálogo que apareció por algo que ella misma hizo. Pedirle la
+    /// contraseña encima del «permitir» que ya apretó es enseñarle a tipearla
+    /// sin leer, y eso cuesta más de lo que cuida.
+    ///
+    /// Lo que sostiene el método es lo otro: sólo lo puede llamar el agente
+    /// instalado, que es el único que muestra ese diálogo. Sin esa comprobación
+    /// cualquier programa local se anotaría la cámara a nombre de Chrome sin
+    /// que apareciera nada en pantalla, que es peor que no guardar nada.
+    async fn record_portal_decision(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        app_id: String,
+        resource_id: String,
+        allowed: bool,
+    ) -> zbus::fdo::Result<()> {
+        let caller = self.solo_el_agente(connection, &header).await?;
+
+        let key = vasak_permissions_protocol::portal_key(&app_id).ok_or_else(|| {
+            FdoError::InvalidArgs(format!(
+                "'{app_id}' no sirve como identidad de aplicación, así que no se \
+                 guarda ninguna decisión a su nombre"
+            ))
+        })?;
+        check_resource(&resource_id, &key)?;
+
+        let application = identity::describe_path(&key);
+
+        let _guard = self.write_lock.lock().await;
+        let mut policy = self.store.load(caller.uid).map_err(FdoError::Failed)?;
+        // `true`: el portal pregunta antes de entregar el recurso y respeta la
+        // respuesta, que es lo que este campo quiere decir. Sin él la pantalla
+        // mostraría el interruptor apagado por no tener perfil que lo sostenga.
+        policy.record(
+            &application,
+            &resource_id,
+            Decision::from_answer(allowed),
+            true,
+        );
+        self.store
+            .save(caller.uid, &policy)
+            .map_err(FdoError::Failed)?;
+
+        tracing::info!(
+            "Portal: '{resource_id}' {} para {app_id}",
+            if allowed { "permitido" } else { "denegado" }
+        );
+        Ok(())
     }
 
     /// Lo que algún perfil bloqueó y todavía nadie decidió.
@@ -650,4 +805,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_interfaz {
+    use super::*;
+
+    use zbus::object_server::Interface;
+
+    fn un_servicio() -> PermissionService {
+        PermissionService {
+            store: PolicyStore::new(),
+            agents: Arc::new(Mutex::new(AgentRegistry::default())),
+            write_lock: Arc::new(Mutex::new(())),
+            throttle: Arc::new(Mutex::new(PromptThrottle::default())),
+            pendientes: Default::default(),
+        }
+    }
+
+    fn introspeccion() -> String {
+        let servicio = un_servicio();
+        let mut xml = String::new();
+        servicio.introspect_to_writer(&mut xml, 0);
+        xml
+    }
+
+    /// La interfaz exporta los nombres que el agente llama.
+    ///
+    /// El agente los manda como cadenas; acá los genera zbus a partir del
+    /// nombre de la función. Renombrar `portal_decision` compila de las dos
+    /// puntas y deja al agente llamando a un método que no existe — y el fallo
+    /// no se ve: la consulta falla, se devuelve «sin decidir», aparece el
+    /// diálogo. O sea que se vería igual que antes de este cambio, que es la
+    /// peor forma posible de romperse.
+    #[test]
+    fn los_metodos_del_portal_se_llaman_como_el_agente_cree() {
+        let xml = introspeccion();
+
+        for metodo in [
+            vasak_permissions_protocol::PORTAL_DECISION_METHOD,
+            vasak_permissions_protocol::RECORD_PORTAL_DECISION_METHOD,
+        ] {
+            assert!(
+                xml.contains(&format!(r#"<method name="{metodo}">"#)),
+                "la interfaz no exporta {metodo}:\n{xml}"
+            );
+        }
+    }
+
+    /// Y con la firma que el agente arma.
+    ///
+    /// `PortalDecision` recibe dos cadenas y **contesta** una: si contestara un
+    /// booleano habría que convertir «todavía no se decidió» en un «no», y
+    /// entonces lo que nunca se preguntó quedaría rechazado para siempre.
+    /// `RecordPortalDecision` recibe dos cadenas y un booleano, y no contesta
+    /// nada.
+    #[test]
+    fn los_metodos_del_portal_tienen_la_firma_que_el_agente_arma() {
+        let xml = introspeccion();
+
+        let consulta = bloque_del_metodo(&xml, vasak_permissions_protocol::PORTAL_DECISION_METHOD);
+        assert_eq!(entradas(&consulta), vec!["s", "s"], "{consulta}");
+        assert_eq!(salidas(&consulta), vec!["s"], "{consulta}");
+
+        let anotar =
+            bloque_del_metodo(&xml, vasak_permissions_protocol::RECORD_PORTAL_DECISION_METHOD);
+        assert_eq!(entradas(&anotar), vec!["s", "s", "b"], "{anotar}");
+        assert!(salidas(&anotar).is_empty(), "{anotar}");
+    }
+
+    fn bloque_del_metodo(xml: &str, metodo: &str) -> String {
+        let inicio = xml
+            .find(&format!(r#"<method name="{metodo}">"#))
+            .unwrap_or_else(|| panic!("no está {metodo} en:\n{xml}"));
+        let resto = &xml[inicio..];
+        let fin = resto.find("</method>").expect("el método tiene cierre");
+        resto[..fin].to_string()
+    }
+
+    fn argumentos(bloque: &str, direccion: &str) -> Vec<String> {
+        bloque
+            .lines()
+            .filter(|l| l.contains(&format!(r#"direction="{direccion}""#)))
+            .filter_map(|l| {
+                let tras = l.split(r#"type=""#).nth(1)?;
+                Some(tras.split('"').next()?.to_string())
+            })
+            .collect()
+    }
+
+    fn entradas(bloque: &str) -> Vec<String> {
+        argumentos(bloque, "in")
+    }
+
+    fn salidas(bloque: &str) -> Vec<String> {
+        argumentos(bloque, "out")
+    }
 }
