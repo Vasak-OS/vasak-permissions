@@ -868,8 +868,10 @@ mod tests_interfaz {
         assert_eq!(entradas(&consulta), vec!["s", "s"], "{consulta}");
         assert_eq!(salidas(&consulta), vec!["s"], "{consulta}");
 
-        let anotar =
-            bloque_del_metodo(&xml, vasak_permissions_protocol::RECORD_PORTAL_DECISION_METHOD);
+        let anotar = bloque_del_metodo(
+            &xml,
+            vasak_permissions_protocol::RECORD_PORTAL_DECISION_METHOD,
+        );
         assert_eq!(entradas(&anotar), vec!["s", "s", "b"], "{anotar}");
         assert!(salidas(&anotar).is_empty(), "{anotar}");
     }

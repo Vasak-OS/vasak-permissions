@@ -178,8 +178,12 @@ impl PolicyStore {
         // A corrupt file must not be treated as "everything is allowed", and
         // must not be silently replaced either — refusing loudly keeps the
         // decisions recoverable by hand.
-        serde_json::from_str(&raw)
-            .map_err(|e| format!("la política de permisos en {} está dañada: {e}", path.display()))
+        serde_json::from_str(&raw).map_err(|e| {
+            format!(
+                "la política de permisos en {} está dañada: {e}",
+                path.display()
+            )
+        })
     }
 
     pub fn save(&self, uid: u32, policy: &UserPolicy) -> Result<(), String> {
@@ -245,8 +249,18 @@ mod tests {
         let mut politica = UserPolicy::default();
 
         // Lo que sí puede pedir, y lo que le quedó decidido de antes.
-        politica.record(&application(gestor), "account.drive", Decision::Allowed, true);
-        politica.record(&application(gestor), "account.email", Decision::Allowed, true);
+        politica.record(
+            &application(gestor),
+            "account.drive",
+            Decision::Allowed,
+            true,
+        );
+        politica.record(
+            &application(gestor),
+            "account.email",
+            Decision::Allowed,
+            true,
+        );
 
         let entrada = politica
             .entries()
@@ -271,7 +285,12 @@ mod tests {
     fn un_programa_sin_alcance_muestra_todas_sus_decisiones() {
         let ajeno = "/home/alguien/.local/bin/algo";
         let mut politica = UserPolicy::default();
-        politica.record(&application(ajeno), "account.email", Decision::Allowed, true);
+        politica.record(
+            &application(ajeno),
+            "account.email",
+            Decision::Allowed,
+            true,
+        );
         politica.record(&application(ajeno), "camera", Decision::Denied, true);
 
         let entrada = politica.entries().into_iter().next().unwrap();
@@ -285,12 +304,26 @@ mod tests {
     #[test]
     fn se_recuerda_si_el_programa_pregunta() {
         let mut politica = UserPolicy::default();
-        politica.record(&application("/usr/bin/vasak-connect"), "camera", Decision::Allowed, true);
-        politica.record(&application("/home/x/a.AppImage"), "camera", Decision::Denied, false);
+        politica.record(
+            &application("/usr/bin/vasak-connect"),
+            "camera",
+            Decision::Allowed,
+            true,
+        );
+        politica.record(
+            &application("/home/x/a.AppImage"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
 
         let entradas = politica.entries();
         let pregunta = |ruta: &str| {
-            entradas.iter().find(|e| e.application.binary_path == ruta).unwrap().asks
+            entradas
+                .iter()
+                .find(|e| e.application.binary_path == ruta)
+                .unwrap()
+                .asks
         };
         assert!(pregunta("/usr/bin/vasak-connect"));
         assert!(!pregunta("/home/x/a.AppImage"));
@@ -306,8 +339,14 @@ mod tests {
         politica.record(&app, "camera", Decision::Allowed, true);
         politica.record(&app, "camera", Decision::Denied, false);
 
-        assert!(politica.entries()[0].asks, "dejó de figurar como que pregunta");
-        assert_eq!(politica.decision("/usr/bin/vasak-connect", "camera"), Decision::Denied);
+        assert!(
+            politica.entries()[0].asks,
+            "dejó de figurar como que pregunta"
+        );
+        assert_eq!(
+            politica.decision("/usr/bin/vasak-connect", "camera"),
+            Decision::Denied
+        );
     }
 
     /// Una política escrita antes de que este campo existiera se sigue
@@ -319,7 +358,10 @@ mod tests {
             "display_name":"a","provenance":"unverified","decisions":{"camera":"denied"}}}}"#;
         let politica: UserPolicy = serde_json::from_str(vieja).expect("se lee");
         assert!(!politica.entries()[0].asks);
-        assert_eq!(politica.decision("/home/x/a.AppImage", "camera"), Decision::Denied);
+        assert_eq!(
+            politica.decision("/home/x/a.AppImage", "camera"),
+            Decision::Denied
+        );
     }
 
     #[test]
@@ -338,7 +380,10 @@ mod tests {
         let app = application("/usr/bin/meet");
 
         policy.record(&app, "camera", Decision::Allowed, false);
-        assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Allowed);
+        assert_eq!(
+            policy.decision("/usr/bin/meet", "camera"),
+            Decision::Allowed
+        );
 
         policy.record(&app, "camera", Decision::Denied, false);
         assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Denied);
@@ -353,7 +398,10 @@ mod tests {
 
         policy.record(&app, "camera", Decision::Allowed, false);
 
-        assert_eq!(policy.decision("/usr/bin/meet", "camera"), Decision::Allowed);
+        assert_eq!(
+            policy.decision("/usr/bin/meet", "camera"),
+            Decision::Allowed
+        );
         assert_eq!(
             policy.decision("/usr/bin/meet", "microphone"),
             Decision::Unknown
@@ -363,7 +411,12 @@ mod tests {
     #[test]
     fn forgetting_a_program_makes_it_ask_again() {
         let mut policy = UserPolicy::default();
-        policy.record(&application("/usr/bin/meet"), "camera", Decision::Denied, false);
+        policy.record(
+            &application("/usr/bin/meet"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
 
         assert!(policy.forget("/usr/bin/meet"));
         assert_eq!(
@@ -379,12 +432,25 @@ mod tests {
         let store = PolicyStore::at(dir.path().to_path_buf());
 
         let mut policy = UserPolicy::default();
-        policy.record(&application("/usr/bin/meet"), "camera", Decision::Allowed, false);
-        policy.record(&application("/usr/bin/meet"), "microphone", Decision::Denied, false);
+        policy.record(
+            &application("/usr/bin/meet"),
+            "camera",
+            Decision::Allowed,
+            false,
+        );
+        policy.record(
+            &application("/usr/bin/meet"),
+            "microphone",
+            Decision::Denied,
+            false,
+        );
         store.save(1000, &policy).expect("save");
 
         let reloaded = store.load(1000).expect("load");
-        assert_eq!(reloaded.decision("/usr/bin/meet", "camera"), Decision::Allowed);
+        assert_eq!(
+            reloaded.decision("/usr/bin/meet", "camera"),
+            Decision::Allowed
+        );
         assert_eq!(
             reloaded.decision("/usr/bin/meet", "microphone"),
             Decision::Denied
@@ -416,11 +482,19 @@ mod tests {
         let store = PolicyStore::at(dir.path().to_path_buf());
 
         let mut first = UserPolicy::default();
-        first.record(&application("/usr/bin/meet"), "camera", Decision::Allowed, false);
+        first.record(
+            &application("/usr/bin/meet"),
+            "camera",
+            Decision::Allowed,
+            false,
+        );
         store.save(1000, &first).expect("save");
 
         assert_eq!(
-            store.load(1001).expect("load").decision("/usr/bin/meet", "camera"),
+            store
+                .load(1001)
+                .expect("load")
+                .decision("/usr/bin/meet", "camera"),
             Decision::Unknown,
             "another user must not inherit the decision"
         );
@@ -476,7 +550,10 @@ mod tests {
             .find(|e| e.application.binary_path == key)
             .expect("la identidad del portal tiene que figurar");
 
-        assert_eq!(entrada.decisions.get("screen-capture"), Some(&Decision::Allowed));
+        assert_eq!(
+            entrada.decisions.get("screen-capture"),
+            Some(&Decision::Allowed)
+        );
         assert_eq!(entrada.decisions.get("camera"), Some(&Decision::Denied));
         // `asks` en verdadero: el portal pregunta antes de entregar el recurso y
         // respeta la respuesta. Sin esto la pantalla mostraría el interruptor

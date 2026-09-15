@@ -419,8 +419,8 @@ mod tests {
     /// una casualidad no es algo sobre lo que apoyar una pantalla de seguridad.
     #[test]
     fn una_identidad_del_portal_se_describe_como_tal() {
-        let key = vasak_permissions_protocol::portal_key("com.google.Chrome")
-            .expect("identidad válida");
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
         let app = describe_path(&key);
 
         assert_eq!(app.binary_path, "portal:com.google.Chrome");
@@ -435,10 +435,17 @@ mod tests {
     /// programa que sí lo está— afirmaría algo que no se sabe.
     #[test]
     fn ninguna_identidad_del_portal_queda_verificada() {
-        for app_id in ["com.google.Chrome", "ar.net.vasak.os.Settings", "cualquiera"] {
-            let key =
-                vasak_permissions_protocol::portal_key(app_id).expect("identidad válida");
-            assert_eq!(describe_path(&key).provenance, Provenance::Unverified, "{app_id}");
+        for app_id in [
+            "com.google.Chrome",
+            "ar.net.vasak.os.Settings",
+            "cualquiera",
+        ] {
+            let key = vasak_permissions_protocol::portal_key(app_id).expect("identidad válida");
+            assert_eq!(
+                describe_path(&key).provenance,
+                Provenance::Unverified,
+                "{app_id}"
+            );
         }
     }
 }

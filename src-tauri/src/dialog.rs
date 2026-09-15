@@ -2,9 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
-use serde::Serialize;
 use vasak_permissions_protocol::PermissionRequest;
 
 const WINDOW_LABEL: &str = "permission-dialog";
@@ -121,7 +121,6 @@ pub async fn ask<R: tauri::Runtime>(app: &AppHandle<R>, question: Question) -> R
         Err(_) => Respuesta::NoSePudoPreguntar,
     }
 }
-
 
 /// Short description of what is on screen, for the journal. A permission dialog
 /// that nobody can account for afterwards is hard to support.

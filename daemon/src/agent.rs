@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use vasak_permissions_protocol::{
-    PermissionRequest, AGENT_BINARY, AGENT_INTERFACE,
-};
+use vasak_permissions_protocol::{PermissionRequest, AGENT_BINARY, AGENT_INTERFACE};
 
 /// How long to wait for someone to answer the dialog.
 ///
@@ -87,7 +85,6 @@ impl AgentRegistry {
         self.by_uid.get(&uid).cloned()
     }
 }
-
 
 /// Whether this executable is the installed agent.
 ///
@@ -308,10 +305,20 @@ mod tests {
         // The whole security of the prompt rests on this: a program the user
         // can write could otherwise register and approve everything itself.
         assert!(registry
-            .register(1000, "/home/someone/fake-agent", ":1.42".into(), "/x".into())
+            .register(
+                1000,
+                "/home/someone/fake-agent",
+                ":1.42".into(),
+                "/x".into()
+            )
             .is_err());
         assert!(registry
-            .register(1000, "/usr/bin/some-other-program", ":1.42".into(), "/x".into())
+            .register(
+                1000,
+                "/usr/bin/some-other-program",
+                ":1.42".into(),
+                "/x".into()
+            )
             .is_err());
 
         assert!(registry

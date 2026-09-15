@@ -82,7 +82,6 @@ impl Agent {
     }
 }
 
-
 /// The system bus, always, in a released build.
 ///
 /// Debug builds follow the service onto a session bus so the dialog can be
@@ -109,7 +108,10 @@ pub async fn connect_and_register(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("no se pudo abrir el bus del sistema: {e}"))?
         .serve_at(
             AGENT_PATH,
-            Agent { app: app.clone(), avisados: avisados.clone() },
+            Agent {
+                app: app.clone(),
+                avisados: avisados.clone(),
+            },
         )
         .map_err(|e| format!("no se pudo publicar el agente: {e}"))?
         .build()
@@ -167,5 +169,8 @@ async fn register(connection: &zbus::Connection) -> Result<(), String> {
 /// Kept so the interface name cannot drift from the protocol crate without the
 /// compiler noticing.
 const _: () = {
-    assert!(matches!(AGENT_INTERFACE.as_bytes(), b"ar.net.vasak.os.PermissionAgent"));
+    assert!(matches!(
+        AGENT_INTERFACE.as_bytes(),
+        b"ar.net.vasak.os.PermissionAgent"
+    ));
 };

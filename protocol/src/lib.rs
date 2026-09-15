@@ -48,7 +48,6 @@ pub const RECORD_PORTAL_DECISION_METHOD: &str = "RecordPortalDecision";
 /// was just refused — which would make the whole service decorative.
 pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
 
-
 /// Services allowed to ask on behalf of somebody else.
 ///
 /// An application does not talk to the permission service directly for an
@@ -215,9 +214,10 @@ pub fn scope_of(binary_path: &str) -> Option<&'static [&'static str]> {
     #[cfg(debug_assertions)]
     if std::env::var_os("VASAK_PERMISSIONS_TEST_ROOT").is_some() {
         let nombre = std::path::Path::new(binary_path).file_name();
-        if let Some((_, alcance)) = SCOPED_BINARIES.iter().find(|(instalado, _)| {
-            std::path::Path::new(instalado).file_name() == nombre
-        }) {
+        if let Some((_, alcance)) = SCOPED_BINARIES
+            .iter()
+            .find(|(instalado, _)| std::path::Path::new(instalado).file_name() == nombre)
+        {
             return Some(alcance);
         }
     }
@@ -405,10 +405,7 @@ impl Resource {
     pub fn decision_has_effect(&self) -> bool {
         matches!(
             self,
-            Resource::Account(_)
-                | Resource::Camera
-                | Resource::Microphone
-                | Resource::Credentials
+            Resource::Account(_) | Resource::Camera | Resource::Microphone | Resource::Credentials
         )
     }
 
@@ -814,7 +811,10 @@ mod tests_alcance {
             "account.chat",
             "credentials",
         ] {
-            assert!(!may_request(sync, prohibido), "no tenía que poder pedir '{prohibido}'");
+            assert!(
+                !may_request(sync, prohibido),
+                "no tenía que poder pedir '{prohibido}'"
+            );
         }
     }
 
@@ -837,7 +837,10 @@ mod tests_alcance {
             "account.tasks",
             "credentials",
         ] {
-            assert!(!may_request(calendario, prohibido), "no tenía que poder pedir '{prohibido}'");
+            assert!(
+                !may_request(calendario, prohibido),
+                "no tenía que poder pedir '{prohibido}'"
+            );
         }
     }
 
@@ -861,7 +864,10 @@ mod tests_alcance {
             "account.tasks",
             "credentials",
         ] {
-            assert!(!may_request(contactos, prohibido), "no tenía que poder pedir '{prohibido}'");
+            assert!(
+                !may_request(contactos, prohibido),
+                "no tenía que poder pedir '{prohibido}'"
+            );
         }
     }
 
@@ -885,7 +891,10 @@ mod tests_alcance {
             "account.drive",
             "credentials",
         ] {
-            assert!(!may_request(correo, recurso), "no tenía que poder pedir '{recurso}'");
+            assert!(
+                !may_request(correo, recurso),
+                "no tenía que poder pedir '{recurso}'"
+            );
         }
     }
 
@@ -1006,7 +1015,10 @@ mod tests_portal {
             portal_key("com.google.Chrome").as_deref(),
             Some("portal:com.google.Chrome")
         );
-        assert_eq!(portal_key("org.gnome.Calculator").as_deref(), Some("portal:org.gnome.Calculator"));
+        assert_eq!(
+            portal_key("org.gnome.Calculator").as_deref(),
+            Some("portal:org.gnome.Calculator")
+        );
     }
 
     /// Vacío es lo que llega de todo programa que no se registró, y es la mitad
