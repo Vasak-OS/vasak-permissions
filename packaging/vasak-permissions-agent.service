@@ -5,7 +5,20 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-Type=exec
+# `dbus` y no `exec`: este proceso es el backend de portal de
+# `org.freedesktop.impl.portal.Access`, y `xdg-desktop-portal` no termina de
+# arrancar hasta que ese nombre existe. Con `Type=exec` systemd daba la unidad
+# por arrancada a los 82 ms —cuando el binario hacía exec— mientras el nombre no
+# aparecía hasta quince segundos después, así que el plantón que eso causaba en
+# cada inicio de sesión no figuraba en ningún lado: `systemd-analyze --user
+# blame` mostraba 82 ms.
+#
+# Ahora «arrancada» quiere decir lo que dice. Si el nombre no se puede tomar la
+# unidad falla y `Restart=on-failure` la vuelve a intentar, que es lo correcto:
+# un agente sin su backend de portal está a medias, y el caso en que pasa —una
+# instancia anterior todavía soltando el nombre— se arregla solo al reintentar.
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.vasak
 ExecStart=/usr/bin/vasak-permissions-agent
 Restart=on-failure
 RestartSec=2
