@@ -11,11 +11,11 @@
 //! is nothing to record a per-program decision against. The two are kept
 //! separate deliberately, and the dialog says which one it is looking at.
 
-use tauri::AppHandle;
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
 use crate::dialog::{PortalQuestion, Question};
+use crate::mas_tarde::MasTarde;
 
 /// The name a portal backend is found under. It has to match the `.portal`
 /// file installed alongside, or the portal never looks here.
@@ -25,9 +25,15 @@ pub const BACKEND_PATH: &str = "/org/freedesktop/portal/desktop";
 /// Response codes from the portal specification.
 const RESPONSE_GRANTED: u32 = 0;
 const RESPONSE_CANCELLED: u32 = 1;
+/// «Falló», que no es lo mismo que «dijo que no»: decir que la persona
+/// rechazó algo que en realidad nunca se le llegó a preguntar manda a quien
+/// depure esto a buscar en el lugar equivocado.
+const RESPONSE_ERROR: u32 = 2;
 
 pub struct AccessBackend {
-    pub app: AppHandle,
+    /// La aplicación, que al publicar este backend todavía no existe.
+    /// Ver `crate::mas_tarde`.
+    pub app: MasTarde,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Access")]
@@ -58,8 +64,18 @@ impl AccessBackend {
         // place itself over another client's window.
         let _ = (handle, parent_window, options);
 
+        let Some(app) = self.app.esperar().await else {
+            // La aplicación no llegó a construirse, así que no hay con qué
+            // preguntar. No se concede: el permiso que nadie pudo autorizar no
+            // es un permiso otorgado.
+            eprintln!(
+                "[vasak-permissions-agent] llegó un pedido de permiso y la aplicación no existe"
+            );
+            return (RESPONSE_ERROR, std::collections::HashMap::new());
+        };
+
         let granted = crate::dialog::ask(
-            &self.app,
+            &app,
             Question::Portal(PortalQuestion {
                 app_id,
                 title,
@@ -94,7 +110,7 @@ impl AccessBackend {
 /// Separate from the connection the agent uses to reach the permission service:
 /// that one is the *system* bus, and the portal only ever looks on the session
 /// bus. One process, two buses, because the two jobs live in different places.
-pub async fn serve(app: AppHandle) -> Result<zbus::Connection, String> {
+pub async fn serve(app: MasTarde) -> Result<zbus::Connection, String> {
     zbus::connection::Builder::session()
         .map_err(|e| format!("no se pudo abrir el bus de sesión: {e}"))?
         .name(BACKEND_NAME)

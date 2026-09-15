@@ -81,7 +81,13 @@ where
     A: serde::Serialize + zbus::zvariant::DynamicType + Sync,
 {
     match connection
-        .call_method(Some(WLR_NAME), WLR_PATH, Some(SCREENCAST_IFACE), metodo, argumentos)
+        .call_method(
+            Some(WLR_NAME),
+            WLR_PATH,
+            Some(SCREENCAST_IFACE),
+            metodo,
+            argumentos,
+        )
         .await
     {
         Ok(reply) => match reply.body().deserialize::<Respuesta>() {
@@ -110,7 +116,9 @@ where
 /// firma que esta interfaz expone por el bus. Es justo lo que hay que mirar:
 /// las dos veces que estuvo mal, compilaba igual.
 pub struct ScreenCastBackend<R: Runtime = tauri::Wry> {
-    pub app: AppHandle<R>,
+    /// La aplicación, que al publicar este backend todavía no existe.
+    /// Ver `crate::mas_tarde`.
+    pub app: crate::mas_tarde::MasTarde<R>,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -134,7 +142,9 @@ impl<R: Runtime> ScreenCastBackend<R> {
         // La sesión se exporta acá aunque la nuestra no haga más que reenviar:
         // el portal la busca en **nuestra** conexión, no en la de wlr.
         if respuesta.0 == RESPONSE_GRANTED {
-            let sesion = SesionReenviada { destino: session_handle.clone() };
+            let sesion = SesionReenviada {
+                destino: session_handle.clone(),
+            };
             if let Err(error) = connection.object_server().at(&session_handle, sesion).await {
                 eprintln!("[vasak-permissions-agent] no se pudo exportar la sesión: {error}");
             }
@@ -154,14 +164,21 @@ impl<R: Runtime> ScreenCastBackend<R> {
         app_id: String,
         options: HashMap<String, OwnedValue>,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        let pregunta = PortalQuestion {
-            app_id: app_id.clone(),
-            title: traducir(&self.app, "screencast.title"),
-            subtitle: traducir(&self.app, "screencast.subtitle"),
-            body: traducir(&self.app, "screencast.body"),
+        let Some(app) = self.app.esperar().await else {
+            eprintln!(
+                "[vasak-permissions-agent] llegó un pedido de captura y la aplicación no existe"
+            );
+            return (RESPONSE_ERROR, vacio());
         };
 
-        if !crate::dialog::ask(&self.app, Question::Portal(pregunta)).await {
+        let pregunta = PortalQuestion {
+            app_id: app_id.clone(),
+            title: traducir(&app, "screencast.title"),
+            subtitle: traducir(&app, "screencast.subtitle"),
+            body: traducir(&app, "screencast.body"),
+        };
+
+        if !crate::dialog::ask(&app, Question::Portal(pregunta)).await {
             return (RESPONSE_CANCELLED, vacio());
         }
 
@@ -233,12 +250,21 @@ impl SesionReenviada {
     /// fallar que tiene esta pantalla.
     async fn close(&self, #[zbus(connection)] connection: &zbus::Connection) {
         if let Err(error) = connection
-            .call_method(Some(WLR_NAME), &self.destino, Some(SESSION_IFACE), "Close", &())
+            .call_method(
+                Some(WLR_NAME),
+                &self.destino,
+                Some(SESSION_IFACE),
+                "Close",
+                &(),
+            )
             .await
         {
             eprintln!("[vasak-permissions-agent] no se pudo cerrar la sesión en wlr: {error}");
         }
-        let _ = connection.object_server().remove::<Self, _>(&self.destino).await;
+        let _ = connection
+            .object_server()
+            .remove::<Self, _>(&self.destino)
+            .await;
     }
 
     #[zbus(signal)]
@@ -263,7 +289,12 @@ async fn propiedad_de_wlr(nombre: &str) -> Option<u32> {
         )
         .await
         .ok()?;
-    reply.body().deserialize::<OwnedValue>().ok()?.downcast_ref::<u32>().ok()
+    reply
+        .body()
+        .deserialize::<OwnedValue>()
+        .ok()?
+        .downcast_ref::<u32>()
+        .ok()
 }
 
 fn traducir<R: Runtime>(app: &AppHandle<R>, clave: &str) -> String {
@@ -278,8 +309,14 @@ pub const BACKEND_PATH: &str = crate::portal::BACKEND_PATH;
 /// cambio de nombre en `portal.rs` no los puede separar sin que el compilador
 /// lo note.
 const _: () = {
-    assert!(matches!(BACKEND_PATH.as_bytes(), b"/org/freedesktop/portal/desktop"));
-    assert!(matches!(WLR_PATH.as_bytes(), b"/org/freedesktop/portal/desktop"));
+    assert!(matches!(
+        BACKEND_PATH.as_bytes(),
+        b"/org/freedesktop/portal/desktop"
+    ));
+    assert!(matches!(
+        WLR_PATH.as_bytes(),
+        b"/org/freedesktop/portal/desktop"
+    ));
 };
 
 #[cfg(test)]
@@ -288,6 +325,16 @@ mod tests {
     use zbus::object_server::Interface;
 
     /// La introspección que el portal lee de una interfaz nuestra.
+    /// Un hueco ya lleno, que es lo que estas pruebas necesitan: acá la
+    /// aplicación existe desde el principio y lo que se mira es otra cosa.
+    fn hueco_lleno(
+        app: &tauri::App<tauri::test::MockRuntime>,
+    ) -> crate::mas_tarde::MasTarde<tauri::test::MockRuntime> {
+        let (cuando, mas_tarde) = crate::mas_tarde::hueco();
+        cuando.llenar(app.handle().clone());
+        mas_tarde
+    }
+
     fn firma<I: Interface>(interfaz: &I) -> String {
         let mut xml = String::new();
         interfaz.introspect_to_writer(&mut xml, 0);
@@ -304,7 +351,9 @@ mod tests {
     #[test]
     fn los_metodos_contestan_dos_valores_sueltos() {
         let app = tauri::test::mock_app();
-        let backend = ScreenCastBackend { app: app.handle().clone() };
+        let backend = ScreenCastBackend {
+            app: hueco_lleno(&app),
+        };
         let xml = firma(&backend);
 
         for metodo in ["CreateSession", "SelectSources", "Start"] {
@@ -319,8 +368,16 @@ mod tests {
                 "{metodo} tiene que sacar dos valores y saca {}:\n{bloque}",
                 salidas.len()
             );
-            assert!(salidas[0].contains(r#"type="u""#), "{metodo}: {}", salidas[0]);
-            assert!(salidas[1].contains(r#"type="a{sv}""#), "{metodo}: {}", salidas[1]);
+            assert!(
+                salidas[0].contains(r#"type="u""#),
+                "{metodo}: {}",
+                salidas[0]
+            );
+            assert!(
+                salidas[1].contains(r#"type="a{sv}""#),
+                "{metodo}: {}",
+                salidas[1]
+            );
         }
     }
 
@@ -333,7 +390,9 @@ mod tests {
     #[test]
     fn la_version_se_anuncia_con_el_nombre_que_el_portal_busca() {
         let app = tauri::test::mock_app();
-        let backend = ScreenCastBackend { app: app.handle().clone() };
+        let backend = ScreenCastBackend {
+            app: hueco_lleno(&app),
+        };
         let xml = firma(&backend);
         assert!(xml.contains(r#"<property name="version""#), "{xml}");
         assert!(!xml.contains(r#"<property name="Version""#), "{xml}");
@@ -350,7 +409,9 @@ mod tests {
     /// El trozo de XML de un método, del `<method name=…>` a su cierre.
     fn bloque_del_metodo<'a>(xml: &'a str, metodo: &str) -> &'a str {
         let abre = format!(r#"<method name="{metodo}">"#);
-        let desde = xml.find(&abre).unwrap_or_else(|| panic!("falta {metodo}:\n{xml}"));
+        let desde = xml
+            .find(&abre)
+            .unwrap_or_else(|| panic!("falta {metodo}:\n{xml}"));
         let hasta = xml[desde..].find("</method>").expect("método sin cerrar") + desde;
         &xml[desde..hasta]
     }
@@ -383,10 +444,16 @@ mod tests {
         }
 
         let tipos = propiedad_de_wlr("AvailableSourceTypes").await;
-        assert!(tipos.is_some(), "wlr está en el bus y no contestó AvailableSourceTypes");
+        assert!(
+            tipos.is_some(),
+            "wlr está en el bus y no contestó AvailableSourceTypes"
+        );
         // Al menos monitores: un backend de captura que no captura nada sería
         // otro problema, pero no éste.
-        assert!(tipos.unwrap() & 1 != 0, "wlr dice que no puede capturar monitores");
+        assert!(
+            tipos.unwrap() & 1 != 0,
+            "wlr dice que no puede capturar monitores"
+        );
 
         assert!(propiedad_de_wlr("AvailableCursorModes").await.is_some());
     }
@@ -415,7 +482,12 @@ mod tests {
         let (codigo, _) = reenviar(
             &connection,
             "CreateSession",
-            &(&handle, &sesion, "ar.net.vasak.prueba", HashMap::<String, OwnedValue>::new()),
+            &(
+                &handle,
+                &sesion,
+                "ar.net.vasak.prueba",
+                HashMap::<String, OwnedValue>::new(),
+            ),
         )
         .await;
 
