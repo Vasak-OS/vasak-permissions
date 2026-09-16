@@ -62,6 +62,11 @@ impl Registro {
         self.vivas.lock().await.remove(sesion.as_str()).is_some()
     }
 
+    /// ¿Esta sesión está capturando ahora mismo?
+    pub async fn tiene(&self, sesion: &OwnedObjectPath) -> bool {
+        self.vivas.lock().await.contains_key(sesion.as_str())
+    }
+
     /// Lo que está vivo, como pares (sesión, aplicación).
     pub async fn vivas(&self) -> Vec<(String, String)> {
         self.vivas
@@ -118,6 +123,17 @@ impl ServicioDeCapturas {
     ) -> zbus::fdo::Result<()> {
         let ruta = OwnedObjectPath::try_from(sesion.as_str())
             .map_err(|error| zbus::fdo::Error::InvalidArgs(format!("sesión inválida: {error}")))?;
+
+        // Sólo se cierra lo que está capturando. Esta interfaz la puede llamar
+        // cualquier programa de la sesión, y sin esta comprobación un camino
+        // bien formado se reenviaba tal cual a xdpw: alcanzaba para cerrarle a
+        // otro una sesión creada y todavía no empezada, que ni siquiera
+        // aparece en la lista que este servicio publica.
+        if !self.registro.tiene(&ruta).await {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "la sesión {sesion} no está capturando"
+            )));
+        }
 
         connection
             .call_method(
@@ -221,6 +237,20 @@ mod pruebas {
             OwnedObjectPath::try_from(RUTA).is_ok(),
             "«{RUTA}» no es un camino de objeto que D-Bus acepte"
         );
+    }
+
+    #[tokio::test]
+    async fn saber_si_una_sesion_esta_capturando() {
+        let registro = Registro::nuevo();
+        let viva = ruta("/sesion/1");
+        let otra = ruta("/sesion/2");
+
+        registro.sumar(&viva, "app").await;
+
+        assert!(registro.tiene(&viva).await);
+        // La que no está es la que `cerrar` tiene que rechazar antes de
+        // reenviarle nada a xdpw.
+        assert!(!registro.tiene(&otra).await);
     }
 
     /// El registro se clona por valor y tiene que seguir siendo el mismo: el
