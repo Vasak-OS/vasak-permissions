@@ -122,6 +122,8 @@ pub struct ScreenCastBackend<R: Runtime = tauri::Wry> {
     /// La aplicación, que al publicar este backend todavía no existe.
     /// Ver `crate::mas_tarde`.
     pub app: crate::mas_tarde::MasTarde<R>,
+    /// Qué se está capturando, para que el panel pueda decirlo y cortarlo.
+    pub capturas: crate::capturas::Registro,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -147,6 +149,7 @@ impl<R: Runtime> ScreenCastBackend<R> {
         if respuesta.0 == RESPONSE_GRANTED {
             let sesion = SesionReenviada {
                 destino: session_handle.clone(),
+                capturas: self.capturas.clone(),
             };
             if let Err(error) = connection.object_server().at(&session_handle, sesion).await {
                 eprintln!("[vasak-permissions-agent] no se pudo exportar la sesión: {error}");
@@ -209,12 +212,22 @@ impl<R: Runtime> ScreenCastBackend<R> {
         parent_window: String,
         options: HashMap<String, OwnedValue>,
     ) -> (u32, HashMap<String, OwnedValue>) {
-        reenviar(
+        let respuesta = reenviar(
             connection,
             "Start",
             &(&handle, &session_handle, &app_id, &parent_window, &options),
         )
-        .await
+        .await;
+
+        // Recién acá empezó a capturar de verdad. Anotarlo en `SelectSources`
+        // —donde se concede— sería anunciar que te están mirando mientras
+        // `xdpw` todavía muestra su selector de monitor.
+        if respuesta.0 == RESPONSE_GRANTED {
+            self.capturas.sumar(&session_handle, &app_id).await;
+            crate::capturas::avisar(connection).await;
+        }
+
+        respuesta
     }
 
     /// Qué se puede capturar, según lo que dice `xdpw`.
@@ -244,6 +257,8 @@ impl<R: Runtime> ScreenCastBackend<R> {
 /// La sesión, que sólo pasa mensajes.
 struct SesionReenviada {
     destino: OwnedObjectPath,
+    /// Para que cerrarla la saque de lo que el panel muestra.
+    capturas: crate::capturas::Registro,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Session")]
@@ -271,6 +286,13 @@ impl SesionReenviada {
             .object_server()
             .remove::<Self, _>(&self.destino)
             .await;
+
+        // El indicador del panel sale de acá: si la sesión se cierra y esto no
+        // se saca, el icono se queda encendido para siempre diciendo que te
+        // están mirando.
+        if self.capturas.sacar(&self.destino).await {
+            crate::capturas::avisar(connection).await;
+        }
     }
 
     #[zbus(signal)]
@@ -359,6 +381,7 @@ mod tests {
         let app = tauri::test::mock_app();
         let backend = ScreenCastBackend {
             app: hueco_lleno(&app),
+            capturas: crate::capturas::Registro::nuevo(),
         };
         let xml = firma(&backend);
 
@@ -398,6 +421,7 @@ mod tests {
         let app = tauri::test::mock_app();
         let backend = ScreenCastBackend {
             app: hueco_lleno(&app),
+            capturas: crate::capturas::Registro::nuevo(),
         };
         let xml = firma(&backend);
         assert!(xml.contains(r#"<property name="version""#), "{xml}");
@@ -406,6 +430,7 @@ mod tests {
         let sesion = SesionReenviada {
             destino: OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1/2")
                 .unwrap(),
+            capturas: crate::capturas::Registro::nuevo(),
         };
         let xml = firma(&sesion);
         assert!(xml.contains(r#"<property name="version""#), "{xml}");
