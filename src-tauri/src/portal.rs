@@ -5,11 +5,25 @@
 //! the question to the person. Implementing that backend is what makes those
 //! dialogs look like the rest of VasakOS instead of borrowing GNOME's.
 //!
-//! What this is **not** is enforcement by the VasakOS permission service. The
-//! portal remembers these answers in its own store, and it tells the backend
-//! only an `app_id`, which is empty for anything outside a sandbox — so there
-//! is nothing to record a per-program decision against. The two are kept
-//! separate deliberately, and the dialog says which one it is looking at.
+//! # Lo que se guarda, y contra qué
+//!
+//! La respuesta se anota en el servicio de permisos, contra el `app_id` que el
+//! portal entrega. Antes no se anotaba en ningún lado y el diálogo volvía a
+//! aparecer cada vez; `politica` cuenta el caso medido y por qué eso era peor
+//! que guardar una identidad imperfecta.
+//!
+//! Este comentario decía que el `app_id` «está vacío para cualquier cosa fuera
+//! de un sandbox», y sobre eso apoyaba la decisión de no guardar nada. Dejó de
+//! ser cierto: `xdg-desktop-portal` 1.22 expone
+//! `org.freedesktop.host.portal.Registry`, donde una aplicación sin sandbox
+//! declara su identificador, y las basadas en Chromium la usan — lo que llega
+//! es `com.google.Chrome`. Vacío llega sólo lo que no se registra, y eso se
+//! sigue preguntando cada vez.
+//!
+//! Lo que **no** cambió es cuánto vale esa identidad: la declara la propia
+//! aplicación y no la comprueba nadie. Por eso estas entradas quedan como
+//! `Provenance::Unverified` y el diálogo sigue sin presentarlas como un
+//! programa identificado — que es otra cosa que un programa que dijo su nombre.
 
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedValue};
@@ -62,7 +76,7 @@ impl AccessBackend {
         // quickly and closes itself, so there is nothing to cancel. The parent
         // window cannot be honoured either — Wayland gives a client no way to
         // place itself over another client's window.
-        let _ = (handle, parent_window, options);
+        let _ = (handle, parent_window);
 
         let Some(app) = self.app.esperar().await else {
             // La aplicación no llegó a construirse, así que no hay con qué
@@ -74,10 +88,19 @@ impl AccessBackend {
             return (RESPONSE_ERROR, std::collections::HashMap::new());
         };
 
-        let granted = crate::dialog::ask(
+        // Qué recurso es, si se puede saber. Esta interfaz es genérica —la
+        // misma atiende la cámara, la ubicación y correr en segundo plano— y no
+        // lo dice; `recurso_del_dialogo` lo deduce de lo poco que hay, y
+        // devuelve `None` cuando no puede. Sin recurso no se guarda nada y se
+        // pregunta cada vez, que es lo que pasaba siempre.
+        let recurso = crate::politica::recurso_del_dialogo(&options);
+
+        let granted = crate::politica::decidir(
             &app,
+            &app_id,
+            recurso,
             Question::Portal(PortalQuestion {
-                app_id,
+                app_id: app_id.clone(),
                 title,
                 subtitle,
                 body,

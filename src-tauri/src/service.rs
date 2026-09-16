@@ -39,7 +39,30 @@ impl Agent {
             zbus::fdo::Error::InvalidArgs(format!("consulta de permiso inválida: {error}"))
         })?;
 
-        Ok(crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await)
+        let respuesta =
+            crate::dialog::ask(&self.app, crate::dialog::Question::Permission(request)).await;
+
+        // Que no se haya podido preguntar sale como error de D-Bus, no como un
+        // «no».
+        //
+        // El servicio guarda la decisión de este camino él mismo, y lo hace con
+        // lo que sale de acá: un `Ok(false)` se anota como `Decision::Denied` y
+        // no se vuelve a preguntar nunca. O sea que un diálogo que no llegó a
+        // aparecer —porque había otro abierto, o porque la ventana no se pudo
+        // crear— dejaría a la aplicación denegada para siempre, sin que nadie
+        // hubiera visto nada.
+        //
+        // Con un error, `agent::ask` del otro lado devuelve `None`, y ahí el
+        // servicio ya sabe qué hacer: deniega este pedido, no guarda nada y
+        // devuelve el turno del limitador, porque no se mostró ningún diálogo.
+        // El camino del portal resuelve lo mismo en `politica::decidir`.
+        if !respuesta.la_contesto_alguien() {
+            return Err(zbus::fdo::Error::Failed(
+                "no se pudo mostrar el diálogo de permiso".into(),
+            ));
+        }
+
+        Ok(respuesta.permitio())
     }
 
     /// Avisa que AppArmor le negó un recurso a una aplicación.
@@ -75,7 +98,6 @@ impl Agent {
     }
 }
 
-
 /// The system bus, always, in a released build.
 ///
 /// Debug builds follow the service onto a session bus so the dialog can be
@@ -102,7 +124,10 @@ pub async fn connect_and_register(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("no se pudo abrir el bus del sistema: {e}"))?
         .serve_at(
             AGENT_PATH,
-            Agent { app: app.clone(), avisados: avisados.clone() },
+            Agent {
+                app: app.clone(),
+                avisados: avisados.clone(),
+            },
         )
         .map_err(|e| format!("no se pudo publicar el agente: {e}"))?
         .build()
@@ -160,5 +185,8 @@ async fn register(connection: &zbus::Connection) -> Result<(), String> {
 /// Kept so the interface name cannot drift from the protocol crate without the
 /// compiler noticing.
 const _: () = {
-    assert!(matches!(AGENT_INTERFACE.as_bytes(), b"ar.net.vasak.os.PermissionAgent"));
+    assert!(matches!(
+        AGENT_INTERFACE.as_bytes(),
+        b"ar.net.vasak.os.PermissionAgent"
+    ));
 };

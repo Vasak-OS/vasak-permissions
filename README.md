@@ -97,9 +97,44 @@ Las aplicaciones de correo, calendario, contactos y chats todavía no existen.
 Cada una entra en la lista el día que se escriba, con su capacidad y ninguna
 más.
 
+## El camino del portal
+
+Cámara y captura de pantalla llegan además por `xdg-desktop-portal`, que le
+pide el diálogo a un backend. Ese backend es el agente de este repositorio, y
+desde ahí **consulta lo guardado antes de preguntar**: lo que ya se concedió no
+se vuelve a preguntar, lo que se rechazó se rechaza sin diálogo, y las dos cosas
+se pueden retirar desde Configuración.
+
+Antes se preguntaba y se descartaba la respuesta. Medido con Chrome pidiendo
+compartir la pantalla: cuatro diálogos idénticos en veinte segundos, y nada
+anotado en ninguna parte.
+
+### Contra qué se guarda, y cuánto vale
+
+Contra el `app_id` que entrega el portal, que **no** es la ruta del ejecutable
+con la que se identifica todo lo demás. La declara la propia aplicación llamando
+a `Register` en `org.freedesktop.host.portal.Registry`, y nadie comprueba que le
+corresponda: un programa puede registrarse como `com.google.Chrome` y heredar lo
+que Chrome tenga concedido.
+
+Se usa igual porque la alternativa era peor. Un diálogo que reaparece cada vez
+no deja a nadie más seguro: enseña a conceder sin leer. Lo que sí se hace es no
+disimularlo — estas entradas quedan como no verificadas, viven en un espacio de
+nombres aparte (`portal:<app_id>`) y se distinguen a simple vista en el archivo
+de política.
+
+Un `app_id` vacío —lo que llega de todo programa que no se registró— se sigue
+preguntando cada vez y no se guarda.
+
 ## Lo que este servicio todavía no puede hacer cumplir
 
-Cámara, micrófono y pantalla los entrega PipeWire y el portal de escritorio.
-Este servicio puede ser la política a la que ellos consultan, pero la regla se
-aplica ahí. Hasta que esa integración exista, el interruptor guarda la decisión
-pero no bloquea el acceso.
+El camino de arriba cubre lo que **pasa por el portal**, que es por donde piden
+la cámara los navegadores y las aplicaciones de videollamada. Lo que no cubre es
+la otra puerta: una aplicación que abre `/dev/video0` directamente o que le
+habla al socket de PipeWire no pasa por acá y no se entera de ninguna decisión.
+
+Para eso hay un perfil de AppArmor, y sólo alcanza a los AppImage: todo lo que
+instaló el gestor de paquetes no tiene perfil. Cerrar la vía de PipeWire está
+pendiente de que WirePlumber aplique permisos por cliente — el registro de ese
+camino, con lo medido y lo descartado, está en
+`vasak-desktop-settings/docs/permisos-de-medios.md`.

@@ -9,6 +9,7 @@ mod aviso;
 mod dialog;
 mod locales;
 mod mas_tarde;
+mod politica;
 mod portal;
 mod portal_screencast;
 mod service;

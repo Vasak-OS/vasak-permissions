@@ -267,10 +267,7 @@ fn correr_parser(argumentos: &[&str], archivo: &std::path::Path) -> Result<(), S
 /// Sólo los que el perfil general niega: el resto no se representa en AppArmor,
 /// así que ponerlo en la excepción no cambiaría nada y confundiría a quien lea
 /// el archivo.
-pub fn permitidos_de(
-    policy: &crate::policy::UserPolicy,
-    binary_path: &str,
-) -> Vec<Resource> {
+pub fn permitidos_de(policy: &crate::policy::UserPolicy, binary_path: &str) -> Vec<Resource> {
     NEGACIONES
         .iter()
         .map(|(recurso, _)| recurso)
@@ -387,7 +384,11 @@ mod tests {
 
     #[test]
     fn el_perfil_engancha_la_ruta_exacta_y_no_niega_nada() {
-        let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
+        let perfil = perfil_para(
+            "/home/alguien/Apps/cosa.AppImage",
+            &[Resource::Camera, Resource::Microphone],
+        )
+        .unwrap();
         assert!(perfil.contains(r#""/home/alguien/Apps/cosa.AppImage""#));
         assert!(perfil.contains("file,"));
     }
@@ -395,7 +396,11 @@ mod tests {
     /// El caso real: el AppImage del equipo de pruebas tiene espacios.
     #[test]
     fn una_ruta_con_espacios_se_acepta_y_queda_entre_comillas() {
-        let perfil = perfil_para("/home/pato/Apps/App Monitor_0.1.0.AppImage", &[Resource::Camera, Resource::Microphone]).unwrap();
+        let perfil = perfil_para(
+            "/home/pato/Apps/App Monitor_0.1.0.AppImage",
+            &[Resource::Camera, Resource::Microphone],
+        )
+        .unwrap();
         assert!(perfil.contains(r#""/home/pato/Apps/App Monitor_0.1.0.AppImage""#));
     }
 
@@ -480,14 +485,28 @@ mod tests {
     #[test]
     fn las_rutas_que_romperian_la_sintaxis_se_rechazan() {
         assert!(perfil_para("/home/x/co\"sa.AppImage", &[]).is_err());
-        assert!(perfil_para("/home/x/co\\sa.AppImage", &[Resource::Camera, Resource::Microphone]).is_err());
-        assert!(perfil_para("/home/x/dos\nlineas", &[Resource::Camera, Resource::Microphone]).is_err());
+        assert!(perfil_para(
+            "/home/x/co\\sa.AppImage",
+            &[Resource::Camera, Resource::Microphone]
+        )
+        .is_err());
+        assert!(perfil_para(
+            "/home/x/dos\nlineas",
+            &[Resource::Camera, Resource::Microphone]
+        )
+        .is_err());
     }
 
     #[test]
     fn una_ruta_relativa_no_sirve_de_enganche() {
-        assert_eq!(perfil_para("cosa.AppImage", &[Resource::Camera, Resource::Microphone]), Err(Motivo::NoEsAbsoluta));
-        assert_eq!(perfil_para("", &[Resource::Camera, Resource::Microphone]), Err(Motivo::NoEsAbsoluta));
+        assert_eq!(
+            perfil_para("cosa.AppImage", &[Resource::Camera, Resource::Microphone]),
+            Err(Motivo::NoEsAbsoluta)
+        );
+        assert_eq!(
+            perfil_para("", &[Resource::Camera, Resource::Microphone]),
+            Err(Motivo::NoEsAbsoluta)
+        );
     }
 
     /// Dos rutas distintas no pueden compartir nombre de perfil: la segunda
@@ -507,8 +526,32 @@ mod tests {
     fn el_nombre_no_lleva_caracteres_raros() {
         let nombre = nombre_de("/home/pato/Apps/App Monitor_0.1.0.AppImage");
         assert!(
-            nombre.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+            nombre
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
             "el nombre del perfil quedó con caracteres que AppArmor no acepta: {nombre}"
+        );
+    }
+
+    /// Una identidad del portal no puede tener perfil, y eso es correcto.
+    ///
+    /// Esta prueba existe para sostener la rama que `set_permission` tiene del
+    /// otro lado. `portal:com.google.Chrome` no es una ruta absoluta, así que
+    /// acá se rechaza —bien rechazado: no hay archivo al que enganchar un
+    /// perfil—. Pero si el camino de la pantalla no la saltara antes de llegar,
+    /// ese rechazo volvería como «no se pudo guardar la decisión» y el
+    /// interruptor de Configuración fallaría siempre.
+    ///
+    /// O sea: el día que alguien saque esa rama, esto sigue en verde y la
+    /// pantalla se rompe. Por eso el comentario está en los dos lados.
+    #[test]
+    fn una_identidad_del_portal_no_tiene_perfil() {
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+
+        assert_eq!(
+            perfil_para(&key, &[Resource::Camera]),
+            Err(Motivo::NoEsAbsoluta)
         );
     }
 }

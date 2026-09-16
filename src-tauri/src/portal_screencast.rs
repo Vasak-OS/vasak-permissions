@@ -52,6 +52,9 @@ pub const WLR_PATH: &str = "/org/freedesktop/portal/desktop";
 const SCREENCAST_IFACE: &str = "org.freedesktop.impl.portal.ScreenCast";
 const SESSION_IFACE: &str = "org.freedesktop.impl.portal.Session";
 
+/// Lo que esta interfaz pide, con el nombre que usa la política.
+const RECURSO: &str = "screen-capture";
+
 const RESPONSE_GRANTED: u32 = 0;
 const RESPONSE_CANCELLED: u32 = 1;
 /// Algo salió mal y no fue la persona quien dijo que no.
@@ -178,7 +181,10 @@ impl<R: Runtime> ScreenCastBackend<R> {
             body: traducir(&app, "screencast.body"),
         };
 
-        if !crate::dialog::ask(&app, Question::Portal(pregunta)).await {
+        // Acá el recurso no hay que deducirlo: esta interfaz es la captura de
+        // pantalla y nada más, así que se nombra y se guarda siempre.
+        if !crate::politica::decidir(&app, &app_id, Some(RECURSO), Question::Portal(pregunta)).await
+        {
             return (RESPONSE_CANCELLED, vacio());
         }
 

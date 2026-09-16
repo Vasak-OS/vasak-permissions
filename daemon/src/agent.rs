@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use vasak_permissions_protocol::{
-    PermissionRequest, AGENT_BINARY, AGENT_INTERFACE,
-};
+use vasak_permissions_protocol::{PermissionRequest, AGENT_BINARY, AGENT_INTERFACE};
 
 /// How long to wait for someone to answer the dialog.
 ///
@@ -88,7 +86,6 @@ impl AgentRegistry {
     }
 }
 
-
 /// Whether this executable is the installed agent.
 ///
 /// The comparison is against one absolute path and nothing else. Matching on
@@ -96,7 +93,7 @@ impl AgentRegistry {
 /// the user's home called `vasak-permissions-agent` register itself and
 /// approve its own requests — which is the one thing this must prevent.
 #[cfg(not(debug_assertions))]
-fn is_the_agent(binary_path: &str) -> bool {
+pub(crate) fn is_the_agent(binary_path: &str) -> bool {
     binary_path == AGENT_BINARY
 }
 
@@ -104,7 +101,7 @@ fn is_the_agent(binary_path: &str) -> bool {
 /// dialog can be exercised from a working copy. Compiled out of release
 /// entirely rather than guarded at runtime.
 #[cfg(debug_assertions)]
-fn is_the_agent(binary_path: &str) -> bool {
+pub(crate) fn is_the_agent(binary_path: &str) -> bool {
     if binary_path == AGENT_BINARY {
         return true;
     }
@@ -308,10 +305,20 @@ mod tests {
         // The whole security of the prompt rests on this: a program the user
         // can write could otherwise register and approve everything itself.
         assert!(registry
-            .register(1000, "/home/someone/fake-agent", ":1.42".into(), "/x".into())
+            .register(
+                1000,
+                "/home/someone/fake-agent",
+                ":1.42".into(),
+                "/x".into()
+            )
             .is_err());
         assert!(registry
-            .register(1000, "/usr/bin/some-other-program", ":1.42".into(), "/x".into())
+            .register(
+                1000,
+                "/usr/bin/some-other-program",
+                ":1.42".into(),
+                "/x".into()
+            )
             .is_err());
 
         assert!(registry
