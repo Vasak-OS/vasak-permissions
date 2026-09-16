@@ -134,6 +134,11 @@ impl AccessBackend {
 /// that one is the *system* bus, and the portal only ever looks on the session
 /// bus. One process, two buses, because the two jobs live in different places.
 pub async fn serve(app: MasTarde) -> Result<zbus::Connection, String> {
+    // Un solo registro para las tres piezas: el backend lo llena al empezar
+    // una captura, la sesión lo vacía al cerrarse, y el servicio lo lee. Es un
+    // `Arc` adentro, así que las copias son el mismo registro.
+    let capturas = crate::capturas::Registro::nuevo();
+
     zbus::connection::Builder::session()
         .map_err(|e| format!("no se pudo abrir el bus de sesión: {e}"))?
         .name(BACKEND_NAME)
@@ -144,9 +149,24 @@ pub async fn serve(app: MasTarde) -> Result<zbus::Connection, String> {
         // portal busca todas las interfaces de un backend ahí.
         .serve_at(
             BACKEND_PATH,
-            crate::portal_screencast::ScreenCastBackend { app },
+            crate::portal_screencast::ScreenCastBackend {
+                app,
+                capturas: capturas.clone(),
+            },
         )
         .map_err(|e| format!("no se pudo publicar el backend de captura: {e}"))?
+        // Y aparte, en su propio camino, lo que el panel consulta: qué se está
+        // capturando ahora mismo. No va en `BACKEND_PATH` a propósito — ahí
+        // viven las interfaces que el portal espera encontrar, y esta no es
+        // una de ellas.
+        .serve_at(
+            crate::capturas::RUTA,
+            crate::capturas::ServicioDeCapturas {
+                registro: capturas,
+                wlr: crate::portal_screencast::WLR_NAME,
+            },
+        )
+        .map_err(|e| format!("no se pudo publicar el servicio de capturas: {e}"))?
         .build()
         .await
         .map_err(|e| format!("no se pudo conectar al bus de sesión: {e}"))

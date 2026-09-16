@@ -6,6 +6,7 @@
 //! of times in the life of an installation.
 
 mod aviso;
+mod capturas;
 mod dialog;
 mod locales;
 mod mas_tarde;
