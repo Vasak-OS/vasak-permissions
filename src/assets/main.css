@@ -4,6 +4,12 @@
    donde no hay ninguno: ninguna de las dos declaraciones puede pisar a la otra. */
 @import "tailwindcss";
 
+/* Tailwind v4 no mira dentro de `node_modules`, así que las clases que sólo
+   existen en los componentes de la librería compartida —el marco de la
+   ventana— no llegan nunca a la hoja de estilos: la ventana abre con el marcado
+   puesto y sin ninguna de sus reglas. */
+@source "../../node_modules/@vasakgroup/vue-libvasak/dist";
+
 :root {
   /* general */
   --corner-radius: 10px;

@@ -2,6 +2,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
+import { WindowFrame } from '@vasakgroup/vue-libvasak';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { esRecursoConocido } from '@/resources';
 import type { Question } from '@/types/permissions';
@@ -80,76 +81,84 @@ onUnmounted(() => unlistenFocus?.());
 </script>
 
 <template>
-	<div
-		class="h-screen w-screen select-none rounded-corner-window border border-ui-border bg-ui-bg/80 p-6 flex flex-col gap-4"
-	>
-		<template v-if="title">
-			<div class="flex flex-col gap-2">
-				<h1 class="text-lg font-semibold text-tx-main">{{ title }}</h1>
-				<p v-if="explanation" class="text-sm text-tx-muted">{{ explanation }}</p>
-			</div>
+	<!-- El marco es el compartido. Este diálogo aparece encima de lo que sea que
+	     estés haciendo, así que es donde más se nota si el borde, la esquina o
+	     el fondo no son los mismos que los de la ventana que tiene debajo.
 
-			<p v-if="portal && portal.body && portal.subtitle" class="text-sm text-tx-main">
-				{{ portal.body }}
-			</p>
-			<p v-else-if="permission && permission.detail" class="text-sm text-tx-main">
-				{{ permission.detail }}
-			</p>
+	     Sin barra, y por lo tanto sin los tres botones: acá la ventana se
+	     responde, no se cierra. Un botón de cerrar sería una salida que deja
+	     esperando para siempre al programa que pidió el permiso, y además dejaría
+	     la pregunta sin respuesta sin que nadie se entere. -->
+	<WindowFrame hide-bar>
+		<div class="flex min-w-0 flex-1 select-none flex-col gap-4 p-6">
+			<template v-if="title">
+				<div class="flex flex-col gap-2">
+					<h1 class="text-lg font-semibold text-tx-main">{{ title }}</h1>
+					<p v-if="explanation" class="text-sm text-tx-muted">{{ explanation }}</p>
+				</div>
 
-			<template v-if="permission">
-				<!-- The user is deciding based on which program is asking, so being
-				     honest about how sure we are is the point, not a detail. -->
-				<p
-					v-if="permission.application.provenance === 'unverified'"
-					class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
-				>
-					{{ t('dialog.unverified') }}
-					<span
-						class="mt-1 line-clamp-2 break-all opacity-80"
+				<p v-if="portal && portal.body && portal.subtitle" class="text-sm text-tx-main">
+					{{ portal.body }}
+				</p>
+				<p v-else-if="permission && permission.detail" class="text-sm text-tx-main">
+					{{ permission.detail }}
+				</p>
+
+				<template v-if="permission">
+					<!-- The user is deciding based on which program is asking, so being
+					     honest about how sure we are is the point, not a detail. -->
+					<p
+						v-if="permission.application.provenance === 'unverified'"
+						class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
+					>
+						{{ t('dialog.unverified') }}
+						<span
+							class="mt-1 line-clamp-2 break-all opacity-80"
+							:title="permission.application.binary_path"
+						>
+							{{ permission.application.binary_path }}
+						</span>
+					</p>
+					<p
+						v-else
+						class="line-clamp-2 break-all text-xs text-tx-muted"
 						:title="permission.application.binary_path"
 					>
 						{{ permission.application.binary_path }}
-					</span>
+					</p>
+				</template>
+
+				<!-- Nothing to name: the portal passes an app_id that is empty for
+				     anything outside a sandbox, which is nearly everything here. -->
+				<p v-else-if="portal" class="text-xs text-tx-muted">
+					<span v-if="portal.app_id">{{ portal.app_id }}</span>
+					<span v-else>{{ t('dialog.unknownRequester') }}</span>
 				</p>
-				<p
-					v-else
-					class="line-clamp-2 break-all text-xs text-tx-muted"
-					:title="permission.application.binary_path"
-				>
-					{{ permission.application.binary_path }}
-				</p>
+
+				<div class="mt-auto flex justify-end gap-2">
+					<!-- Refusing is the default action: it is the reversible one, and
+					     the safe answer for someone who is not sure. -->
+					<button
+						type="button"
+						:disabled="answering"
+						autofocus
+						class="rounded-corner border border-ui-border px-4 py-2 text-sm text-tx-main hover:bg-ui-surface disabled:opacity-50"
+						@click="answer(false)"
+					>
+						{{ t('dialog.deny') }}
+					</button>
+					<button
+						type="button"
+						:disabled="answering"
+						class="rounded-corner bg-primary px-4 py-2 text-sm font-semibold text-tx-on-primary hover:bg-secondary disabled:opacity-50"
+						@click="answer(true)"
+					>
+						{{ t('dialog.allow') }}
+					</button>
+				</div>
 			</template>
 
-			<!-- Nothing to name: the portal passes an app_id that is empty for
-			     anything outside a sandbox, which is nearly everything here. -->
-			<p v-else-if="portal" class="text-xs text-tx-muted">
-				<span v-if="portal.app_id">{{ portal.app_id }}</span>
-				<span v-else>{{ t('dialog.unknownRequester') }}</span>
-			</p>
-
-			<div class="mt-auto flex justify-end gap-2">
-				<!-- Refusing is the default action: it is the reversible one, and
-				     the safe answer for someone who is not sure. -->
-				<button
-					type="button"
-					:disabled="answering"
-					autofocus
-					class="rounded-corner border border-ui-border px-4 py-2 text-sm text-tx-main hover:bg-ui-surface disabled:opacity-50"
-					@click="answer(false)"
-				>
-					{{ t('dialog.deny') }}
-				</button>
-				<button
-					type="button"
-					:disabled="answering"
-					class="rounded-corner bg-primary px-4 py-2 text-sm font-semibold text-tx-on-primary hover:bg-secondary disabled:opacity-50"
-					@click="answer(true)"
-				>
-					{{ t('dialog.allow') }}
-				</button>
-			</div>
-		</template>
-
-		<p v-else class="m-auto text-sm text-tx-muted">{{ t('dialog.empty') }}</p>
-	</div>
+			<p v-else class="m-auto text-sm text-tx-muted">{{ t('dialog.empty') }}</p>
+		</div>
+	</WindowFrame>
 </template>
