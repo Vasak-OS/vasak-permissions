@@ -1,12 +1,13 @@
 {
   "name": "vasak-permissions-agent",
   "private": true,
-  "version": "0.9.0",
+  "version": "0.9.1",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
-    "build": "bunx --bun vue-tsc --noEmit && bunx --bun vite build",
+    "build": "bunx vue-tsc --noEmit && bunx --bun vite build",
     "preview": "bunx --bun vite preview",
+    "test": "bun test",
     "tauri": "tauri",
     "lint": "bunx --bun biome check .",
     "lint:fix": "bunx --bun biome check --write . && bunx --bun biome format --write .",
