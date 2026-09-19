@@ -1,7 +1,7 @@
 {
   "name": "vasak-permissions-agent",
   "private": true,
-  "version": "0.9.1",
+  "version": "0.10.0",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
@@ -18,8 +18,9 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-shell": "^2.3.6",
     "@vasakgroup/plugin-config-manager": "^2.5.0",
-    "@vasakgroup/tauri-plugin-i18n": "^2.3.0",
     "@vasakgroup/plugin-vicons": "^2.1.2",
+    "@vasakgroup/tauri-plugin-i18n": "^2.3.0",
+    "@vasakgroup/vue-libvasak": "^0.6.0",
     "path": "^0.12.7",
     "pinia": "^3.0.4",
     "url": "^0.11.4",
@@ -27,10 +28,13 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.12",
+    "@happy-dom/global-registrator": "^20.14.5",
     "@tailwindcss/postcss": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^25.9.5",
     "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.5.1",
+    "happy-dom": "^20.14.5",
     "postcss": "^8.5.28",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
