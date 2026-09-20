@@ -39,8 +39,27 @@ import { fileURLToPath } from 'node:url';
 // un checkout en una ruta con espacios mandaría a `Bun.Glob`, `Bun.file` y
 // `Bun.spawn` a una carpeta que no existe.
 const raiz = fileURLToPath(new URL('..', import.meta.url));
+/** Este mismo archivo, relativo a la raíz. */
+const propio = fileURLToPath(import.meta.url).slice(raiz.length);
 
-const fuentes = await Array.fromAsync(new Bun.Glob('src/**/*.{ts,d.ts,vue}').scan({ cwd: raiz }));
+/**
+ * Todo lo que el chequeo de tipos mira, no sólo `src`.
+ *
+ * El `tsconfig` de la raíz incluye también `tests/**` y los `.tsx`, y el de
+ * node los archivos de configuración sueltos. Una declaración puesta en
+ * cualquiera de esos lugares tapa los tipos igual, y con un patrón más angosto
+ * las dos pruebas de abajo pasarían sin haberla visto. Lo marcó la revisión.
+ */
+const fuentes = (
+	await Promise.all(
+		['src/**/*.{ts,tsx,mts,cts,vue}', 'tests/**/*.{ts,tsx,vue}', '*.{ts,mts,cts}'].map(
+			async (patron) => await Array.fromAsync(new Bun.Glob(patron).scan({ cwd: raiz }))
+		)
+	)
+).flat()
+	// Menos este archivo. Los patrones que busca los lleva escritos adentro,
+	// así que al ampliar el escaneo a `tests/` empezó a encontrarse a sí mismo.
+	.filter((ruta) => ruta !== propio);
 
 async function conteniendo(patron: RegExp): Promise<string[]> {
 	const hallados: string[] = [];
@@ -67,6 +86,11 @@ describe('los tipos de la librería', () => {
 		// la lista viene vacía —una `raiz` mal armada y no hay nada que mirar—.
 		expect(fuentes).toContain('src/vite-env.d.ts');
 		expect(fuentes).toContain('src/main.ts');
+		// Y que los tres patrones traigan algo: el de `tests` y el de la raíz se
+		// sumaron porque el de `src` solo dejaba huecos, y un patrón que no
+		// encuentra nada los deja igual.
+		expect(fuentes.some((ruta) => ruta.startsWith('tests/'))).toBe(true);
+		expect(fuentes).toContain('vite.config.ts');
 		expect(fuentes.length).toBeGreaterThan(3);
 	});
 
@@ -99,35 +123,52 @@ describe('los tipos de la librería', () => {
 		expect(Bun.semver.satisfies(instalada, '>=0.6.0')).toBe(true);
 	});
 
-	test('y se comprueban: el uso correcto pasa', async () => {
+	test('y se comprueban: los dos usos correctos pasan', async () => {
 		const { codigo, salida } = await chequear('tests/fixtures/tsconfig.json');
 
 		expect(salida).toBe('');
 		expect(codigo).toBe(0);
 	}, 120_000);
 
+	// El último caso es sobre un componente **propio** y no de la librería: las
+	// dos cosas se rompen por caminos distintos, y sin él una regresión que
+	// dejara de mirar lo propio pasaría desapercibida. Lo marcó la revisión.
 	test.each([
-		['una propiedad con el tipo cambiado', ':title="\'Escritorio\'"', ':title="42"'],
-		['una bandera que no es booleana', ':hide-bar="false"', ':hide-bar="\'no\'"'],
+		['UsoDeLaLibreria.vue', 'una propiedad con el tipo cambiado', ':title="\'Escritorio\'"', ':title="42"'],
+		['UsoDeLaLibreria.vue', 'una bandera que no es booleana', ':hide-bar="false"', ':hide-bar="\'no\'"'],
 		[
+			'UsoDeLaLibreria.vue',
 			'un componente que no existe',
 			'import { WindowFrame }',
 			'import { WindowFrame, NoExiste }',
 		],
-	])('y se comprueban: %s falla', async (_caso, busca, pone) => {
-		const fuente = await Bun.file(`${raiz}tests/fixtures/UsoDeLaLibreria.vue`).text();
+		['UsoDelPropio.vue', 'una propiedad de un componente propio', ':etiqueta="\'aceptar\'"', ':etiqueta="42"'],
+	])('y se comprueban: %s, %s falla', async (archivo, _caso, busca, pone) => {
+		const fuente = await Bun.file(`${raiz}tests/fixtures/${archivo}`).text();
 		// Si la sustitución no encuentra nada se estaría comprobando el fixture
 		// bueno, que pasa: la prueba mentiría diciendo que el chequeo no tiene
 		// dientes cuando el error está acá.
 		expect(fuente).toContain(busca);
 
+		// La carpeta entera, con el archivo elegido saboteado: los fixtures se
+		// importan entre ellos, así que copiar uno solo dejaría el chequeo
+		// fallando por un import que no existe en vez de por el tipo.
+		// `Bun.write` crea los directorios padre, así que no hace falta `mkdir`.
 		const carpeta = `${raiz}tests/fixtures/.sabotaje-${Bun.randomUUIDv7()}`;
 		try {
-			await Bun.write(`${carpeta}/UsoDeLaLibreria.vue`, fuente.replace(busca, pone));
-			await Bun.write(
-				`${carpeta}/tsconfig.json`,
-				await Bun.file(`${raiz}tests/fixtures/tsconfig.json`).text(),
-			);
+			for (const nombre of [
+				'UsoDeLaLibreria.vue',
+				'UsoDelPropio.vue',
+				'ComponentePropio.vue',
+				'tsconfig.json',
+			]) {
+				await Bun.write(
+					`${carpeta}/${nombre}`,
+					nombre === archivo
+						? fuente.replace(busca, pone)
+						: await Bun.file(`${raiz}tests/fixtures/${nombre}`).text(),
+				);
+			}
 
 			const { codigo, salida } = await chequear(
 				`tests/fixtures/${carpeta.split('/').pop()}/tsconfig.json`,
@@ -136,7 +177,7 @@ describe('los tipos de la librería', () => {
 			// En el componente y con posición: un tsconfig que no mire nada
 			// también termina con error —«No inputs were found»—, y daría por
 			// buena la prueba sin haber comprobado el uso.
-			expect(salida).toMatch(/UsoDeLaLibreria\.vue\(\d+,\d+\): error TS\d+/);
+			expect(salida).toMatch(new RegExp(`${archivo.replace('.', '\\.')}\\(\\d+,\\d+\\): error TS\\d+`));
 			expect(codigo).not.toBe(0);
 		} finally {
 			await Bun.$`rm -rf ${carpeta}`.quiet();

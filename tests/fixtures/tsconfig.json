@@ -9,5 +9,5 @@
     "noEmit": true,
     "jsx": "preserve"
   },
-  "include": ["UsoDeLaLibreria.vue"]
+  "include": ["UsoDeLaLibreria.vue", "UsoDelPropio.vue", "ComponentePropio.vue"]
 }
