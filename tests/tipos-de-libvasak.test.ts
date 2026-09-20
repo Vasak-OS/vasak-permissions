@@ -251,7 +251,10 @@ describe('el chequeo de las plantillas', () => {
 		// forma.
 		const declaracion = await Bun.file(`${raiz}src/tipos-de-plantilla.d.ts`).text();
 
-		expect(declaracion).toContain('data-${string}');
+		// Con una expresión regular y no con `toContain`: escrito como cadena,
+		// `'data-${string}'` hace que el linter avise de un marcador de
+		// plantilla que no se interpola, y no es eso lo que pasa.
+		expect(declaracion).toMatch(/\[atributo: `data-\$\{string\}`\]/);
 		expect(declaracion).toContain("declare module 'vue'");
 	});
 });
