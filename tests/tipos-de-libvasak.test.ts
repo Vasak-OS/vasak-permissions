@@ -184,3 +184,74 @@ describe('los tipos de la librería', () => {
 		}
 	}, 120_000);
 });
+
+/**
+ * El `tsconfig` sin sus comentarios, listo para `JSON.parse`.
+ *
+ * Es JSONC, así que `.json()` se cae con «Unrecognized token '/'». Y quitar los
+ * comentarios con una expresión regular tampoco alcanza: el alias `"@/*"` lleva
+ * un `/*` adentro de las comillas, y el quitador se come desde ahí hasta el
+ * próximo `*​/`, dejando el JSON partido. Por eso este recorre el texto sabiendo
+ * cuándo está dentro de una cadena.
+ */
+async function leerTsconfig(): Promise<{
+	vueCompilerOptions?: { strictTemplates?: boolean };
+}> {
+	const crudo = await Bun.file(`${raiz}tsconfig.json`).text();
+	let salida = '';
+	let enCadena = false;
+	let escapado = false;
+	for (let i = 0; i < crudo.length; i++) {
+		const caracter = crudo[i];
+		if (enCadena) {
+			salida += caracter;
+			if (escapado) escapado = false;
+			else if (caracter === '\\') escapado = true;
+			else if (caracter === '"') enCadena = false;
+			continue;
+		}
+		if (caracter === '"') {
+			enCadena = true;
+			salida += caracter;
+			continue;
+		}
+		if (caracter === '/' && crudo[i + 1] === '/') {
+			while (i < crudo.length && crudo[i] !== '\n') i++;
+			salida += '\n';
+			continue;
+		}
+		if (caracter === '/' && crudo[i + 1] === '*') {
+			i += 2;
+			while (i < crudo.length && !(crudo[i] === '*' && crudo[i + 1] === '/')) i++;
+			i++;
+			continue;
+		}
+		salida += caracter;
+	}
+	return JSON.parse(salida);
+}
+
+describe('el chequeo de las plantillas', () => {
+	test('mira cada atributo, no sólo los que reconoce', async () => {
+		// Sin `strictTemplates`, `vue-tsc` comprueba el tipo de las propiedades
+		// que **sí** existen y no dice nada de una que no existe, de un evento
+		// que el componente no emite, ni de un atributo inventado sobre un
+		// elemento. Un `@click` sobre un componente sin `defineEmits` funciona
+		// por caída de atributos y nunca se nota; un `:size` sobre un `<img>` no
+		// hace nada y tampoco.
+		const tsconfig = await leerTsconfig();
+
+		expect(tsconfig.vueCompilerOptions?.strictTemplates).toBe(true);
+	});
+
+	test('y los `data-*` siguen permitidos, que es la excepción legítima', async () => {
+		// HTML los permite todos, y acá marcan nodos que después se buscan con
+		// `closest()` o `querySelector()`. Declararlos uno por uno deja la lista
+		// vieja en cuanto alguien marca un nodo nuevo, así que se declara la
+		// forma.
+		const declaracion = await Bun.file(`${raiz}src/tipos-de-plantilla.d.ts`).text();
+
+		expect(declaracion).toContain('data-${string}');
+		expect(declaracion).toContain("declare module 'vue'");
+	});
+});
