@@ -2,7 +2,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
-import { WindowFrame } from '@vasakgroup/vue-libvasak';
+import { AlertMessage, WindowFrame } from '@vasakgroup/vue-libvasak';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { esRecursoConocido } from '@/resources';
 import type { Question } from '@/types/permissions';
@@ -106,19 +106,25 @@ onUnmounted(() => unlistenFocus?.());
 
 				<template v-if="permission">
 					<!-- The user is deciding based on which program is asking, so being
-					     honest about how sure we are is the point, not a detail. -->
-					<p
+					     honest about how sure we are is the point, not a detail.
+
+					     En el aviso del sistema: el borde y el fondo eran los mismos
+					     valores escritos a mano, y el icono es lo que hace mirar. Acá
+					     el aviso puede estar diciendo que un programa sin firmar pide
+					     la cámara, así que mirarlo no es opcional. -->
+					<AlertMessage
 						v-if="permission.application.provenance === 'unverified'"
-						class="rounded-corner border border-status-warning/40 bg-status-warning/10 p-2 text-xs text-status-warning"
+						tone="warning"
+						icon="dialog-warning"
+						:title="t('dialog.unverified')"
 					>
-						{{ t('dialog.unverified') }}
 						<span
-							class="mt-1 line-clamp-2 break-all opacity-80"
+							class="line-clamp-2 break-all text-xs opacity-80"
 							:title="permission.application.binary_path"
 						>
 							{{ permission.application.binary_path }}
 						</span>
-					</p>
+					</AlertMessage>
 					<p
 						v-else
 						class="line-clamp-2 break-all text-xs text-tx-muted"

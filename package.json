@@ -1,7 +1,7 @@
 {
   "name": "vasak-permissions-agent",
   "private": true,
-  "version": "0.10.5",
+  "version": "0.11.0",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
@@ -17,22 +17,22 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-shell": "^2.3.6",
-    "@vasakgroup/plugin-config-manager": "^2.5.0",
-    "@vasakgroup/plugin-vicons": "^2.1.2",
+    "@vasakgroup/plugin-config-manager": "^2.6.0",
+    "@vasakgroup/plugin-vicons": "^2.2.0",
     "@vasakgroup/tauri-plugin-i18n": "^2.3.0",
-    "@vasakgroup/vue-libvasak": "^0.7.2",
+    "@vasakgroup/vue-libvasak": "^0.19.0",
     "path": "^0.12.7",
     "pinia": "^3.0.4",
     "url": "^0.11.4",
-    "vue": "^3.5.42"
+    "vue": "^3.5.43"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.12",
+    "@biomejs/biome": "^2.5.14",
     "@happy-dom/global-registrator": "^20.14.5",
     "@tailwindcss/postcss": "^4.3.3",
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "^2.11.5",
     "@types/node": "^25.9.5",
-    "@vitejs/plugin-vue": "^6.0.8",
+    "@vitejs/plugin-vue": "^6.0.9",
     "@vue/test-utils": "^2.5.1",
     "happy-dom": "^20.14.5",
     "postcss": "^8.5.28",

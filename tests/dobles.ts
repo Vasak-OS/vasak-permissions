@@ -51,12 +51,12 @@ export function olvidarTodo() {
 }
 
 /** El tema de iconos. El marco pide los de los botones de ventana. */
-export async function getIconSource(_nombre: string) {
-	return '';
+export async function getIconSource(nombre: string) {
+	return `icono:${nombre}`;
 }
 
-export async function getSymbolSource(_nombre: string) {
-	return '';
+export async function getSymbolSource(nombre: string) {
+	return `simbolo:${nombre}`;
 }
 
 /** El aviso de que cambió el tema de iconos, que el marco escucha. */
