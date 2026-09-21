@@ -311,6 +311,67 @@ impl PermissionService {
             .await
     }
 
+    /// Lo que ya se decidió para otro proceso, **sin preguntar nada**.
+    ///
+    /// `CheckPermissionFor` no sirve para hacer cumplir un permiso desde un
+    /// punto que no es una acción de la persona. Ese método pregunta cuando no
+    /// sabe, y quien hace cumplir suele enterarse en el peor momento para
+    /// preguntar: el módulo de WirePlumber ve a cada cliente **al conectarse**,
+    /// y «¿le permitís la cámara a pactl?» no es una pregunta que alguien
+    /// pueda contestar. Preguntarla en cada conexión enseñaría a conceder sin
+    /// leer, que es exactamente lo que este servicio existe para no hacer.
+    ///
+    /// Así que acá se lee y no se pregunta: devuelve `allowed`, `denied` o
+    /// `unknown`, no abre diálogo y **no guarda nada**. Quien pregunta con
+    /// contexto es el portal, que sabe qué aplicación lo pidió y para qué.
+    ///
+    /// `unknown` no es «permitido»: quien llame tiene que tratarlo como
+    /// negado. Se devuelve aparte de `denied` porque son cosas distintas —una
+    /// es una decisión de la persona y la otra es que todavía no la tomó— y la
+    /// pantalla de Privacidad y seguridad las muestra distinto.
+    async fn query_permission_for(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        subject_pid: u32,
+        subject_start_time: u64,
+        resource_id: String,
+    ) -> zbus::fdo::Result<String> {
+        let delegate = caller_of(connection, &header).await?;
+        if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
+            return Err(FdoError::AccessDenied(format!(
+                "{} no puede consultar permisos en nombre de otro proceso",
+                delegate.binary_path()
+            )));
+        }
+
+        let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
+            .map_err(FdoError::InvalidArgs)?;
+
+        check_resource(&resource_id, &subject.binary_path())?;
+
+        if !crate::identity::delegate_may_speak_for(delegate.uid, subject.uid) {
+            return Err(FdoError::AccessDenied(
+                "el proceso indicado pertenece a otro usuario".into(),
+            ));
+        }
+
+        // Fuera del alcance declarado no hay nada que leer: es «no», igual que
+        // en `decide`, y por el mismo motivo — que el gestor de archivos pida
+        // el correo es un fallo o un ataque, no una decisión pendiente.
+        if !vasak_permissions_protocol::may_request(&subject.binary_path(), &resource_id) {
+            return Ok(Decision::Denied.as_id().to_string());
+        }
+
+        let stored = self
+            .store
+            .load(subject.uid)
+            .map_err(FdoError::Failed)?
+            .decision(&subject.binary_path(), &resource_id);
+
+        Ok(stored.as_id().to_string())
+    }
+
     /// Everything decided for the calling user, as JSON, for the settings
     /// screen. A caller only ever sees its own user's policy.
     async fn list_permissions(
@@ -874,6 +935,71 @@ mod tests_interfaz {
         );
         assert_eq!(entradas(&anotar), vec!["s", "s", "b"], "{anotar}");
         assert!(salidas(&anotar).is_empty(), "{anotar}");
+    }
+
+    /// El método que lee la política sin preguntar existe y se llama como el
+    /// módulo de WirePlumber cree.
+    ///
+    /// Ese módulo está escrito en C, no comparte nada de este código y lo
+    /// nombra por una cadena. Un renombre de este lado compila perfecto y lo
+    /// deja llamando a un método que no existe. Y como el módulo **falla
+    /// cerrando**, eso no se vería como un error: se vería como la cámara
+    /// apagada para todo el mundo, sin que nada diga por qué.
+    #[test]
+    fn la_consulta_sin_preguntar_se_llama_como_el_modulo_cree() {
+        let xml = introspeccion();
+        let metodo = vasak_permissions_protocol::QUERY_PERMISSION_FOR_METHOD;
+
+        assert!(
+            xml.contains(&format!(r#"<method name="{metodo}">"#)),
+            "la interfaz no exporta {metodo}:\n{xml}"
+        );
+    }
+
+    /// Y con la firma que el módulo arma: pid, instante de arranque y recurso;
+    /// contesta una cadena.
+    ///
+    /// La cadena es a propósito y es la misma razón que en `PortalDecision`:
+    /// si contestara un booleano habría que convertir «todavía no se decidió»
+    /// en un «no», y se perdería la diferencia entre lo que la persona decidió
+    /// y lo que nunca se le preguntó. El módulo trata las dos igual —niega—,
+    /// pero la pantalla de Privacidad y seguridad no.
+    ///
+    /// El instante de arranque no es decorativo: es lo que impide que un pid
+    /// reciclado apunte a otro programa entre que el cliente se conecta y que
+    /// llega la consulta.
+    #[test]
+    fn la_consulta_sin_preguntar_tiene_la_firma_que_el_modulo_arma() {
+        let xml = introspeccion();
+        let bloque = bloque_del_metodo(
+            &xml,
+            vasak_permissions_protocol::QUERY_PERMISSION_FOR_METHOD,
+        );
+
+        assert_eq!(entradas(&bloque), vec!["u", "t", "s"], "{bloque}");
+        assert_eq!(salidas(&bloque), vec!["s"], "{bloque}");
+    }
+
+    /// Y **no** se parece a `CheckPermissionFor`, que sí pregunta.
+    ///
+    /// Los dos toman pid y arranque, y confundirlos desde el módulo abriría un
+    /// diálogo por cada cliente de PipeWire que se conecta — «¿le permitís la
+    /// cámara a pactl?»—, que es justo lo que enseña a conceder sin leer. Se
+    /// distinguen por la firma: el que pregunta toma además un `detail` para
+    /// el diálogo y contesta un booleano.
+    #[test]
+    fn el_que_pregunta_y_el_que_no_no_se_pueden_confundir() {
+        let xml = introspeccion();
+
+        let pregunta = bloque_del_metodo(&xml, "CheckPermissionFor");
+        let lee = bloque_del_metodo(
+            &xml,
+            vasak_permissions_protocol::QUERY_PERMISSION_FOR_METHOD,
+        );
+
+        assert_eq!(entradas(&pregunta), vec!["u", "t", "s", "s"], "{pregunta}");
+        assert_eq!(salidas(&pregunta), vec!["b"], "{pregunta}");
+        assert_ne!(entradas(&pregunta), entradas(&lee));
     }
 
     fn bloque_del_metodo(xml: &str, metodo: &str) -> String {

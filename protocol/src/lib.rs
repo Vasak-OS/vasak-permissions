@@ -42,6 +42,16 @@ pub const AGENT_BINARY: &str = "/usr/bin/vasak-permissions-agent";
 pub const PORTAL_DECISION_METHOD: &str = "PortalDecision";
 pub const RECORD_PORTAL_DECISION_METHOD: &str = "RecordPortalDecision";
 
+/// Lo que ya se decidió, sin preguntar ni guardar nada.
+///
+/// Acá por el mismo motivo que los dos de arriba: lo llama un módulo en C
+/// —`permisos-de-medios`, en `vasak-wireplumber-modules`— que no comparte
+/// nada de este código y lo nombra por una cadena. Un renombre de este lado
+/// compila perfecto y deja al módulo llamando a un método que no existe, o sea
+/// sin poder leer la política; y como falla cerrando, la cámara se apagaría
+/// para todos sin que nada diga por qué.
+pub const QUERY_PERMISSION_FOR_METHOD: &str = "QueryPermissionFor";
+
 /// polkit action guarding every change made from the settings interface.
 ///
 /// Without it, any program could call `SetPermission` and grant itself what it
@@ -60,7 +70,18 @@ pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
 /// paths under `/usr/bin`, which needs root to write: a program the user can
 /// write cannot be one of these, and therefore cannot claim to be asking for
 /// somebody else.
-pub const DELEGATE_BINARIES: [&str; 1] = ["/usr/bin/vasak-accounts"];
+pub const DELEGATE_BINARIES: [&str; 2] = [
+    "/usr/bin/vasak-accounts",
+    // El módulo `permisos-de-medios` de WirePlumber, que corre dentro de este
+    // proceso. Le pregunta a este servicio por cada cliente de PipeWire que se
+    // conecta, y nombra al cliente por su pid.
+    //
+    // No usa `CheckPermissionFor` sino `QueryPermissionFor`: al conectar no hay
+    // contexto para preguntarle nada a nadie —«¿le permitís la cámara a
+    // pactl?» no es una pregunta que alguien pueda contestar—, así que lee lo
+    // ya decidido y no abre diálogo. Quien pregunta con contexto es el portal.
+    "/usr/bin/wireplumber",
+];
 
 #[cfg(not(debug_assertions))]
 pub fn is_delegate(binary_path: &str) -> bool {
@@ -671,6 +692,7 @@ mod delegate_tests {
     #[test]
     fn only_services_installed_by_the_system_may_ask_for_someone_else() {
         assert!(is_delegate("/usr/bin/vasak-accounts"));
+        assert!(is_delegate("/usr/bin/wireplumber"));
 
         // A program the user can write must never be able to claim it is
         // asking on another program's behalf — it would name whichever
@@ -679,6 +701,27 @@ mod delegate_tests {
         assert!(!is_delegate("/tmp/vasak-accounts"));
         assert!(!is_delegate("vasak-accounts"));
         assert!(!is_delegate("/usr/bin/anything-else"));
+        assert!(!is_delegate("/home/someone/.local/bin/wireplumber"));
+    }
+
+    /// Un delegado de más es un programa que puede hablar por cualquier otro,
+    /// así que la lista se cuenta: si crece sin que nadie lo note, esto falla y
+    /// obliga a mirar por qué.
+    #[test]
+    fn la_lista_de_delegados_no_crece_sola() {
+        assert_eq!(
+            DELEGATE_BINARIES.len(),
+            2,
+            "agregar un delegado es dejar que un programa hable por otro: \
+             que sea a propósito"
+        );
+        for delegado in DELEGATE_BINARIES {
+            assert!(
+                delegado.starts_with("/usr/bin/"),
+                "{delegado} no está bajo /usr/bin, así que el usuario podría \
+                 escribirlo y hacerse pasar por él"
+            );
+        }
     }
 }
 
