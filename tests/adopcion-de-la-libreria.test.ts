@@ -63,6 +63,27 @@ describe('el aviso de binario sin verificar', () => {
 		expect(aviso.classes().join(' ')).toContain(CLASES_POR_TONO.warning.split(' ')[0]);
 	});
 
+	test('y con icono, que es lo que hace mirar', async () => {
+		// Es la ganancia del cambio y por eso se comprueba: sacar el `icon`
+		// dejaba el aviso igual de correcto y sin lo único que hace que alguien
+		// levante la vista antes de darle la cámara a un programa sin firmar.
+		//
+		// Se mira la propiedad **y** que el icono llegue al DOM. Lo segundo no
+		// comprueba que el nombre exista en el tema de verdad —el doble resuelve
+		// cualquier nombre—, sino que la cadena entera funcione: que el aviso lo
+		// pase, que `ThemeIcon` lo resuelva y que termine dibujando un `img`.
+		// Hay que esperar porque hasta que la resolución vuelve deja un hueco.
+		const abierto = await preguntar('unverified');
+		const aviso = abierto.findComponent(AlertMessage);
+
+		expect(aviso.props('icon')).toBe('dialog-warning');
+
+		await new Promise((listo) => setTimeout(listo, 0));
+		await abierto.vm.$nextTick();
+
+		expect(aviso.find('img').exists()).toBe(true);
+	});
+
 	test('dice la ruta, que es lo único que identifica al programa', async () => {
 		// Sin nombre verificado, la ruta del binario es el único dato con el que
 		// alguien puede decidir. Si se perdiera al mudar el aviso, la pregunta
