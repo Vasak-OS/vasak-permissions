@@ -13,11 +13,16 @@
     "lint:fix": "bunx --bun biome check --write . && bunx --bun biome format --write .",
     "format": "bunx --bun biome format --write ."
   },
+  "vasak": {
+    "bibliotecasAtrasadas": {
+      "@vasakgroup/plugin-config-manager": "La 2.7.0 no cambia una línea de código —su dist es idéntico al de la 2.6.1— pero mueve pinia de dependencia a par y le pide ^4.0.0, mientras esta aplicación está en pinia 3: instalarla deja «incorrect peer dependency». Por eso el rango es ~2.6.1 y no ^2.6.1, que alcanzaría la 2.7.0. Se saca al subir a pinia 4."
+    }
+  },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-shell": "^2.3.6",
-    "@vasakgroup/plugin-config-manager": "^2.7.0",
+    "@vasakgroup/plugin-config-manager": "~2.6.1",
     "@vasakgroup/plugin-vicons": "^2.2.1",
     "@vasakgroup/tauri-plugin-i18n": "^2.3.0",
     "@vasakgroup/vue-libvasak": "^1.4.0",
