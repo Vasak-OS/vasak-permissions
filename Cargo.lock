@@ -3786,10 +3786,11 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-config-manager"
-version = "2.5.0"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cff20817a37669d89d2346de4d1c6ac3258a4d28b98924e4115cc22bd40f78b5"
+checksum = "88a5561596a6abc058c9d230373e489dafa9b119cf170525e829ae1b53da7443"
 dependencies = [
+ "dirs",
  "home",
  "notify",
  "serde",
@@ -3820,11 +3821,12 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-vicons"
-version = "2.1.2"
+version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "480910827f8ef55d24c717f3063b888bdcf5fd6ac041a01907bb7c102502e1c3"
+checksum = "b6582d78c225cf8fd9fcff2aae9eada42566ca26ba885f28e824ed90356828c4"
 dependencies = [
  "base64 0.22.1",
+ "dirs",
  "glib",
  "gtk",
  "serde",
@@ -4494,7 +4496,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-permissions-agent"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -4511,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-permissions-daemon"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "futures-util",
  "libc",
@@ -4528,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-permissions-protocol"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "serde",
 ]

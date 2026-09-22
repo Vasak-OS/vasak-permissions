@@ -20,6 +20,14 @@ jobs:
       # Este repositorio ya está al día con las bibliotecas propias, así
       # que quedarse atrás pasa a cortar en vez de sólo avisar.
       bibliotecas_cortan: true
+      # Y el candado también. La línea de arriba decía «ya está al día» siendo
+      # falso: el rango pedía `^1.0.0` —que admite la 1.4.0— y `bun.lock` se
+      # había quedado en la 1.0.0, así que se empaquetaba ésa con el CI en
+      # verde. Ahora que la comprobación existe (Vasak-OS/.github#7), se
+      # enciende acá. Para este repositorio es **la** protección: no usa ningún
+      # componente que haya cambiado, así que lo único que puede pasarle es
+      # quedarse atrás otra vez sin que nada lo diga.
+      candado_corta: true
       # El daemon y el protocolo no dependen de Tauri, así que sus pruebas
       # corren en un runner pelado. Entre ellas están las de propiedad sobre
       # los analizadores que leen el registro del kernel — que es entrada que
