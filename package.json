@@ -1,7 +1,7 @@
 {
   "name": "vasak-permissions-agent",
   "private": true,
-  "version": "0.12.0",
+  "version": "0.13.0",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
@@ -17,10 +17,10 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-shell": "^2.3.6",
-    "@vasakgroup/plugin-config-manager": "^2.6.0",
-    "@vasakgroup/plugin-vicons": "^2.2.0",
+    "@vasakgroup/plugin-config-manager": "^2.7.0",
+    "@vasakgroup/plugin-vicons": "^2.2.1",
     "@vasakgroup/tauri-plugin-i18n": "^2.3.0",
-    "@vasakgroup/vue-libvasak": "^1.0.0",
+    "@vasakgroup/vue-libvasak": "^1.4.0",
     "path": "^0.12.7",
     "pinia": "^3.0.4",
     "url": "^0.11.4",
