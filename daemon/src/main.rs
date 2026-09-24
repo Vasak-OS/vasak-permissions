@@ -33,7 +33,7 @@ use zbus::{interface, Connection};
 use agent::{AgentRegistry, SharedAgents};
 use identity::PinnedCaller;
 use policy::PolicyStore;
-use throttle::PromptThrottle;
+use throttle::{NoticeThrottle, PromptThrottle};
 use vasak_permissions_protocol::{
     Decision, PermissionRequest, Resource, SERVICE_INTERFACE, SERVICE_NAME, SERVICE_PATH,
 };
@@ -48,6 +48,12 @@ struct PermissionService {
     write_lock: Arc<Mutex<()>>,
     /// Ceiling on how many dialogs a person can be shown at once.
     throttle: Arc<Mutex<PromptThrottle>>,
+    /// Cada cuánto se repite el aviso de un mismo bloqueo.
+    ///
+    /// Hace falta porque quien hace cumplir un permiso pregunta **por cada
+    /// conexión**: un navegador que abre tres a PipeWire consultaría tres veces
+    /// por lo mismo antes de que la primera quede anotada.
+    notices: Arc<Mutex<NoticeThrottle>>,
     /// Lo que algún perfil ajeno bloqueó y todavía nadie decidió.
     ///
     /// Va acá y no en la política porque es otra cosa: la política guarda
@@ -133,6 +139,90 @@ impl PermissionService {
 
     /// Looks up the stored answer, asks the user when there is none, and
     /// remembers what they said.
+    /// Deja constancia de un bloqueo que nadie preguntó, y avisa una vez.
+    ///
+    /// `QueryPermissionFor` contesta sin preguntar, que es lo correcto —el
+    /// módulo de WirePlumber ve al cliente al conectarse, y «¿le permitís la
+    /// cámara a pactl?» no es una pregunta que alguien pueda contestar—, pero
+    /// así como estaba dejaba a la persona sin nada: la aplicación no figuraba
+    /// en Privacidad y seguridad, así que no había interruptor que mover, y la
+    /// negación no se veía. Bloquear sin poder desbloquear es justo lo que este
+    /// servicio existe para no hacer.
+    ///
+    /// Así que un `unknown` que se va a hacer cumplir se anota y se avisa, igual
+    /// que ya se hacía con lo que niega AppArmor. Anotarlo es lo que hace que
+    /// después se pueda decidir; avisar es lo que hace que se pueda decidir
+    /// ahora.
+    ///
+    /// Sólo con `unknown`. Un `denied` es una decisión de la persona, y repetir
+    /// el aviso de algo que ya contestó es insistir.
+    async fn anotar_y_avisar(
+        &self,
+        connection: &Connection,
+        subject: &PinnedCaller,
+        resource_id: &str,
+    ) {
+        let application = subject.describe();
+
+        let primera_vez = self.notices.lock().await.should_notify(
+            subject.uid,
+            &application.binary_path,
+            resource_id,
+            std::time::Instant::now(),
+        );
+        if !primera_vez {
+            return;
+        }
+
+        crate::audit::registrar_el_intento(
+            &self.store,
+            &self.write_lock,
+            subject.uid,
+            &application,
+            resource_id,
+        )
+        .await;
+
+        tracing::info!(
+            "Sin decisión para '{resource_id}' de {}; se anota y se avisa al usuario {}",
+            application.binary_path,
+            subject.uid
+        );
+
+        // Aparte: quien pregunta esto está esperando para dejar pasar o no a un
+        // cliente que se está conectando, y un agente lento no puede demorar
+        // eso.
+        //
+        // Con el mismo cupo que los avisos de AppArmor, y no con uno propio: lo
+        // que se protege es a la persona y al bus, que no distinguen de cuál de
+        // los dos caminos vino el aviso. El silencio de arriba no alcanza acá —
+        // una andanada de aplicaciones **distintas** son claves distintas, y sin
+        // techo cada una abriría su tarea.
+        let permiso = match crate::audit::cupo().clone().try_acquire_owned() {
+            Ok(permiso) => permiso,
+            Err(_) => {
+                tracing::debug!("Demasiados avisos a la vez; se descarta el de {resource_id}");
+                return;
+            }
+        };
+
+        let connection = connection.clone();
+        let agents = self.agents.clone();
+        let uid = subject.uid;
+        let resource_id = resource_id.to_string();
+        tokio::spawn(async move {
+            let _permiso = permiso;
+            crate::agent::avisar_de_bloqueo_por_id(
+                &connection,
+                &agents,
+                uid,
+                &application,
+                &resource_id,
+            )
+            .await;
+        });
+    }
+
     async fn decide(
         &self,
         connection: &Connection,
@@ -368,6 +458,11 @@ impl PermissionService {
             .load(subject.uid)
             .map_err(FdoError::Failed)?
             .decision(&subject.binary_path(), &resource_id);
+
+        if stored == Decision::Unknown {
+            self.anotar_y_avisar(connection, &subject, &resource_id)
+                .await;
+        }
 
         Ok(stored.as_id().to_string())
     }
@@ -831,6 +926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agents: Arc::clone(&agents),
         write_lock,
         throttle: Arc::new(Mutex::new(PromptThrottle::default())),
+        notices: Arc::new(Mutex::new(NoticeThrottle::default())),
         pendientes: Arc::clone(&pendientes),
     };
 
@@ -880,6 +976,7 @@ mod tests_interfaz {
             agents: Arc::new(Mutex::new(AgentRegistry::default())),
             write_lock: Arc::new(Mutex::new(())),
             throttle: Arc::new(Mutex::new(PromptThrottle::default())),
+            notices: Arc::new(Mutex::new(NoticeThrottle::default())),
             pendientes: Default::default(),
         }
     }

@@ -56,6 +56,50 @@ impl PromptThrottle {
     }
 }
 
+/// A ceiling on how often the same block is announced to the same person.
+///
+/// Distinto del de arriba y por otro motivo. `PromptThrottle` protege el
+/// significado de las respuestas; esto protege el aviso de sí mismo: un punto
+/// que hace cumplir un permiso ve al mismo programa **en cada conexión** —el
+/// módulo de WirePlumber lo ve cada vez que un cliente se conecta— y sin techo
+/// un navegador que abre tres conexiones produce tres avisos idénticos.
+///
+/// Se recuerda por persona, programa y recurso, que es exactamente lo que el
+/// aviso dice. Dos programas distintos, o el mismo pidiendo dos cosas, son
+/// avisos distintos y tienen que salir los dos.
+#[derive(Default)]
+pub struct NoticeThrottle {
+    shown: HashMap<(u32, String, String), Instant>,
+}
+
+/// Cuánto se calla un aviso repetido del mismo programa y el mismo recurso.
+///
+/// El mismo valor que usa el camino de AppArmor, y por la misma razón: una
+/// aplicación a la que se le niega la cámara suele reintentar en bucle.
+const NOTICE_SILENCE: Duration = Duration::from_secs(300);
+
+impl NoticeThrottle {
+    /// Whether this block should be announced now, and records that it was.
+    pub fn should_notify(
+        &mut self,
+        uid: u32,
+        binary_path: &str,
+        resource_id: &str,
+        now: Instant,
+    ) -> bool {
+        // Que el mapa no crezca sin techo en una sesión larga.
+        self.shown
+            .retain(|_, shown| now.duration_since(*shown) < NOTICE_SILENCE);
+
+        let key = (uid, binary_path.to_string(), resource_id.to_string());
+        if self.shown.contains_key(&key) {
+            return false;
+        }
+        self.shown.insert(key, now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,7 +110,10 @@ mod tests {
         let now = Instant::now();
 
         for attempt in 0..LIMIT {
-            assert!(throttle.allow(1000, now), "prompt {attempt} should be allowed");
+            assert!(
+                throttle.allow(1000, now),
+                "prompt {attempt} should be allowed"
+            );
         }
     }
 
@@ -157,5 +204,49 @@ mod tests {
         let mut throttle = PromptThrottle::default();
         throttle.refund(1000);
         assert!(throttle.allow(1000, Instant::now()));
+    }
+
+    /// El caso que lo justifica: un navegador que abre varias conexiones a
+    /// PipeWire una detrás de otra.
+    #[test]
+    fn el_mismo_bloqueo_seguido_avisa_una_sola_vez() {
+        let mut techo = NoticeThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.should_notify(1000, "/usr/bin/navegador", "camera", ahora));
+        assert!(!techo.should_notify(1000, "/usr/bin/navegador", "camera", ahora));
+        assert!(!techo.should_notify(
+            1000,
+            "/usr/bin/navegador",
+            "camera",
+            ahora + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn pasado_el_silencio_vuelve_a_avisar() {
+        let mut techo = NoticeThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.should_notify(1000, "/usr/bin/navegador", "camera", ahora));
+        assert!(techo.should_notify(
+            1000,
+            "/usr/bin/navegador",
+            "camera",
+            ahora + NOTICE_SILENCE + Duration::from_secs(1)
+        ));
+    }
+
+    /// Callar un aviso no puede callar otro: son hechos distintos y cada uno
+    /// lleva su oferta de permitir.
+    #[test]
+    fn otro_programa_u_otro_recurso_avisan_igual() {
+        let mut techo = NoticeThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.should_notify(1000, "/usr/bin/navegador", "camera", ahora));
+        assert!(techo.should_notify(1000, "/usr/bin/otro", "camera", ahora));
+        assert!(techo.should_notify(1000, "/usr/bin/navegador", "microphone", ahora));
+        assert!(techo.should_notify(1001, "/usr/bin/navegador", "camera", ahora));
     }
 }
