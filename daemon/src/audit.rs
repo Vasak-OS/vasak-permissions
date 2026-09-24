@@ -272,9 +272,15 @@ use std::time::{Duration, Instant};
 const SILENCIO: Duration = Duration::from_secs(300);
 
 /// Cuántos avisos pueden estar en vuelo a la vez.
+///
+/// Es de los dos caminos que avisan —el que lee las denegaciones de AppArmor y
+/// el que contesta `QueryPermissionFor`—, y por eso el cupo es uno solo: lo que
+/// se protege es a la persona y al bus, y a ninguno de los dos le importa cuál
+/// de los dos módulos mandó el aviso. El silencio por aplicación no cubre esto:
+/// una andanada de aplicaciones **distintas** son claves distintas.
 const AVISOS_A_LA_VEZ: usize = 4;
 
-fn cupo() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+pub(crate) fn cupo() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static CUPO: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     CUPO.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(AVISOS_A_LA_VEZ)))

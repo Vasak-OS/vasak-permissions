@@ -192,11 +192,26 @@ impl PermissionService {
         // Aparte: quien pregunta esto está esperando para dejar pasar o no a un
         // cliente que se está conectando, y un agente lento no puede demorar
         // eso.
+        //
+        // Con el mismo cupo que los avisos de AppArmor, y no con uno propio: lo
+        // que se protege es a la persona y al bus, que no distinguen de cuál de
+        // los dos caminos vino el aviso. El silencio de arriba no alcanza acá —
+        // una andanada de aplicaciones **distintas** son claves distintas, y sin
+        // techo cada una abriría su tarea.
+        let permiso = match crate::audit::cupo().clone().try_acquire_owned() {
+            Ok(permiso) => permiso,
+            Err(_) => {
+                tracing::debug!("Demasiados avisos a la vez; se descarta el de {resource_id}");
+                return;
+            }
+        };
+
         let connection = connection.clone();
         let agents = self.agents.clone();
         let uid = subject.uid;
         let resource_id = resource_id.to_string();
         tokio::spawn(async move {
+            let _permiso = permiso;
             crate::agent::avisar_de_bloqueo_por_id(
                 &connection,
                 &agents,
