@@ -112,7 +112,7 @@ pub(crate) fn is_the_agent(binary_path: &str) -> bool {
             .is_some_and(|name| name == "vasak-permissions-agent")
 }
 
-/// Le avisa al usuario que AppArmor le negó un recurso a una aplicación.
+/// Le avisa al usuario que una aplicación quiso un recurso y no lo tuvo.
 ///
 /// No pregunta nada y no espera respuesta: el bloqueo ya ocurrió y no se puede
 /// deshacer. Lo único que hace es que deje de ser invisible.
@@ -120,6 +120,30 @@ pub(crate) fn is_the_agent(binary_path: &str) -> bool {
 /// Si no hay agente corriendo, se pierde, y está bien: un aviso es útil en el
 /// momento y no tiene sentido guardarlo para mostrarlo en el próximo inicio de
 /// sesión, cuando la persona ya no se acuerda de qué estaba haciendo.
+///
+/// Toma el id y no el `Resource` porque los dos puntos que hacen cumplir un
+/// permiso lo tienen de formas distintas: el de AppArmor lo deduce del archivo
+/// que se negó, y el de `QueryPermissionFor` lo recibe como texto por D-Bus.
+pub async fn avisar_de_bloqueo_por_id(
+    connection: &zbus::Connection,
+    agents: &SharedAgents,
+    uid: u32,
+    application: &vasak_permissions_protocol::Application,
+    resource_id: &str,
+) {
+    avisar(
+        connection,
+        agents,
+        uid,
+        application,
+        resource_id,
+        String::new(),
+        String::new(),
+    )
+    .await
+}
+
+/// El mismo aviso, cuando quien lo manda ya tiene el recurso tipado.
 pub async fn avisar_de_bloqueo(
     connection: &zbus::Connection,
     agents: &SharedAgents,
@@ -127,16 +151,7 @@ pub async fn avisar_de_bloqueo(
     application: &vasak_permissions_protocol::Application,
     resource: &vasak_permissions_protocol::Resource,
 ) {
-    avisar(
-        connection,
-        agents,
-        uid,
-        application,
-        &resource.as_id(),
-        String::new(),
-        String::new(),
-    )
-    .await
+    avisar_de_bloqueo_por_id(connection, agents, uid, application, &resource.as_id()).await
 }
 
 /// Avisa de un bloqueo que no es de un recurso con nombre.

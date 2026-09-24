@@ -103,7 +103,9 @@ fn numero_de(linea: &str, clave: &str) -> Option<u32> {
     let aguja = format!(" {clave}=");
     let inicio = linea.find(&aguja)? + aguja.len();
     let resto = &linea[inicio..];
-    let fin = resto.find(|c: char| !c.is_ascii_digit()).unwrap_or(resto.len());
+    let fin = resto
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(resto.len());
     resto[..fin].parse().ok()
 }
 
@@ -400,9 +402,10 @@ pub async fn vigilar(
         // desbloquear es la ruta concreta. Antes se descartaba, y eso dejaba a
         // la persona con un programa que falla sin explicación y sin remedio.
         if !es_nuestro(&denegacion.perfil) {
-            let programa = crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let programa =
+                crate::procesos::recordada(&procesos, denegacion.pid, denegacion.momento)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_default();
             let primera_vez = crate::local::anotar(
                 &pendientes,
                 crate::local::Bloqueo {
@@ -440,7 +443,12 @@ pub async fn vigilar(
                         tokio::spawn(async move {
                             let _permiso = permiso;
                             crate::agent::avisar_de_archivo(
-                                &connection, &agents, uid, &aplicacion, &perfil, &ruta,
+                                &connection,
+                                &agents,
+                                uid,
+                                &aplicacion,
+                                &perfil,
+                                &ruta,
                             )
                             .await;
                         });
@@ -505,7 +513,8 @@ pub async fn vigilar(
                 denegacion.ruta,
                 denegacion.pid,
                 match viva {
-                    Some(exe) => format!(" (quedó '{exe}', que no es donde estos perfiles enganchan)"),
+                    Some(exe) =>
+                        format!(" (quedó '{exe}', que no es donde estos perfiles enganchan)"),
                     None => String::from(" (ya no existe y no se recuerda)"),
                 }
             );
@@ -515,7 +524,11 @@ pub async fn vigilar(
 
         // El uid va en la clave: si dos personas con sesión abierta usan la
         // misma aplicación, callar a una no puede callar a la otra.
-        let clave = (denegacion.uid, aplicacion.binary_path.clone(), recurso.as_id());
+        let clave = (
+            denegacion.uid,
+            aplicacion.binary_path.clone(),
+            recurso.as_id(),
+        );
         let ahora = Instant::now();
         if let Some(anterior) = recientes.get(&clave) {
             let desde = ahora.duration_since(*anterior);
@@ -548,7 +561,14 @@ pub async fn vigilar(
         // no agrega nada; y si dijo que sí, escribir «denegado» acá borraría su
         // decisión por un bloqueo que probablemente venga de que la excepción
         // todavía no estaba cargada.
-        registrar_el_intento(&store, &write_lock, denegacion.uid, &aplicacion, &recurso).await;
+        registrar_el_intento(
+            &store,
+            &write_lock,
+            denegacion.uid,
+            &aplicacion,
+            &recurso.as_id(),
+        )
+        .await;
 
         tracing::info!(
             "AppArmor le negó '{}' a {}; avisando al usuario {}",
@@ -607,12 +627,18 @@ fn nombre_confiable(recordada: Option<String>, viva: Option<String>) -> Option<S
 }
 
 /// Anota en la política que esta aplicación pidió el recurso y no lo tenía.
-async fn registrar_el_intento(
+/// Deja escrito que una aplicación quiso un recurso y no lo tuvo.
+///
+/// Lo usan los dos puntos que hacen cumplir un permiso sin preguntar: el que
+/// lee las denegaciones de AppArmor y el que contesta `QueryPermissionFor`.
+/// Toma el id del recurso y no el `Resource` porque el segundo llega como
+/// texto por D-Bus.
+pub(crate) async fn registrar_el_intento(
     store: &crate::policy::PolicyStore,
     write_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     uid: u32,
     aplicacion: &vasak_permissions_protocol::Application,
-    recurso: &Resource,
+    resource_id: &str,
 ) {
     use vasak_permissions_protocol::Decision;
 
@@ -626,15 +652,18 @@ async fn registrar_el_intento(
             return;
         }
     };
-    if politica.decision(&aplicacion.binary_path, &recurso.as_id()) != Decision::Unknown {
+    if politica.decision(&aplicacion.binary_path, resource_id) != Decision::Unknown {
         return;
     }
     // `false`: esto no lo preguntó nadie, se observó un bloqueo del
     // kernel. Es lo que distingue una aplicación confinada por un perfil de
     // una que consulta y respeta la respuesta.
-    politica.record(aplicacion, &recurso.as_id(), Decision::Denied, false);
+    politica.record(aplicacion, resource_id, Decision::Denied, false);
     if let Err(error) = store.save(uid, &politica) {
-        tracing::warn!("No se pudo anotar el bloqueo de {}: {error}", aplicacion.binary_path);
+        tracing::warn!(
+            "No se pudo anotar el bloqueo de {}: {error}",
+            aplicacion.binary_path
+        );
     }
 }
 
@@ -731,7 +760,10 @@ mod tests {
     /// La serie del evento, que es lo que distingue una denegación de otra.
     #[test]
     fn de_la_marca_sale_el_numero_de_serie() {
-        assert_eq!(serie_de("audit(1788539628.817:36077): apparmor=\"DENIED\""), Some(36077));
+        assert_eq!(
+            serie_de("audit(1788539628.817:36077): apparmor=\"DENIED\""),
+            Some(36077)
+        );
         // Sin milésimas también.
         assert_eq!(serie_de("audit(1788539628:5): x"), Some(5));
     }
@@ -793,7 +825,10 @@ mod tests {
             Some("/home/pato/Apps/App Monitor.AppImage".into()),
             Some("/usr/bin/bash".into()),
         );
-        assert_eq!(ruta.as_deref(), Some("/home/pato/Apps/App Monitor.AppImage"));
+        assert_eq!(
+            ruta.as_deref(),
+            Some("/home/pato/Apps/App Monitor.AppImage")
+        );
     }
 
     /// Sin nada recordado, el intérprete no sirve como nombre.
@@ -808,7 +843,10 @@ mod tests {
     #[test]
     fn sin_nada_recordado_el_interprete_no_alcanza() {
         assert_eq!(nombre_confiable(None, Some("/usr/bin/bash".into())), None);
-        assert_eq!(nombre_confiable(None, Some("/usr/bin/python3".into())), None);
+        assert_eq!(
+            nombre_confiable(None, Some("/usr/bin/python3".into())),
+            None
+        );
     }
 
     /// Un programa propio del usuario que no pasó por ningún intérprete se
@@ -839,7 +877,10 @@ mod tests {
     #[test]
     fn lo_recordado_tambien_tiene_que_estar_donde_el_perfil_engancha() {
         assert_eq!(
-            nombre_confiable(Some("/usr/bin/bash".into()), Some("/home/pato/x.AppImage".into())),
+            nombre_confiable(
+                Some("/usr/bin/bash".into()),
+                Some("/home/pato/x.AppImage".into())
+            ),
             None
         );
     }
@@ -858,7 +899,7 @@ mod tests {
         recurso: &Resource,
     ) {
         let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-        registrar_el_intento(store, &lock, 1000, app, recurso).await;
+        registrar_el_intento(store, &lock, 1000, app, &recurso.as_id()).await;
     }
 
     /// Sin esto la aplicación bloqueada no aparece en ninguna lista y no hay
@@ -894,7 +935,10 @@ mod tests {
         registrar_en(&store, &app, &Resource::Camera).await;
 
         assert_eq!(
-            store.load(1000).unwrap().decision("/home/x/a.AppImage", "camera"),
+            store
+                .load(1000)
+                .unwrap()
+                .decision("/home/x/a.AppImage", "camera"),
             Decision::Allowed,
             "el bloqueo borró un permiso que la persona había concedido"
         );
@@ -909,8 +953,14 @@ mod tests {
         registrar_en(&store, &app, &Resource::Microphone).await;
 
         let politica = store.load(1000).unwrap();
-        assert_eq!(politica.decision("/home/x/a.AppImage", "microphone"), Decision::Denied);
-        assert_eq!(politica.decision("/home/x/a.AppImage", "camera"), Decision::Unknown);
+        assert_eq!(
+            politica.decision("/home/x/a.AppImage", "microphone"),
+            Decision::Denied
+        );
+        assert_eq!(
+            politica.decision("/home/x/a.AppImage", "camera"),
+            Decision::Unknown
+        );
     }
 
     /// Una línea tal cual la escribe el kernel, copiada del registro real.
@@ -1088,7 +1138,9 @@ mod tests {
     #[test]
     fn los_nuestros_se_reconocen_como_nuestros() {
         assert!(es_nuestro("vasak-appimage"));
-        assert!(es_nuestro(&crate::excepcion::nombre_de("/home/ana/x.AppImage")));
+        assert!(es_nuestro(&crate::excepcion::nombre_de(
+            "/home/ana/x.AppImage"
+        )));
         for ajeno in ["firefox", "usr.bin.man", "dbus-system", "vasak", "appimage"] {
             assert!(!es_nuestro(ajeno), "«{ajeno}» no es nuestro");
         }
