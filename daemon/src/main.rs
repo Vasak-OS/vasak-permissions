@@ -89,6 +89,55 @@ fn check_resource(resource_id: &str, key: &str) -> Result<(), FdoError> {
     }
 }
 
+/// Fija el proceso por el que un delegado pregunta, si puede preguntar por él.
+///
+/// Las dos comprobaciones que separan a un delegado de cualquier otro llamante,
+/// juntas y en este orden, para que `CheckPermissionFor` y `QueryPermissionFor`
+/// no puedan separarse:
+///
+/// 1. Que quien pregunta sea uno de los [`DELEGATE_BINARIES`], por la ruta de
+///    su ejecutable fijado. Antes de tocar al sujeto: a un programa cualquiera
+///    no se le contesta nada sobre otro proceso, ni siquiera si existe.
+/// 2. Que el sujeto sea de su usuario, salvo que el delegado corra como root.
+///    El servicio de cuentas corre como root y habla por cualquiera; el
+///    sincronizador y WirePlumber corren como la persona, y por un proceso de
+///    otro usuario se les niega **sin diálogo** — la negativa llega antes de
+///    `decide`, que es lo único que pregunta. Ver
+///    [`identity::delegate_may_speak_for`].
+///
+/// Recibe la ruta y el uid del delegado ya resueltos, y no el mensaje, para
+/// poder probar la regla sin un bus.
+///
+/// [`DELEGATE_BINARIES`]: vasak_permissions_protocol::DELEGATE_BINARIES
+fn pin_delegated_subject(
+    delegate_binary: &str,
+    delegate_uid: u32,
+    subject_pid: u32,
+    subject_start_time: u64,
+) -> Result<PinnedCaller, FdoError> {
+    if !vasak_permissions_protocol::is_delegate(delegate_binary) {
+        return Err(FdoError::AccessDenied(format!(
+            "{delegate_binary} no puede consultar permisos en nombre de otro proceso"
+        )));
+    }
+
+    let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
+        .map_err(FdoError::InvalidArgs)?;
+
+    if !identity::delegate_may_speak_for(delegate_uid, subject.uid) {
+        tracing::warn!(
+            "{delegate_binary} (usuario {delegate_uid}) quiso preguntar por el \
+             proceso {subject_pid}, que es del usuario {}. Se niega sin preguntar",
+            subject.uid
+        );
+        return Err(FdoError::AccessDenied(
+            "el proceso indicado pertenece a otro usuario".into(),
+        ));
+    }
+
+    Ok(subject)
+}
+
 /// Pins the caller of the current message and resolves who it is.
 async fn caller_of(connection: &Connection, header: &Header<'_>) -> Result<PinnedCaller, FdoError> {
     let sender = header
@@ -373,29 +422,20 @@ impl PermissionService {
         detail: String,
     ) -> zbus::fdo::Result<bool> {
         let delegate = caller_of(connection, &header).await?;
-        if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
-            return Err(FdoError::AccessDenied(format!(
-                "{} no puede consultar permisos en nombre de otro proceso",
-                delegate.binary_path()
-            )));
-        }
-
-        let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
-            .map_err(FdoError::InvalidArgs)?;
+        // Un delegado sin privilegios queda confinado a su propio usuario. El
+        // de sistema —root, que es como corre el de cuentas porque los tokens
+        // viven en archivos de root— habla por cualquiera: es el único que
+        // puede, y para eso existe. Ver `pin_delegated_subject`.
+        let subject = pin_delegated_subject(
+            &delegate.binary_path(),
+            delegate.uid,
+            subject_pid,
+            subject_start_time,
+        )?;
 
         // Contra el sujeto, que es contra quien se guarda: el delegado sólo
         // transporta la pregunta.
         check_resource(&resource_id, &subject.binary_path())?;
-
-        // Un delegado sin privilegios queda confinado a su propio usuario. El
-        // de sistema —root, que es como corre el de cuentas porque los tokens
-        // viven en archivos de root— habla por cualquiera: es el único que
-        // puede, y para eso existe. Ver `delegate_may_speak_for`.
-        if !crate::identity::delegate_may_speak_for(delegate.uid, subject.uid) {
-            return Err(FdoError::AccessDenied(
-                "el proceso indicado pertenece a otro usuario".into(),
-            ));
-        }
 
         self.decide(connection, &subject, &resource_id, detail)
             .await
@@ -428,23 +468,14 @@ impl PermissionService {
         resource_id: String,
     ) -> zbus::fdo::Result<String> {
         let delegate = caller_of(connection, &header).await?;
-        if !vasak_permissions_protocol::is_delegate(&delegate.binary_path()) {
-            return Err(FdoError::AccessDenied(format!(
-                "{} no puede consultar permisos en nombre de otro proceso",
-                delegate.binary_path()
-            )));
-        }
-
-        let subject = PinnedCaller::capture_subject(subject_pid, subject_start_time)
-            .map_err(FdoError::InvalidArgs)?;
+        let subject = pin_delegated_subject(
+            &delegate.binary_path(),
+            delegate.uid,
+            subject_pid,
+            subject_start_time,
+        )?;
 
         check_resource(&resource_id, &subject.binary_path())?;
-
-        if !crate::identity::delegate_may_speak_for(delegate.uid, subject.uid) {
-            return Err(FdoError::AccessDenied(
-                "el proceso indicado pertenece a otro usuario".into(),
-            ));
-        }
 
         // Fuera del alcance declarado no hay nada que leer: es «no», igual que
         // en `decide`, y por el mismo motivo — que el gestor de archivos pida
@@ -962,6 +993,139 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("{SERVICE_NAME} escuchando en {SERVICE_PATH} ({SERVICE_INTERFACE})");
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod delegation_tests {
+    use super::*;
+
+    /// El uid con el que corre la prueba, leído de donde lo lee el demonio para
+    /// el sujeto: el dueño de `/proc/<pid>`.
+    fn own_uid() -> u32 {
+        std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").expect("/proc/self"))
+    }
+
+    /// El proceso de la prueba como sujeto: existe, está vivo y su momento de
+    /// arranque es el de verdad.
+    fn own_process() -> (u32, u64) {
+        let pid = std::process::id();
+        let start_time = crate::polkit::start_time_of(pid).expect("momento de arranque");
+        (pid, start_time)
+    }
+
+    /// Un uid que no es el de la prueba ni root, sea quien sea quien la corre.
+    fn someone_else(uid: u32) -> u32 {
+        if uid == 1 {
+            2
+        } else {
+            uid.wrapping_add(1).max(1)
+        }
+    }
+
+    fn is_access_denied(result: &Result<PinnedCaller, FdoError>) -> bool {
+        matches!(result, Err(FdoError::AccessDenied(_)))
+    }
+
+    /// El caso para el que el sincronizador entró en la lista: una aplicación
+    /// de la misma persona le pide lo guardado y él pregunta en su nombre.
+    #[test]
+    fn el_sincronizador_pregunta_por_un_proceso_de_su_propio_usuario() {
+        let (pid, start_time) = own_process();
+        let subject =
+            pin_delegated_subject("/usr/bin/vasak-accounts-sync", own_uid(), pid, start_time)
+                .expect("un proceso de su propio usuario tiene que poder nombrarlo");
+        assert_eq!(subject.pid, pid);
+        assert_eq!(subject.uid, own_uid());
+    }
+
+    /// Y por uno de otro usuario, no: se niega antes de `decide`, que es lo
+    /// único que abre un diálogo. Si esto pasara, una copia del sincronizador
+    /// corrida por cualquiera leería las decisiones de otra persona en el valor
+    /// de retorno y le abriría diálogos en su sesión.
+    #[test]
+    fn el_sincronizador_no_pregunta_por_un_proceso_de_otro_usuario() {
+        let (pid, start_time) = own_process();
+        let delegate_uid = someone_else(own_uid());
+
+        let result = pin_delegated_subject(
+            "/usr/bin/vasak-accounts-sync",
+            delegate_uid,
+            pid,
+            start_time,
+        );
+        assert!(
+            is_access_denied(&result),
+            "el usuario {delegate_uid} pudo preguntar por un proceso del usuario {}",
+            own_uid()
+        );
+    }
+
+    /// La misma regla alcanza a WirePlumber, que también corre como la persona.
+    /// No es una regla nueva para el sincronizador: es la de todo delegado sin
+    /// privilegios.
+    #[test]
+    fn wireplumber_tampoco_pregunta_por_otro_usuario() {
+        let (pid, start_time) = own_process();
+
+        assert!(pin_delegated_subject("/usr/bin/wireplumber", own_uid(), pid, start_time).is_ok());
+        assert!(is_access_denied(&pin_delegated_subject(
+            "/usr/bin/wireplumber",
+            someone_else(own_uid()),
+            pid,
+            start_time,
+        )));
+    }
+
+    /// El servicio de cuentas corre como root y sigue hablando por cualquiera:
+    /// sumar al sincronizador no le cambia nada.
+    #[test]
+    fn el_servicio_de_cuentas_como_root_sigue_hablando_por_cualquiera() {
+        let (pid, start_time) = own_process();
+        assert!(pin_delegated_subject("/usr/bin/vasak-accounts", 0, pid, start_time).is_ok());
+    }
+
+    /// Quien no es delegado no llega ni a fijar al sujeto: la respuesta es
+    /// `AccessDenied` aunque el pid no exista, y no un error que diga si
+    /// existe o no.
+    #[test]
+    fn un_programa_que_no_es_delegado_no_llega_al_sujeto() {
+        for binary in [
+            "/usr/bin/vasak-mail",
+            "/home/alguien/.local/bin/vasak-accounts-sync",
+            "/tmp/vasak-accounts-sync",
+        ] {
+            let result = pin_delegated_subject(binary, 0, 999_999_999, 0);
+            assert!(is_access_denied(&result), "{binary}");
+        }
+    }
+
+    /// Los tres del almacén se aceptan contra la ruta de un ejecutable, que es
+    /// contra lo que el sincronizador va a preguntar.
+    #[test]
+    fn el_servicio_acepta_los_recursos_del_almacen() {
+        for id in ["store.email", "store.calendar", "store.contacts"] {
+            assert!(
+                check_resource(id, "/usr/bin/vasak-contacts").is_ok(),
+                "{id} no se acepta"
+            );
+        }
+    }
+
+    /// Un área inventada es un recurso desconocido, y contra una identidad del
+    /// portal no hay nada que guardar: por ahí no llega ninguna lectura.
+    #[test]
+    fn el_servicio_rechaza_lo_que_no_es_del_almacen() {
+        assert!(matches!(
+            check_resource("store.algo", "/usr/bin/vasak-contacts"),
+            Err(FdoError::InvalidArgs(_))
+        ));
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(matches!(
+            check_resource("store.contacts", &key),
+            Err(FdoError::NotSupported(_))
+        ));
+    }
 }
 
 #[cfg(test)]

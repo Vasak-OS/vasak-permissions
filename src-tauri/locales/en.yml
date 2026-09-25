@@ -49,6 +49,21 @@ resources:
   account.tasks:
     title: Let {0} access your tasks?
     explanation: It will be able to see and change your task lists.
+  store.email:
+    title: Let {0} read the email saved on this computer?
+    explanation: >-
+      It will be able to see the messages already downloaded from your
+      accounts. It will not be able to get into your mailbox or send anything.
+  store.calendar:
+    title: Let {0} read the calendar saved on this computer?
+    explanation: >-
+      It will be able to see the events and tasks already downloaded from your
+      accounts. It will not be able to get into your account or change anything.
+  store.contacts:
+    title: Let {0} read the contacts saved on this computer?
+    explanation: >-
+      It will be able to see the address book already downloaded from your
+      accounts. It will not be able to get into your account or change anything.
 
 blocked:
   camera: "{0} tried to use the camera"

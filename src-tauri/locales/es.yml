@@ -49,6 +49,21 @@ resources:
   account.tasks:
     title: ¿Querés que {0} acceda a tus tareas?
     explanation: Va a poder ver y modificar tus listas de tareas.
+  store.email:
+    title: ¿Querés que {0} lea el correo guardado en este equipo?
+    explanation: >-
+      Va a poder ver los mensajes que ya se bajaron de tus cuentas. No va a
+      poder entrar a tu casilla ni enviar nada.
+  store.calendar:
+    title: ¿Querés que {0} lea el calendario guardado en este equipo?
+    explanation: >-
+      Va a poder ver los eventos y las tareas que ya se bajaron de tus cuentas.
+      No va a poder entrar a tu cuenta ni cambiar nada.
+  store.contacts:
+    title: ¿Querés que {0} lea los contactos guardados en este equipo?
+    explanation: >-
+      Va a poder ver la libreta de direcciones que ya se bajó de tus cuentas.
+      No va a poder entrar a tu cuenta ni cambiar nada.
 
 blocked:
   camera: "{0} quiso usar la cámara"

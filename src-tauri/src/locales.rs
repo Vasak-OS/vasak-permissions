@@ -175,6 +175,87 @@ mod tests {
         );
     }
 
+    /// Las claves de un catálogo, con la ruta entera separada por puntos
+    /// (`resources.account.email.title`).
+    ///
+    /// La lectura es por líneas y no con un analizador de YAML: agregar una
+    /// dependencia para leer dos archivos en una prueba es más de lo que hace
+    /// falta, y lo que importa —qué claves hay— se ve así.
+    fn catalog_keys(text: &str) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        let mut path: Vec<String> = Vec::new();
+        let mut block_indent: Option<usize> = None;
+
+        for line in text.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+
+            // Adentro de un bloque `>-` o `|` todo es texto, no YAML: una
+            // línea de prosa que empiece con «palabra:» no es una clave.
+            if let Some(level) = block_indent {
+                if indent > level {
+                    continue;
+                }
+                block_indent = None;
+            }
+
+            let Some((key, value)) = line.trim().split_once(':') else {
+                continue;
+            };
+            if key.contains(' ') || key.is_empty() {
+                continue;
+            }
+            path.truncate(indent / 2);
+            path.push(key.trim_matches(['"', '\'']).to_string());
+
+            let value = value.trim();
+            if !value.is_empty() {
+                keys.insert(path.join("."));
+            }
+            if value.starts_with('>') || value.starts_with('|') {
+                block_indent = Some(indent);
+            }
+        }
+        keys
+    }
+
+    /// Todo recurso que puede llegar al diálogo tiene su título y su
+    /// explicación en cada catálogo.
+    ///
+    /// Sin esto, sumar un recurso al protocolo compila, pasa todas las pruebas y
+    /// deja el diálogo **en blanco** justo en la pregunta nueva: el diálogo no
+    /// arma la clave de un recurso que no conoce, así que no muestra ni la
+    /// clave cruda. Se recorren las listas del propio protocolo para que un
+    /// área nueva del almacén o una capacidad nueva de las cuentas no se pueda
+    /// olvidar acá.
+    #[test]
+    fn cada_recurso_de_las_cuentas_y_del_almacen_tiene_sus_textos() {
+        use vasak_permissions_protocol::{AccountResource, Resource, StoreResource};
+
+        let ids: Vec<String> = AccountResource::ALL
+            .into_iter()
+            .map(Resource::Account)
+            .chain(StoreResource::ALL.into_iter().map(Resource::Store))
+            .map(|resource| resource.as_id())
+            .collect();
+        assert!(ids.contains(&"store.contacts".to_string()));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        for language in SOPORTADOS {
+            let keys = catalog_keys(
+                &std::fs::read_to_string(root.join(format!("{language}.yml"))).unwrap(),
+            );
+            for id in &ids {
+                for field in ["title", "explanation"] {
+                    let key = format!("resources.{id}.{field}");
+                    assert!(keys.contains(&key), "{language}.yml no tiene {key}");
+                }
+            }
+        }
+    }
+
     /// Que los dos catálogos digan lo mismo, y que se puedan leer.
     ///
     /// Sin esto, un YAML roto se envía callado: la aplicación abre igual y
@@ -189,55 +270,15 @@ mod tests {
     /// comillas mal cerradas— se ve así.
     #[test]
     fn los_dos_catalogos_tienen_las_mismas_claves() {
-        let claves_de = |texto: &str| -> std::collections::BTreeSet<String> {
-            let mut claves = std::collections::BTreeSet::new();
-            let mut pila: Vec<String> = Vec::new();
-            let mut sangria_del_bloque: Option<usize> = None;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let es = catalog_keys(&std::fs::read_to_string(root.join("es.yml")).unwrap());
+        let en = catalog_keys(&std::fs::read_to_string(root.join("en.yml")).unwrap());
 
-            for linea in texto.lines() {
-                if linea.trim().is_empty() || linea.trim_start().starts_with('#') {
-                    continue;
-                }
-                let sangria = linea.len() - linea.trim_start().len();
-
-                // Adentro de un bloque `>-` o `|` todo es texto, no YAML: una
-                // línea de prosa que empiece con «palabra:» no es una clave.
-                if let Some(nivel) = sangria_del_bloque {
-                    if sangria > nivel {
-                        continue;
-                    }
-                    sangria_del_bloque = None;
-                }
-
-                let Some((clave, valor)) = linea.trim().split_once(':') else {
-                    continue;
-                };
-                if clave.contains(' ') || clave.is_empty() {
-                    continue;
-                }
-                pila.truncate(sangria / 2);
-                pila.push(clave.trim_matches(['"', '\'']).to_string());
-
-                let valor = valor.trim();
-                if !valor.is_empty() {
-                    claves.insert(pila.join("."));
-                }
-                if valor.starts_with('>') || valor.starts_with('|') {
-                    sangria_del_bloque = Some(sangria);
-                }
-            }
-            claves
-        };
-
-        let raiz = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
-        let es = claves_de(&std::fs::read_to_string(raiz.join("es.yml")).unwrap());
-        let en = claves_de(&std::fs::read_to_string(raiz.join("en.yml")).unwrap());
-
-        let solo_es: Vec<_> = es.difference(&en).collect();
-        let solo_en: Vec<_> = en.difference(&es).collect();
+        let only_es: Vec<_> = es.difference(&en).collect();
+        let only_en: Vec<_> = en.difference(&es).collect();
         assert!(
-            solo_es.is_empty() && solo_en.is_empty(),
-            "sólo en español: {solo_es:?}; sólo en inglés: {solo_en:?}"
+            only_es.is_empty() && only_en.is_empty(),
+            "sólo en español: {only_es:?}; sólo en inglés: {only_en:?}"
         );
         assert!(
             es.len() > 20,

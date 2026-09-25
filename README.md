@@ -87,15 +87,34 @@ recurso es una cosa y administrar la política es otra. `ListPermissions` y
 quien administra, así que la configuración sigue pudiendo conceder y quitar
 permisos de otros programas. Lo único que no puede es concederse algo a sí misma.
 
-El bucle que mantiene al día el correo —`vasak-accounts-sync`— también está en
-la lista, con `account.email` y nada más. Corre con la cuenta de la persona y
-aparte del servicio de cuentas, así que a los ojos de esta lista es una
-aplicación como cualquier otra y le corresponde el mismo trato: que viva en el
-mismo repositorio que el servicio no le da nada.
+El sincronizador —`vasak-accounts-sync`— también está en la lista, con
+`account.email`, `account.calendar` y `account.contacts` y nada más. Baja las
+tres áreas a un almacén local cifrado, y la meta es que sea el **único** proceso
+que llega a la credencial: a medida que cada aplicación migre a leer del
+almacén, pierde su `account.<área>` y gana el `store.<área>` correspondiente.
+Hoy no migró ninguna, así que ninguna tiene `store.*` en su alcance, y el
+calendario y los contactos conservan su `account.*`.
 
-Las aplicaciones de correo, calendario, contactos y chats todavía no existen.
-Cada una entra en la lista el día que se escriba, con su capacidad y ninguna
-más.
+## Leer el almacén local: `store.*`
+
+`store.email`, `store.calendar` y `store.contacts` son **leer lo que el
+sincronizador guardó**, y no llegar a la cuenta. La diferencia importa:
+`account.calendar` entrega el token, y en un servidor como Nextcloud esa
+contraseña abre también los contactos y los archivos; `store.calendar` sólo deja
+ver los eventos que ya se bajaron. Un recurso por área, de lectura: dos diálogos
+casi iguales confunden más de lo que protegen.
+
+Quien pregunta es el sincronizador, en nombre de la aplicación que lee: por eso
+está en `DELEGATE_BINARIES`. Corre como la persona, así que —igual que
+WirePlumber— **sólo puede preguntar por procesos de su propio usuario**; por uno
+ajeno se le niega sin diálogo. El único delegado que habla por cualquiera es el
+servicio de cuentas, que corre como root.
+
+Decidir `store.*` cambia algo —el sincronizador consulta antes de servir cada
+lectura— pero un rechazo **no es una frontera**: la base es un archivo de la
+persona y su clave vive en el llavero de la sesión, que le entrega sus secretos
+a cualquier proceso de ese mismo usuario. Por eso `is_enforceable` contesta que
+no: es consentimiento y visibilidad, no contención.
 
 ## El camino del portal
 

@@ -4,7 +4,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
 import { AlertMessage, WindowFrame } from '@vasakgroup/vue-libvasak';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { esRecursoConocido } from '@/resources';
+import { isKnownResource } from '@/resources';
 import type { Question } from '@/types/permissions';
 
 const question = ref<Question | null>(null);
@@ -38,15 +38,15 @@ const portal = computed(() => (question.value?.kind === 'portal' ? question.valu
  * devolvería la clave cruda, y ésta es la pantalla donde menos se puede
  * permitir un texto así.
  */
-const recurso = computed(() => {
+const resource = computed(() => {
 	const id = permission.value?.resource_id;
-	return id && esRecursoConocido(id) ? id : null;
+	return id && isKnownResource(id) ? id : null;
 });
 
 const title = computed(() => {
 	if (portal.value) return portal.value.title;
-	if (!permission.value || !recurso.value) return '';
-	return t(`resources.${recurso.value}.title`).replace(
+	if (!permission.value || !resource.value) return '';
+	return t(`resources.${resource.value}.title`).replace(
 		'{0}',
 		permission.value.application.display_name
 	);
@@ -54,7 +54,7 @@ const title = computed(() => {
 
 const explanation = computed(() => {
 	if (portal.value) return portal.value.subtitle || portal.value.body;
-	return recurso.value ? t(`resources.${recurso.value}.explanation`) : '';
+	return resource.value ? t(`resources.${resource.value}.explanation`) : '';
 });
 
 const answer = async (allowed: boolean) => {
