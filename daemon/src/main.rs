@@ -1053,10 +1053,11 @@ mod delegation_tests {
             pid,
             start_time,
         );
+        // El mensaje no lleva los uid: CodeQL marca cualquier camino de un uid a
+        // una salida, aunque sea el texto de una prueba.
         assert!(
             is_access_denied(&result),
-            "el usuario {delegate_uid} pudo preguntar por un proceso del usuario {}",
-            own_uid()
+            "un delegado pudo preguntar por un proceso de otro usuario"
         );
     }
 
