@@ -217,7 +217,8 @@ pub fn revocar_en(perfil: &str, regla: &str, raiz: &Path) -> Result<bool, String
 /// El temporal va en el **mismo directorio** que el destino: `rename` sólo es
 /// atómico dentro del mismo sistema de archivos, y `/tmp` suele ser otro.
 fn escribir(perfil: &str, reglas: &[String], raiz: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(raiz).map_err(|e| format!("no se pudo crear {}: {e}", raiz.display()))?;
+    std::fs::create_dir_all(raiz)
+        .map_err(|e| format!("no se pudo crear {}: {e}", raiz.display()))?;
     let mut texto = String::from(CABECERA);
     for r in reglas {
         texto.push_str("  ");
@@ -462,13 +463,10 @@ mod tests {
     /// una borraba lo que la otra acababa de escribir. Falló de verdad, y de
     /// forma intermitente, que es la peor manera de fallar.
     fn tmp(prueba: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("vasak-local-{}-{prueba}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("vasak-local-{}-{prueba}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
-
-
 
     /// Que `ubicar` encuentre un perfil de verdad, no sólo uno inventado.
     ///
@@ -483,15 +481,13 @@ mod tests {
         let Some(alguno) = std::fs::read_dir("/usr/share/apparmor.d")
             .ok()
             .and_then(|d| {
-                d.flatten()
-                    .filter(|e| e.path().is_dir())
-                    .find_map(|e| {
-                        std::fs::read_dir(e.path()).ok().and_then(|f| {
-                            f.flatten()
-                                .find(|x| x.path().is_file())
-                                .map(|x| x.file_name().to_string_lossy().into_owned())
-                        })
+                d.flatten().filter(|e| e.path().is_dir()).find_map(|e| {
+                    std::fs::read_dir(e.path()).ok().and_then(|f| {
+                        f.flatten()
+                            .find(|x| x.path().is_file())
+                            .map(|x| x.file_name().to_string_lossy().into_owned())
                     })
+                })
             })
         else {
             return;
@@ -582,7 +578,10 @@ mod tests {
 
         let resultado = conceder_y_recargar("perfil-que-no-existe-12345", &regla, &raiz);
 
-        assert!(resultado.is_err(), "debería fallar: el perfil no está instalado");
+        assert!(
+            resultado.is_err(),
+            "debería fallar: el perfil no está instalado"
+        );
         assert!(
             concedidas_en("perfil-que-no-existe-12345", &raiz).is_empty(),
             "quedó la regla escrita con el kernel sin enterarse"
@@ -614,7 +613,10 @@ mod tests {
         let segunda = regla_para("/home/ana/dos", "r").unwrap();
         let resultado = conceder_en("firefox", &segunda, &raiz);
 
-        assert!(resultado.is_err(), "debería fallar: el temporal está ocupado");
+        assert!(
+            resultado.is_err(),
+            "debería fallar: el temporal está ocupado"
+        );
         assert_eq!(
             concedidas_en("firefox", &raiz),
             vec![primera],
@@ -639,13 +641,19 @@ mod tests {
         let regla = regla_para("/home/ana/x", "r").unwrap();
         let resultado = conceder_en("firefox", &regla, &raiz);
 
-        assert!(resultado.is_err(), "debería fallar: el destino es un directorio");
+        assert!(
+            resultado.is_err(),
+            "debería fallar: el destino es un directorio"
+        );
         let sobrantes: Vec<_> = std::fs::read_dir(&raiz)
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
-        assert!(sobrantes.is_empty(), "quedó un temporal tirado: {sobrantes:?}");
+        assert!(
+            sobrantes.is_empty(),
+            "quedó un temporal tirado: {sobrantes:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&raiz);
     }
@@ -730,7 +738,12 @@ mod tests {
     /// entrecomillar no apaga el globbing.
     #[test]
     fn los_comodines_se_rechazan() {
-        for ruta in ["/home/ana/*", "/home/**", "/home/ana/x?", "/home/{ana,juan}/x"] {
+        for ruta in [
+            "/home/ana/*",
+            "/home/**",
+            "/home/ana/x?",
+            "/home/{ana,juan}/x",
+        ] {
             assert!(regla_para(ruta, "r").is_err(), "pasó: {ruta}");
         }
     }
@@ -754,9 +767,18 @@ mod tests {
     /// nuevo queda confinado o suelto.
     #[test]
     fn la_ejecucion_no_es_un_permiso_que_se_conceda_asi() {
-        assert_eq!(regla_para("/home/ana/x", "rx"), Err(Motivo::MascaraInvalida));
-        assert_eq!(regla_para("/home/ana/x", "ix"), Err(Motivo::MascaraInvalida));
-        assert_eq!(regla_para("/home/ana/x", "Px"), Err(Motivo::MascaraInvalida));
+        assert_eq!(
+            regla_para("/home/ana/x", "rx"),
+            Err(Motivo::MascaraInvalida)
+        );
+        assert_eq!(
+            regla_para("/home/ana/x", "ix"),
+            Err(Motivo::MascaraInvalida)
+        );
+        assert_eq!(
+            regla_para("/home/ana/x", "Px"),
+            Err(Motivo::MascaraInvalida)
+        );
     }
 
     #[test]
@@ -771,7 +793,15 @@ mod tests {
     /// siendo un nombre de archivo.
     #[test]
     fn un_perfil_que_se_escapa_del_directorio_se_rechaza() {
-        for p in ["../../etc/passwd", "a/b", "..", ".", "", "con espacio", "x\0y"] {
+        for p in [
+            "../../etc/passwd",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "con espacio",
+            "x\0y",
+        ] {
             assert!(!perfil_valido(p), "pasó: {p}");
         }
         for p in ["firefox", "thunderbird", "usr.bin.foo", "vasak-appimage"] {

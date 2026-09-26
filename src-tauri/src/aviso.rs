@@ -95,7 +95,9 @@ pub type Avisados = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u3
 const AVISOS_RECORDADOS: usize = 32;
 
 fn recordar(avisados: &Avisados, id: u32, pendiente: Pendiente) {
-    let Ok(mut mapa) = avisados.lock() else { return };
+    let Ok(mut mapa) = avisados.lock() else {
+        return;
+    };
     if mapa.len() >= AVISOS_RECORDADOS {
         if let Some(&viejo) = mapa.keys().min() {
             mapa.remove(&viejo);
@@ -140,11 +142,7 @@ pub const ACCION_NO: &str = "no";
 /// registra y se sigue. Un aviso perdido no justifica romper nada.
 pub async fn mostrar(app: &AppHandle, aviso: &PermissionRequest, avisados: &Avisados) {
     let clave = format!("blocked.{}", aviso.resource_id);
-    let plantilla = app
-        .i18n()
-        .translate(&clave)
-        .unwrap_or(&clave)
-        .to_string();
+    let plantilla = app.i18n().translate(&clave).unwrap_or(&clave).to_string();
     let resumen = texto(&plantilla, &aviso.application.display_name);
     // El cuerpo, con uno propio por recurso si lo hay.
     //
@@ -294,30 +292,46 @@ async fn atender(sistema: &zbus::Connection, accion: &str, pendiente: &Pendiente
     let generico = !pendiente.profile.is_empty();
 
     let resultado = match (accion, generico) {
-        (ACCION_PERMITIR, true) => llamar(
-            sistema,
-            "AllowBlocked",
-            &(pendiente.profile.as_str(), pendiente.detail.as_str()),
-        )
-        .await,
-        (ACCION_NO, true) => llamar(
-            sistema,
-            "DismissBlocked",
-            &(pendiente.profile.as_str(), pendiente.detail.as_str()),
-        )
-        .await,
-        (ACCION_PERMITIR, false) => llamar(
-            sistema,
-            "SetPermission",
-            &(pendiente.binary_path.as_str(), pendiente.resource_id.as_str(), true),
-        )
-        .await,
-        (ACCION_NO, false) => llamar(
-            sistema,
-            "SetPermission",
-            &(pendiente.binary_path.as_str(), pendiente.resource_id.as_str(), false),
-        )
-        .await,
+        (ACCION_PERMITIR, true) => {
+            llamar(
+                sistema,
+                "AllowBlocked",
+                &(pendiente.profile.as_str(), pendiente.detail.as_str()),
+            )
+            .await
+        }
+        (ACCION_NO, true) => {
+            llamar(
+                sistema,
+                "DismissBlocked",
+                &(pendiente.profile.as_str(), pendiente.detail.as_str()),
+            )
+            .await
+        }
+        (ACCION_PERMITIR, false) => {
+            llamar(
+                sistema,
+                "SetPermission",
+                &(
+                    pendiente.binary_path.as_str(),
+                    pendiente.resource_id.as_str(),
+                    true,
+                ),
+            )
+            .await
+        }
+        (ACCION_NO, false) => {
+            llamar(
+                sistema,
+                "SetPermission",
+                &(
+                    pendiente.binary_path.as_str(),
+                    pendiente.resource_id.as_str(),
+                    false,
+                ),
+            )
+            .await
+        }
         _ => return, // otro botón, o el «default» de algunos daemons
     };
 
@@ -363,14 +377,20 @@ mod tests {
             "Firefox",
             "/etc/shadow",
         );
-        assert_eq!(texto, "Un perfil le impidió abrir /etc/shadow. Fue Firefox.");
+        assert_eq!(
+            texto,
+            "Un perfil le impidió abrir /etc/shadow. Fue Firefox."
+        );
     }
 
     /// Una plantilla a la que le falte un marcador no puede romper el aviso ni
     /// dejar un «{1}» a la vista de la persona.
     #[test]
     fn una_plantilla_incompleta_no_deja_marcadores_sueltos() {
-        assert_eq!(texto_con_detalle("Se bloqueó algo", "App", "/x"), "Se bloqueó algo");
+        assert_eq!(
+            texto_con_detalle("Se bloqueó algo", "App", "/x"),
+            "Se bloqueó algo"
+        );
         assert_eq!(texto_con_detalle("{0} falló", "App", "/x"), "App falló");
     }
 

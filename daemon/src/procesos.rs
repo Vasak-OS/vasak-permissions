@@ -96,7 +96,9 @@ fn btime() -> Option<Duration> {
     *BTIME.get_or_init(|| {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let linea = stat.lines().find(|l| l.starts_with("btime "))?;
-        Some(Duration::from_secs(linea.split_whitespace().nth(1)?.parse().ok()?))
+        Some(Duration::from_secs(
+            linea.split_whitespace().nth(1)?.parse().ok()?,
+        ))
     })
 }
 
@@ -227,7 +229,7 @@ fn suscripcion(pid_propio: u32) -> Vec<u8> {
     m.extend_from_slice(&0u32.to_ne_bytes()); // ack
     m.extend_from_slice(&4u16.to_ne_bytes()); // len
     m.extend_from_slice(&0u16.to_ne_bytes()); // flags
-    // datos
+                                              // datos
     m.extend_from_slice(&PROC_CN_MCAST_LISTEN.to_ne_bytes());
     m
 }
@@ -276,7 +278,12 @@ pub fn escuchar(cache: Cache) {
 
     let mensaje = suscripcion(std::process::id());
     let enviado = unsafe {
-        libc::send(fd, mensaje.as_ptr() as *const libc::c_void, mensaje.len(), 0)
+        libc::send(
+            fd,
+            mensaje.as_ptr() as *const libc::c_void,
+            mensaje.len(),
+            0,
+        )
     };
     if enviado < 0 {
         tracing::warn!(
@@ -327,7 +334,8 @@ pub fn escuchar(cache: Cache) {
         if leidos <= 0 {
             // EINTR y demás: reintentar. Un error persistente haría girar esto,
             // así que se corta.
-            if leidos < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            if leidos < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
             {
                 continue;
             }
@@ -377,9 +385,15 @@ mod tests {
     #[test]
     fn el_arranque_de_init_coincide_con_el_uptime() {
         let Some(init) = arranque_de(1) else { return };
-        let Ok(texto) = std::fs::read_to_string("/proc/uptime") else { return };
-        let Some(segundos) = texto.split_whitespace().next() else { return };
-        let Ok(uptime) = segundos.parse::<f64>() else { return };
+        let Ok(texto) = std::fs::read_to_string("/proc/uptime") else {
+            return;
+        };
+        let Some(segundos) = texto.split_whitespace().next() else {
+            return;
+        };
+        let Ok(uptime) = segundos.parse::<f64>() else {
+            return;
+        };
 
         let edad = (ahora_epoch() - init).as_secs_f64();
         assert!(
@@ -414,7 +428,11 @@ mod tests {
     #[test]
     fn los_otros_eventos_se_ignoran() {
         for que in [0x0000_0001, 0x0000_0004, 0x8000_0000] {
-            assert_eq!(pid_de_exec(&mensaje(que, 4242)), None, "aceptó el evento {que:#x}");
+            assert_eq!(
+                pid_de_exec(&mensaje(que, 4242)),
+                None,
+                "aceptó el evento {que:#x}"
+            );
         }
     }
 
@@ -422,14 +440,20 @@ mod tests {
     fn un_mensaje_corto_no_lee_de_mas() {
         assert_eq!(pid_de_exec(&[]), None);
         assert_eq!(pid_de_exec(&[0u8; 40]), None);
-        assert_eq!(pid_de_exec(&mensaje(PROC_EVENT_EXEC, 1)[..OFFSET_PID + 3]), None);
+        assert_eq!(
+            pid_de_exec(&mensaje(PROC_EVENT_EXEC, 1)[..OFFSET_PID + 3]),
+            None
+        );
     }
 
     #[test]
     fn la_suscripcion_tiene_la_forma_que_el_kernel_espera() {
         let m = suscripcion(1234);
         assert_eq!(m.len(), OFFSET_QUE + 4);
-        assert_eq!(u32::from_ne_bytes(m[0..4].try_into().unwrap()), m.len() as u32);
+        assert_eq!(
+            u32::from_ne_bytes(m[0..4].try_into().unwrap()),
+            m.len() as u32
+        );
         assert_eq!(
             u32::from_ne_bytes(m[OFFSET_QUE..OFFSET_QUE + 4].try_into().unwrap()),
             PROC_CN_MCAST_LISTEN
@@ -482,7 +506,13 @@ mod tests {
     /// aplicación equivocada.
     #[test]
     fn un_pid_reciclado_no_nombra_a_la_aplicacion_nueva() {
-        let cache = con(7, &[("/home/x/vieja.AppImage", 10), ("/home/x/nueva.AppImage", 20)]);
+        let cache = con(
+            7,
+            &[
+                ("/home/x/vieja.AppImage", 10),
+                ("/home/x/nueva.AppImage", 20),
+            ],
+        );
         assert_eq!(
             recordada(&cache, 7, en(15)),
             Some(PathBuf::from("/home/x/vieja.AppImage")),

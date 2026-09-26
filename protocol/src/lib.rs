@@ -70,8 +70,29 @@ pub const MANAGE_ACTION: &str = "ar.net.vasak.os.permissions.manage";
 /// paths under `/usr/bin`, which needs root to write: a program the user can
 /// write cannot be one of these, and therefore cannot claim to be asking for
 /// somebody else.
-pub const DELEGATE_BINARIES: [&str; 2] = [
+///
+/// Estar en la lista no alcanza para hablar por **cualquiera**. La ruta dice qué
+/// programa es, no quién lo corre: un delegado que no corre como root sólo
+/// puede preguntar por procesos de su propio usuario, y por uno ajeno se le
+/// niega sin abrir ningún diálogo. La regla vive en el demonio
+/// (`delegate_may_speak_for`) y alcanza a los dos delegados de la sesión,
+/// WirePlumber y el sincronizador; el único que habla por todos es el servicio
+/// de cuentas, que corre como root.
+pub const DELEGATE_BINARIES: [&str; 3] = [
     "/usr/bin/vasak-accounts",
+    // El sincronizador de cuentas, que corre como la persona.
+    //
+    // Es el único dueño del almacén local: escribe lo que baja de los
+    // servidores y sirve las lecturas a las aplicaciones. Cuando una de ellas
+    // le pide los contactos guardados, la pregunta es sobre **esa** aplicación
+    // y no sobre el sincronizador: por eso pregunta en su nombre, con
+    // `CheckPermissionFor` y el recurso `store.<área>`. Si preguntara por sí
+    // mismo, todas las aplicaciones compartirían una sola decisión anotada
+    // contra él, que no es ninguna decisión.
+    //
+    // Corre sin privilegios, así que sólo puede hablar por procesos de su
+    // propio usuario: ver arriba.
+    "/usr/bin/vasak-accounts-sync",
     // El módulo `permisos-de-medios` de WirePlumber, que corre dentro de este
     // proceso. Le pregunta a este servicio por cada cliente de PipeWire que se
     // conecta, y nombra al cliente por su pid.
@@ -144,9 +165,16 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// que cada identificador exista, porque uno mal escrito no falla: no empareja
 /// con nada, y el alcance queda más chico de lo que se quiso.
 ///
-/// Las aplicaciones de correo, calendario, contactos y chats todavía no
-/// existen. Cada una entra acá el día que se escriba, con su capacidad y
-/// ninguna más.
+/// ── Hacia dónde va ──────────────────────────────────────────────────────────
+///
+/// Las cuentas en línea van a tener un solo proceso que llegue a la
+/// credencial: el sincronizador, que baja el correo, los calendarios y los
+/// contactos a un almacén local cifrado. Las aplicaciones van a leer de ahí,
+/// con los recursos `store.<área>`, y a medida que cada una migre pierde su
+/// `account.<área>` en esta lista y gana el `store.<área>` que le corresponde.
+///
+/// Todavía no migró ninguna, así que ninguna tiene `store.*`: una prueba lo
+/// fija, para que el recurso entre con la migración y no antes.
 pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
@@ -168,21 +196,33 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // conceder y quitar permisos de **otros** programas, que es su trabajo. Lo
     // único que no puede es concederse algo a sí misma.
     ("/usr/bin/vasak-settings", &[]),
-    // El bucle que mantiene al día el correo. Corre con la cuenta de la
-    // persona, aparte del servicio de cuentas, porque habla IMAP con servidores
+    // El sincronizador: mantiene al día el correo, los calendarios y los
+    // contactos, y los guarda en el almacén local. Corre con la cuenta de la
+    // persona, aparte del servicio de cuentas, porque habla con servidores
     // ajenos y eso no puede pasar por un proceso de root.
     //
-    // Sólo el correo: el calendario es de la aplicación de calendario y los
-    // contactos de la suya. Que viva en el mismo repositorio que el servicio no
-    // le da nada — le pide los tokens por el mismo camino que cualquier otra
-    // aplicación, y este límite lo alcanza igual.
-    ("/usr/bin/vasak-accounts-sync", &["account.email"]),
-    // El calendario. Lee los eventos por CalDAV de las cuentas conectadas.
+    // Las tres áreas, y es a propósito: es el proceso que baja lo que después
+    // leen las aplicaciones, así que es el que llega a la credencial. La meta
+    // es que sea el **único** — hoy el calendario y los contactos todavía
+    // piden la suya, hasta que lean del almacén.
     //
-    // No los contactos, aunque vivan en el mismo servidor y detrás de la misma
-    // contraseña: la agenda es de la aplicación de contactos. Un servidor
-    // Nextcloud entrega las dos cosas con la misma credencial, así que sin esta
-    // línea la separación sería una convención y no un límite.
+    // Nada de `store.*`: el almacén lo sirve él, no lo pide. Y nada fuera de
+    // estas tres —ni los discos en la nube, ni los chats—: que viva en el mismo
+    // repositorio que el servicio no le da nada, le pide los tokens por el
+    // mismo camino que cualquier otra aplicación y este límite lo alcanza igual.
+    (
+        "/usr/bin/vasak-accounts-sync",
+        &["account.email", "account.calendar", "account.contacts"],
+    ),
+    // El calendario. Hoy lee los eventos por CalDAV de las cuentas conectadas,
+    // y por eso conserva `account.calendar`.
+    //
+    // Es provisorio: cuando lea del almacén cambia `account.calendar` por
+    // `store.calendar`, y la credencial queda sólo en el sincronizador. Mientras
+    // tanto, nunca los contactos, aunque vivan en el mismo servidor y detrás de
+    // la misma contraseña: un servidor Nextcloud entrega las dos cosas con la
+    // misma credencial, así que sin esta línea la separación sería una
+    // convención y no un límite.
     ("/usr/bin/vasak-calendar", &["account.calendar"]),
     // La aplicación de correo. **Nada**, y es la más expuesta de todas.
     //
@@ -195,6 +235,10 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // `vasak-mail` reemplazado podría pedir `account.email` y la persona vería un
     // diálogo pidiéndole permiso para algo que la aplicación de verdad nunca
     // necesitó — y que si concede, entrega la contraseña de su casilla.
+    //
+    // Cuando lea del almacén va a ganar `store.email`, que es leer lo que el
+    // sincronizador guardó y no llegar a la casilla. `account.email` no lo gana
+    // nunca.
     ("/usr/bin/vasak-mail", &[]),
     // La libreta de direcciones. El otro lado de la línea que separa los
     // contactos de los calendarios.
@@ -204,6 +248,9 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // eventos. Sin las dos, el límite lo tendría sólo una de ellas — y las dos
     // llegan al mismo servidor con la misma contraseña, así que alcanzaba con
     // reemplazar la que no estaba acotada.
+    //
+    // Provisorio como el del calendario: cuando lea del almacén cambia
+    // `account.contacts` por `store.contacts`.
     ("/usr/bin/vasak-contacts", &["account.contacts"]),
 ];
 
@@ -212,7 +259,7 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
 /// Verdadero para todo lo que no esté en la lista: ver arriba por qué.
 pub fn may_request(binary_path: &str, resource_id: &str) -> bool {
     match scope_of(binary_path) {
-        Some(alcance) => alcance.contains(&resource_id),
+        Some(scope) => scope.contains(&resource_id),
         None => true,
     }
 }
@@ -225,21 +272,21 @@ pub fn may_request(binary_path: &str, resource_id: &str) -> bool {
 /// haría que cualquier `vasak-file-manager` en cualquier carpeta contara como el
 /// del sistema, y eso invierte el sentido de la lista.
 pub fn scope_of(binary_path: &str) -> Option<&'static [&'static str]> {
-    if let Some((_, alcance)) = SCOPED_BINARIES
+    if let Some((_, scope)) = SCOPED_BINARIES
         .iter()
-        .find(|(instalado, _)| *instalado == binary_path)
+        .find(|(installed, _)| *installed == binary_path)
     {
-        return Some(alcance);
+        return Some(scope);
     }
 
     #[cfg(debug_assertions)]
     if std::env::var_os("VASAK_PERMISSIONS_TEST_ROOT").is_some() {
-        let nombre = std::path::Path::new(binary_path).file_name();
-        if let Some((_, alcance)) = SCOPED_BINARIES
+        let file_name = std::path::Path::new(binary_path).file_name();
+        if let Some((_, scope)) = SCOPED_BINARIES
             .iter()
-            .find(|(instalado, _)| std::path::Path::new(instalado).file_name() == nombre)
+            .find(|(installed, _)| std::path::Path::new(installed).file_name() == file_name)
         {
-            return Some(alcance);
+            return Some(scope);
         }
     }
 
@@ -361,6 +408,20 @@ pub enum Resource {
     /// Access to one capability of the user's online accounts.
     #[serde(rename = "account")]
     Account(AccountResource),
+    /// Leer lo que el sincronizador ya guardó de un área, en el almacén local.
+    ///
+    /// Es otra pregunta que [`Resource::Account`], y la diferencia es la que
+    /// importa. `account.calendar` llega a la **credencial**: con él se pide el
+    /// token de la cuenta, y en un servidor como Nextcloud esa contraseña abre
+    /// todo —el calendario, los contactos, los archivos—. `store.calendar` sólo
+    /// deja leer los eventos que el sincronizador ya bajó, y no le da a la
+    /// aplicación forma de llegar al servidor.
+    ///
+    /// Un solo recurso por área, de lectura: dos diálogos casi iguales
+    /// —«ver tus eventos» y «ver y cambiar tus eventos»— confunden más de lo
+    /// que protegen.
+    #[serde(rename = "store")]
+    Store(StoreResource),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -372,6 +433,20 @@ pub enum AccountResource {
     Chat,
     Drive,
     Tasks,
+}
+
+/// Las áreas del almacén local que se pueden leer.
+///
+/// Son tres y no las seis de [`AccountResource`] porque son las que el
+/// sincronizador guarda. Los chats, los discos en la nube y las tareas de las
+/// APIs propias de cada proveedor no pasan por el almacén; las tareas de
+/// CalDAV viajan con el calendario, que es donde las guarda el servidor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoreResource {
+    Email,
+    Calendar,
+    Contacts,
 }
 
 impl Resource {
@@ -406,6 +481,14 @@ impl Resource {
     /// effect, because an AppArmor exception gets written either way. What is
     /// refused outright is a decision that changes *nothing at all*: the person
     /// could neither rely on it nor take it back.
+    ///
+    /// Lo guardado en el almacén local (`store.*`) tampoco, y por un motivo
+    /// parecido al de la cámara. El sincronizador pregunta antes de servir una
+    /// lectura, pero la base es un archivo de la persona y su clave vive en el
+    /// llavero de la sesión, que le entrega sus secretos a cualquier proceso de
+    /// ese mismo usuario. Un programa que no quiera preguntar puede ir directo
+    /// al archivo. El permiso es consentimiento y visibilidad, no una frontera,
+    /// y decir otra cosa acá sería prometer lo que no se cumple.
     pub fn is_enforceable(&self) -> bool {
         matches!(self, Resource::Account(_))
     }
@@ -424,9 +507,16 @@ impl Resource {
     /// which is why the distinction exists at all. But refusing one that *does*
     /// change something leaves a switch that cannot be moved.
     pub fn decision_has_effect(&self) -> bool {
+        // `store.*` cambia algo: el sincronizador consulta la decisión antes de
+        // servir cada lectura, así que negar corta ese camino y permitir lo
+        // abre. Que haya otro camino es lo que dice `is_enforceable`.
         matches!(
             self,
-            Resource::Account(_) | Resource::Camera | Resource::Microphone | Resource::Credentials
+            Resource::Account(_)
+                | Resource::Store(_)
+                | Resource::Camera
+                | Resource::Microphone
+                | Resource::Credentials
         )
     }
 
@@ -467,12 +557,16 @@ impl Resource {
             Resource::InputCapture => "input-capture".into(),
             Resource::Credentials => "credentials".into(),
             Resource::Account(capability) => format!("account.{}", capability.as_id()),
+            Resource::Store(area) => format!("store.{}", area.as_id()),
         }
     }
 
     pub fn from_id(id: &str) -> Option<Self> {
         if let Some(capability) = id.strip_prefix("account.") {
             return AccountResource::from_id(capability).map(Resource::Account);
+        }
+        if let Some(area) = id.strip_prefix("store.") {
+            return StoreResource::from_id(area).map(Resource::Store);
         }
 
         match id {
@@ -488,6 +582,16 @@ impl Resource {
 }
 
 impl AccountResource {
+    /// Todas, por lo mismo que [`StoreResource::ALL`].
+    pub const ALL: [AccountResource; 6] = [
+        AccountResource::Email,
+        AccountResource::Calendar,
+        AccountResource::Contacts,
+        AccountResource::Chat,
+        AccountResource::Drive,
+        AccountResource::Tasks,
+    ];
+
     pub fn as_id(&self) -> &'static str {
         match self {
             AccountResource::Email => "email",
@@ -507,6 +611,35 @@ impl AccountResource {
             "chat" => Some(AccountResource::Chat),
             "drive" => Some(AccountResource::Drive),
             "tasks" => Some(AccountResource::Tasks),
+            _ => None,
+        }
+    }
+}
+
+impl StoreResource {
+    /// Todas, para que quien tenga que cubrirlas —los catálogos de idioma, la
+    /// pantalla de Configuración— las recorra sin copiar la lista.
+    pub const ALL: [StoreResource; 3] = [
+        StoreResource::Email,
+        StoreResource::Calendar,
+        StoreResource::Contacts,
+    ];
+
+    /// Escritas a mano por lo mismo que las de [`Resource::as_id`]: terminan en
+    /// un archivo en disco.
+    pub fn as_id(&self) -> &'static str {
+        match self {
+            StoreResource::Email => "email",
+            StoreResource::Calendar => "calendar",
+            StoreResource::Contacts => "contacts",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "email" => Some(StoreResource::Email),
+            "calendar" => Some(StoreResource::Calendar),
+            "contacts" => Some(StoreResource::Contacts),
             _ => None,
         }
     }
@@ -654,6 +787,9 @@ mod tests {
             Resource::Account(AccountResource::Chat),
             Resource::Account(AccountResource::Drive),
             Resource::Account(AccountResource::Tasks),
+            Resource::Store(StoreResource::Email),
+            Resource::Store(StoreResource::Calendar),
+            Resource::Store(StoreResource::Contacts),
         ];
 
         for resource in resources {
@@ -676,6 +812,60 @@ mod tests {
         );
     }
 
+    /// Los tres del almacén, con el texto exacto que va a quedar en disco y el
+    /// que el sincronizador va a mandar por el bus.
+    #[test]
+    fn los_recursos_del_almacen_se_reconocen() {
+        for (id, area) in [
+            ("store.email", StoreResource::Email),
+            ("store.calendar", StoreResource::Calendar),
+            ("store.contacts", StoreResource::Contacts),
+        ] {
+            let resource = Resource::from_id(id).unwrap_or_else(|| panic!("{id} no se reconoce"));
+            assert_eq!(resource, Resource::Store(area));
+            assert_eq!(resource.as_id(), id, "{id} no vuelve igual");
+        }
+
+        // Y `ALL` es exactamente esos tres: quien recorra la lista para cubrir
+        // los catálogos de idioma no se puede saltear ninguno.
+        let ids: Vec<String> = StoreResource::ALL
+            .iter()
+            .map(|area| Resource::Store(area.clone()).as_id())
+            .collect();
+        assert_eq!(ids, ["store.email", "store.calendar", "store.contacts"]);
+    }
+
+    /// Un área inventada no se adivina. `store.drive` es el caso que importa:
+    /// `drive` sí es una capacidad de las cuentas, pero el almacén no la
+    /// guarda, y aceptarla dejaría un interruptor que no lee nada.
+    #[test]
+    fn un_area_del_almacen_inventada_se_rechaza() {
+        for id in [
+            "store.algo",
+            "store.drive",
+            "store.chat",
+            "store.tasks",
+            "store.",
+            "store",
+            "store.Email",
+            "store.email.extra",
+        ] {
+            assert_eq!(Resource::from_id(id), None, "{id} no tenía que reconocerse");
+        }
+    }
+
+    /// Leer lo guardado y llegar a la credencial son recursos distintos: una
+    /// decisión sobre uno nunca puede leerse como decisión sobre el otro.
+    #[test]
+    fn leer_el_almacen_no_es_llegar_a_la_cuenta() {
+        for area in StoreResource::ALL {
+            let store = Resource::Store(area.clone()).as_id();
+            let account = format!("account.{}", area.as_id());
+            assert_ne!(store, account);
+            assert_ne!(Resource::from_id(&store), Resource::from_id(&account));
+        }
+    }
+
     #[test]
     fn an_unknown_id_is_rejected_rather_than_guessed() {
         assert_eq!(Resource::from_id("nonsense"), None);
@@ -692,6 +882,7 @@ mod delegate_tests {
     #[test]
     fn only_services_installed_by_the_system_may_ask_for_someone_else() {
         assert!(is_delegate("/usr/bin/vasak-accounts"));
+        assert!(is_delegate("/usr/bin/vasak-accounts-sync"));
         assert!(is_delegate("/usr/bin/wireplumber"));
 
         // A program the user can write must never be able to claim it is
@@ -702,6 +893,8 @@ mod delegate_tests {
         assert!(!is_delegate("vasak-accounts"));
         assert!(!is_delegate("/usr/bin/anything-else"));
         assert!(!is_delegate("/home/someone/.local/bin/wireplumber"));
+        assert!(!is_delegate("/home/someone/.local/bin/vasak-accounts-sync"));
+        assert!(!is_delegate("/usr/local/bin/vasak-accounts-sync"));
     }
 
     /// Un delegado de más es un programa que puede hablar por cualquier otro,
@@ -711,14 +904,14 @@ mod delegate_tests {
     fn la_lista_de_delegados_no_crece_sola() {
         assert_eq!(
             DELEGATE_BINARIES.len(),
-            2,
+            3,
             "agregar un delegado es dejar que un programa hable por otro: \
              que sea a propósito"
         );
-        for delegado in DELEGATE_BINARIES {
+        for delegate in DELEGATE_BINARIES {
             assert!(
-                delegado.starts_with("/usr/bin/"),
-                "{delegado} no está bajo /usr/bin, así que el usuario podría \
+                delegate.starts_with("/usr/bin/"),
+                "{delegate} no está bajo /usr/bin, así que el usuario podría \
                  escribirlo y hacerse pasar por él"
             );
         }
@@ -763,6 +956,34 @@ mod enforcement_tests {
         assert!(!Resource::Location.is_enforceable());
         assert!(!Resource::InputCapture.is_enforceable());
     }
+
+    /// Lo guardado en el almacén: decidirlo cambia algo —el sincronizador lo
+    /// consulta antes de servir cada lectura— pero un rechazo no es una
+    /// frontera, porque la base y su clave están al alcance de cualquier
+    /// proceso de la misma persona. Las dos respuestas tienen que decir eso.
+    #[test]
+    fn el_almacen_se_decide_pero_no_es_una_frontera() {
+        for area in StoreResource::ALL {
+            let resource = Resource::Store(area);
+            assert!(resource.decision_has_effect(), "{}", resource.as_id());
+            assert!(
+                resource.decision_has_effect_for("/usr/bin/vasak-contacts"),
+                "{}",
+                resource.as_id()
+            );
+            assert!(!resource.is_enforceable(), "{}", resource.as_id());
+        }
+    }
+
+    /// Por el portal no llega ninguna lectura del almacén, así que una decisión
+    /// anotada contra una identidad del portal no movería nada.
+    #[test]
+    fn el_almacen_no_se_decide_por_el_portal() {
+        let key = portal_key("com.google.Chrome").expect("identidad válida");
+        for area in StoreResource::ALL {
+            assert!(!Resource::Store(area).decision_has_effect_for(&key));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -790,7 +1011,7 @@ mod policy_tests {
 }
 
 #[cfg(test)]
-mod tests_alcance {
+mod scope_tests {
     use super::*;
 
     /// El caso que motivó la lista: el gestor de archivos llega a los discos en
@@ -837,28 +1058,69 @@ mod tests_alcance {
         }
     }
 
-    /// El bucle de correo llega al correo y a nada más.
+    /// El sincronizador llega al correo, al calendario y a los contactos, y a
+    /// nada más.
     ///
-    /// Corre aparte del servicio de cuentas y con la cuenta de la persona, así
-    /// que es una aplicación como cualquier otra a los ojos de esta lista — y le
-    /// corresponde el mismo trato.
+    /// Antes sólo llegaba al correo y esta prueba exigía que no pudiera pedir
+    /// el calendario ni los contactos. Se invirtió a propósito: es el proceso
+    /// que baja las tres áreas al almacén local, y la meta es que sea el único
+    /// que llegue a la credencial.
+    ///
+    /// Sigue acotado, y eso es lo que la prueba cuida del otro lado: ni los
+    /// discos en la nube, ni los chats, ni el almacén que él mismo sirve.
     #[test]
-    fn el_bucle_de_correo_solo_llega_al_correo() {
+    fn el_sincronizador_llega_al_correo_al_calendario_y_a_los_contactos() {
         let sync = "/usr/bin/vasak-accounts-sync";
 
-        assert!(may_request(sync, "account.email"));
-        for prohibido in [
-            "account.calendar",
-            "account.contacts",
-            "account.drive",
-            "account.chat",
-            "credentials",
-        ] {
+        for allowed in ["account.email", "account.calendar", "account.contacts"] {
             assert!(
-                !may_request(sync, prohibido),
-                "no tenía que poder pedir '{prohibido}'"
+                may_request(sync, allowed),
+                "tenía que poder pedir '{allowed}'"
             );
         }
+        for forbidden in [
+            "account.drive",
+            "account.chat",
+            "account.tasks",
+            "store.email",
+            "store.calendar",
+            "store.contacts",
+            "credentials",
+            "camera",
+        ] {
+            assert!(
+                !may_request(sync, forbidden),
+                "no tenía que poder pedir '{forbidden}'"
+            );
+        }
+    }
+
+    /// Ninguna aplicación tiene `store.*` todavía.
+    ///
+    /// El recurso entra en el alcance de cada una cuando migre a leer del
+    /// almacén, en el mismo cambio que le saca su `account.*`. Antes no: una
+    /// aplicación con los dos llegaría a la credencial **y** a lo guardado, y
+    /// el reparto quedaría peor que hoy.
+    #[test]
+    fn ninguna_aplicacion_tiene_el_almacen_todavia() {
+        for (binary, scope) in SCOPED_BINARIES {
+            for id in scope {
+                assert!(
+                    !id.starts_with("store."),
+                    "{binary} tiene '{id}' antes de haber migrado al almacén"
+                );
+            }
+        }
+    }
+
+    /// El calendario conserva su `account.calendar` hasta migrar: sacárselo
+    /// antes lo dejaría sin eventos, porque todavía no lee del almacén.
+    #[test]
+    fn el_calendario_conserva_su_cuenta_hasta_migrar() {
+        assert_eq!(
+            scope_of("/usr/bin/vasak-calendar"),
+            Some(&["account.calendar"][..])
+        );
     }
 
     /// El calendario llega al calendario y a nada más.
@@ -924,19 +1186,21 @@ mod tests_alcance {
     /// permiso para algo que la aplicación de verdad nunca necesitó.
     #[test]
     fn el_correo_no_puede_pedir_ni_el_correo() {
-        let correo = "/usr/bin/vasak-mail";
+        let mail_app = "/usr/bin/vasak-mail";
 
-        assert_eq!(scope_of(correo), Some(&[][..]));
-        for recurso in [
+        assert_eq!(scope_of(mail_app), Some(&[][..]));
+        for resource in [
             "account.email",
             "account.contacts",
             "account.calendar",
             "account.drive",
+            // Tampoco lo guardado, hasta que migre a leer del almacén.
+            "store.email",
             "credentials",
         ] {
             assert!(
-                !may_request(correo, recurso),
-                "no tenía que poder pedir '{recurso}'"
+                !may_request(mail_app, resource),
+                "no tenía que poder pedir '{resource}'"
             );
         }
     }

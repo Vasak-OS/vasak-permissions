@@ -6,9 +6,9 @@
 //! that behind an authentication the user performs, in a dialog the calling
 //! program has no control over.
 
+use std::collections::HashMap;
 use zbus::fdo::Error as FdoError;
 use zbus::zvariant::Value;
-use std::collections::HashMap;
 
 use vasak_permissions_protocol::MANAGE_ACTION;
 

@@ -31,9 +31,9 @@ const SYSTEM_PREFIXES: [&str; 3] = ["/usr/", "/opt/", "/bin/"];
 /// sin que se mostrara un solo diálogo, porque la negativa llega antes de
 /// preguntarle a nadie.
 ///
-/// El único delegado de la lista es `/usr/bin/vasak-accounts`, y corre como
-/// root a propósito: los tokens viven en archivos de root, que es justamente lo
-/// que impide que un programa del usuario los lea por su cuenta. O sea que el
+/// El delegado de entonces era `/usr/bin/vasak-accounts`, y corre como root a
+/// propósito: los tokens viven en archivos de root, que es justamente lo que
+/// impide que un programa del usuario los lea por su cuenta. O sea que el
 /// delegado siempre tiene uid 0 y el sujeto siempre es un proceso del usuario:
 /// la igualdad no podía darse nunca.
 ///
@@ -54,6 +54,15 @@ const SYSTEM_PREFIXES: [&str; 3] = ["/usr/", "/opt/", "/bin/"];
 /// ahí preguntar por procesos ajenos. Eso filtraría la decisión de otra persona
 /// en el valor de retorno, y le abriría diálogos en su sesión. Un delegado no
 /// privilegiado sigue confinado a su propio usuario.
+///
+/// ── A quiénes alcanza hoy ───────────────────────────────────────────────────
+///
+/// A los dos delegados que corren como la persona: WirePlumber, que lee lo
+/// decidido para cada cliente de PipeWire, y el sincronizador de cuentas, que
+/// pregunta en nombre de la aplicación que lee el almacén local. Los dos
+/// atienden sólo a procesos de su propia sesión, así que la regla no les quita
+/// nada que necesiten; y sin ella, una copia de cualquiera de los dos corrida
+/// por otro usuario del equipo hablaría por todos.
 pub fn delegate_may_speak_for(delegate_uid: u32, subject_uid: u32) -> bool {
     delegate_uid == 0 || delegate_uid == subject_uid
 }

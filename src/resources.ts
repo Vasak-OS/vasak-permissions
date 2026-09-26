@@ -9,7 +9,7 @@
  * que no está en el catálogo, pedir su texto devolvería la clave cruda —
  * `resources.loquesea.title`— en la pantalla donde menos se puede permitir.
  */
-export const RECURSOS_CONOCIDOS = [
+export const KNOWN_RESOURCES = [
 	'camera',
 	'microphone',
 	'screen-capture',
@@ -21,11 +21,16 @@ export const RECURSOS_CONOCIDOS = [
 	'account.chat',
 	'account.drive',
 	'account.tasks',
+	// Leer lo que el sincronizador guardó en el almacén local. Otra pregunta que
+	// la de `account.*`: no llega a la cuenta, sólo a lo que ya se bajó.
+	'store.email',
+	'store.calendar',
+	'store.contacts',
 ] as const;
 
-export type RecursoConocido = (typeof RECURSOS_CONOCIDOS)[number];
+export type KnownResource = (typeof KNOWN_RESOURCES)[number];
 
 /** Si este id tiene textos en el catálogo. */
-export function esRecursoConocido(id: string): id is RecursoConocido {
-	return (RECURSOS_CONOCIDOS as readonly string[]).includes(id);
+export function isKnownResource(id: string): id is KnownResource {
+	return (KNOWN_RESOURCES as readonly string[]).includes(id);
 }
