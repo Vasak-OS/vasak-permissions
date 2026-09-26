@@ -57,7 +57,7 @@ describe('el marco del diálogo', () => {
 		// dibujan dos veces y se ven los dos.
 		const abierto = await preguntar();
 
-		expect(abierto.findAll('.rounded-corner-window').length).toBe(1);
+		expect(abierto.findAll('.rounded-corner-window')).toHaveLength(1);
 	});
 });
 
@@ -67,7 +67,7 @@ describe('los botones de la ventana', () => {
 		const abierto = await preguntar();
 
 		expect(abierto.findComponent(WindowControls).exists()).toBe(false);
-		expect(abierto.findAll('button[aria-label="Close"]').length).toBe(0);
+		expect(abierto.findAll('button[aria-label="Close"]')).toHaveLength(0);
 	});
 
 	test('y nada le pide a la ventana que se cierre', async () => {
