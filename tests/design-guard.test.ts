@@ -66,20 +66,33 @@ function stripComments(text: string): string {
 	let out = '';
 	let index = 0;
 	while (index < text.length) {
+		const char = text[index] as string;
+		// Un texto entre comillas se copia entero: un `//` o un `/*` adentro
+		// (`title="a // b"`) no abre ningún comentario, y cortarlo ahí se
+		// llevaba puesto lo que venía después en la misma línea.
+		if (char === '"' || char === '`') {
+			let end = index + 1;
+			while (end < text.length && text[end] !== char) end += text[end] === '\\' ? 2 : 1;
+			out += text.slice(index, end + 1);
+			index = end + 1;
+			continue;
+		}
 		const pair = pairs.find(([open]) => text.startsWith(open, index));
 		if (pair) {
 			const end = text.indexOf(pair[1], index + pair[0].length);
 			index = end === -1 ? text.length : end + pair[1].length;
 			continue;
 		}
-		// `//` de línea, salvo dentro de una dirección (`https://`) o un texto.
+		// `//` de línea, salvo dentro de una dirección (`https://`) o un texto
+		// con comilla simple, que no se sigue: en la prosa de una plantilla es
+		// un apóstrofo y no abre nada.
 		const previous = text[index - 1] ?? '';
-		if (text.startsWith('//', index) && !':"\'`'.includes(previous)) {
+		if (text.startsWith('//', index) && !':\'`'.includes(previous)) {
 			const end = text.indexOf('\n', index);
 			index = end === -1 ? text.length : end;
 			continue;
 		}
-		out += text[index];
+		out += char;
 		index += 1;
 	}
 	return out;
@@ -152,7 +165,7 @@ const VIEWPORT =
 const FORBIDDEN_SHAPE: Array<[string, RegExp]> = [
 	[
 		'sombras de Tailwind en vez de shadow-surface-*',
-		/(?<![\w-])(?:[a-z0-9@[\]-]+:)*(?:shadow(?:-(?:sm|md|lg|xl|2xl|inner))?|drop-shadow(?:-(?:sm|md|lg|xl|2xl|\[[^\]]*\]))?)(?![\w-])/g,
+		/(?<![\w-])(?:[a-z0-9@[\]-]+:)*(?:shadow(?:-(?:2xs|xs|sm|md|lg|xl|2xl|inner))?|drop-shadow(?:-(?:xs|sm|md|lg|xl|2xl|\[[^\]]*\]))?)(?![\w-])/g,
 	],
 	['desenfoque detrás', /backdrop-blur/g],
 	[
@@ -249,7 +262,9 @@ describe('los colores salen del esquema', () => {
 		for (const file of sources('**/*.css')) {
 			for (const line of (await read(SOURCE + file)).split('\n')) {
 				if (!line.match(LITERAL_COLOR)) continue;
-				if (/^\s*--[a-z0-9-]+\s*:\s*#[0-9a-fA-F]{3,8}\s*;\s*$/.test(line)) continue;
+				// Sólo en `main.css`: otra hoja que declare `--algo: #fff` y
+				// después lo use es un color dibujado a mano con un paso más.
+				if (`${SOURCE}${file}` === APP_CSS && /^\s*--[a-z0-9-]+\s*:\s*#[0-9a-fA-F]{3,8}\s*;\s*$/.test(line)) continue;
 				found.push(`${file}: ${line.trim()}`);
 			}
 		}
@@ -296,6 +311,11 @@ describe('los colores salen del esquema', () => {
 		expect([...'drop-shadow-[0_0_6px_rgba(59,130,246,0.5)]'.matchAll(LITERAL_COLOR)]).toHaveLength(1);
 		// Y un comentario no es un color.
 		expect(stripComments('/* #dd7878 */ <!-- rgb(1 2 3) -->')).not.toMatch(LITERAL_COLOR);
+		// Pero un `//` adentro de un texto no se come lo que sigue. (Sin la
+		// `g`: con ella, `toMatch` arranca donde terminó la búsqueda anterior.)
+		const once = new RegExp(LITERAL_COLOR.source);
+		expect(stripComments('<div title="a // b" class="bg-white rounded-md"></div>')).toMatch(once);
+		expect(stripComments('<div title="a /* b" class="bg-white"></div> */')).toMatch(once);
 	});
 });
 
@@ -351,13 +371,14 @@ describe('ningún punto de corte de la pantalla', () => {
 describe('lo que la forma de Once UI deja afuera', () => {
 	for (const [what, regex] of FORBIDDEN_SHAPE) {
 		test(`sin ${what}`, async () => {
-			expect(await findAll(sources('**/*.{vue,ts}'), regex)).toEqual([]);
+			// También en las hojas: un `@apply shadow-lg` es la misma sombra.
+			expect(await findAll(sources('**/*.{vue,ts,css}'), regex)).toEqual([]);
 		});
 	}
 
 	test('las duraciones son 100, 150, 200 o 300', async () => {
 		const found = await findAll(
-			sources('**/*.{vue,ts}'),
+			sources('**/*.{vue,ts,css}'),
 			/(?<![\w-])(?:[a-z0-9@[\]-]+:)*duration-(\d+)(?![\w-])/g,
 			(m) => !['100', '150', '200', '300'].includes(m[1] as string)
 		);
@@ -366,10 +387,12 @@ describe('lo que la forma de Once UI deja afuera', () => {
 	});
 
 	test('la guardia ve lo prohibido cuando lo hay', () => {
-		const sample = 'shadow-lg drop-shadow-[0_0_6px] hover:scale-110 backdrop-blur-md shadow-surface-l';
+		const sample = 'shadow-lg shadow-xs shadow-2xs drop-shadow-[0_0_6px] hover:scale-110 backdrop-blur-md shadow-surface-l';
 		const hits = FORBIDDEN_SHAPE.flatMap(([what, regex]) => [...sample.matchAll(regex)].map(() => what));
 
 		expect(hits).toEqual([
+			'sombras de Tailwind en vez de shadow-surface-*',
+			'sombras de Tailwind en vez de shadow-surface-*',
 			'sombras de Tailwind en vez de shadow-surface-*',
 			'sombras de Tailwind en vez de shadow-surface-*',
 			'desenfoque detrás',
