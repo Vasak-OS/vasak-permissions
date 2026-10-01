@@ -1,8 +1,12 @@
-/* biome-ignore-all lint/style/noDescendingSpecificity: el `body *` de más abajo
-   fija el color del texto y el bloque de `@layer base` fija `border-color`. La
-   regla compara selectores sin mirar qué propiedad tocan, así que ve un conflicto
-   donde no hay ninguno: ninguna de las dos declaraciones puede pisar a la otra. */
 @import "tailwindcss";
+
+/* La forma de los componentes, con el criterio de Once UI: radios derivados
+   del que eligió la persona, bordes finos, velos de estado, la superficie de lo
+   que flota, sombras, roles de texto y curvas. Va después de Tailwind, como
+   pide la librería, y trae también el piso del anillo de foco con `ui-focus`
+   (vue-libvasak#74, `docs/once-ui.md`). Los colores no están ahí: los deriva de
+   las `--use-*` de abajo, que pisa el config-manager con el esquema. */
+@import "@vasakgroup/vue-libvasak/tokens.css";
 
 /* Tailwind v4 no mira dentro de `node_modules`, así que las clases que sólo
    existen en los componentes de la librería compartida —el marco de la
@@ -34,17 +38,32 @@
   --ui-background: #eff1f5;
   --ui-surface: #ccd0da;
   --ui-border: #dce0e8;
+  /* El borde de lo que **delimita un control** —un campo, un botón, un selector—.
+     `--ui-border` da 1.17 contra el fondo en claro y 1.14 en oscuro, contra el
+     mínimo de 3.0 que pide WCAG 1.4.11 para lo que no es texto: a esos valores el
+     contorno de un input no se percibe. Se separa en dos tokens en lugar de subir
+     uno solo, porque el mismo color también hace de separador decorativo, y subirlo
+     ahí convertiría cada tarjeta en una caja marcada. */
+  --ui-border-strong: #7c7f93;
   --ui-background-dark: #1e1e2e;
   --ui-surface-dark: #313244;
   --ui-border-dark: #11111b;
+  --ui-border-strong-dark: #6c7086;
 
   /* Colores de Texto */
   --text-main: #4c4f69;
-  --text-muted: #6c6f85;
-  --text-on-primary: #5c5f77;
+  /* #555869 y no #6c6f85: el anterior daba 4.37 sobre el fondo y 3.20 sobre la
+     superficie, contra el mínimo de 4.5 de WCAG 1.4.3 — y es el color de casi todo
+     el texto secundario, que además suele ir en 12px o menos. Éste da 6.22 y 4.56,
+     y sigue siendo más claro que el texto principal, así que la jerarquía se
+     mantiene. El del modo oscuro ya cumplía (7.37 y 5.65) y no se toca. */
+  --text-muted: #555869;
+  --text-on-primary: #1e1e2e;
+  --text-on-secondary: #eff1f5;
   --text-main-dark: #cdd6f4;
   --text-muted-dark: #a6adc8;
-  --text-on-primary-dark: #cdd6f4;
+  --text-on-primary-dark: #1e1e2e;
+  --text-on-secondary-dark: #1e1e2e;
 
   /* Status */
   --status-error: #d20f39;
@@ -104,9 +123,11 @@
   --use-ui-background: var(--ui-background);
   --use-ui-surface: var(--ui-surface);
   --use-ui-border: var(--ui-border);
+  --use-ui-border-strong: var(--ui-border-strong);
   --use-text-main: var(--text-main);
   --use-text-muted: var(--text-muted);
   --use-text-on-primary: var(--text-on-primary);
+  --use-text-on-secondary: var(--text-on-secondary);
   --use-status-error: var(--status-error);
   --use-status-success: var(--status-success);
   --use-status-warning: var(--status-warning);
@@ -119,9 +140,11 @@
   --use-ui-background: var(--ui-background-dark);
   --use-ui-surface: var(--ui-surface-dark);
   --use-ui-border: var(--ui-border-dark);
+  --use-ui-border-strong: var(--ui-border-strong-dark);
   --use-text-main: var(--text-main-dark);
   --use-text-muted: var(--text-muted-dark);
   --use-text-on-primary: var(--text-on-primary-dark);
+  --use-text-on-secondary: var(--text-on-secondary-dark);
   --use-status-error: var(--status-error-dark);
   --use-status-success: var(--status-success-dark);
   --use-status-warning: var(--status-warning-dark);
@@ -140,9 +163,10 @@
   --font-title: var(--vsk-font-title);
   --font-mono: var(--vsk-font-terminal);
 
-  /* radius */
-  --radius-corner: var(--corner-radius);
-  --radius-corner-window: calc(var(--corner-radius) + 2px);
+  /* Los radios —`rounded-corner-xs…xl`, `-full` y `-window`— los declara
+     `tokens.css`, derivados todos de `--corner-radius` con `calc()`. Acá
+     había una copia (`corner` y `corner-window`) con los mismos valores; dos
+     lugares que dicen lo mismo terminan diciendo cosas distintas. */
 
   /* Colores de Marca - responsive a dark mode */
   --color-primary: var(--use-primary);
@@ -172,12 +196,26 @@
   animation: circle-in 500ms;
 }
 
-body * {
-  @apply text-tx-main transition-colors duration-300;
-}
+/* El color del texto se hereda del cuerpo y va en la capa `base`.
 
-.background {
-  @apply bg-ui-bg/80;
+   Era `body * { @apply text-tx-main }` suelto, fuera de toda capa, y en CSS
+   lo que no está en una capa le gana a lo que sí, sin mirar la especificidad:
+   pisaba **todas** las utilidades de color de texto, que Tailwind 4 emite en
+   `@layer utilities`. Acá el «Permitir» salía con el color principal sobre el
+   primario en vez de `text-tx-on-primary` (en oscuro, 1,4:1), igual que en el
+   escritorio (vasak-desktop#144). Heredado desde el cuerpo, lo que no pide
+   color sigue en `tx-main` y lo que lo pide, lo recibe.
+
+   La transición de colores al cambiar de tema se queda para todo, pero también
+   en `base`: así la de un componente la pisa en vez de perder contra ella. */
+@layer base {
+  body {
+    color: var(--color-tx-main);
+  }
+
+  body * {
+    @apply transition-colors duration-300;
+  }
 }
 
 @layer base {
@@ -186,7 +224,9 @@ body * {
   ::before,
   ::backdrop,
   ::file-selector-button {
-    border-color: var(--color-gray-200, currentColor);
+    /* El canto fino del esquema y no `gray-200`, que es un gris de la paleta
+       de Tailwind: un `border` sin color queda como los de la librería. */
+    border-color: var(--color-ui-line-weak, currentColor);
   }
 }
 
@@ -200,10 +240,43 @@ body * {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 4px;
+  /* Con `rgba(255,255,255,.2)` la barra era blanca sobre fondo claro, o sea
+     invisible, y un color escrito a mano. El token sigue al tema. */
+  background: color-mix(in srgb, var(--color-tx-muted) 45%, transparent);
+  border-radius: var(--radius-corner-xs);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: color-mix(in srgb, var(--color-tx-muted) 70%, transparent);
 }
+
+/* ── Accesibilidad: el movimiento ─────────────────────────────────────────── */
+
+/*
+ * Menos movimiento para quien lo pidió (WCAG 2.3.3, y 2.2.2 para lo que no para).
+ *
+ * En el escritorio hay 378 transiciones y 41 animaciones **infinitas** —pulsos de
+ * «conectando», ruedas de carga—, y cero soporte de esta preferencia. Para alguien
+ * con trastorno vestibular eso no es una molestia estética.
+ *
+ * No se apaga del todo: una duración mínima en lugar de `none` conserva los eventos
+ * `transitionend` y `animationend`, que hay código que espera. Y `iteration-count: 1`
+ * es lo que detiene lo infinito, que es la parte que de verdad marea.
+ */
+/* biome-ignore-start lint/complexity/noImportantStyles: acá `!important` es la
+   regla, no la excepción. Lo que hay que pisar son las transiciones que cada
+   componente declara con utilidades de Tailwind, que tienen más especificidad
+   que un selector universal: sin `!important` esta preferencia no gana ninguna
+   y la persona que la pidió sigue viendo todo moverse. Es además lo que hace
+   la propia hoja de reinicio de Tailwind y lo que recomienda WCAG 2.3.3. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* biome-ignore-end lint/complexity/noImportantStyles: fin del bloque de movimiento. */

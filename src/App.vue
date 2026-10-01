@@ -2,8 +2,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useI18n } from '@vasakgroup/tauri-plugin-i18n';
-import { AlertMessage, WindowFrame } from '@vasakgroup/vue-libvasak';
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { ActionButton, AlertMessage, WindowFrame } from '@vasakgroup/vue-libvasak';
+import { computed, nextTick, onMounted, onUnmounted, ref, useTemplateRef } from 'vue';
 import { isKnownResource } from '@/resources';
 import type { Question } from '@/types/permissions';
 
@@ -17,6 +17,20 @@ let unlistenFocus: (() => void) | null = null;
  */
 const load = async () => {
 	question.value = await invoke<Question | null>('pending_request');
+	await focusDeny();
+};
+
+const denyButton = useTemplateRef<{ $el: HTMLElement }>('denyButton');
+
+/**
+ * El foco arranca en «No permitir» en cada pregunta, no sólo en la primera:
+ * negar es la respuesta reversible, y un Enter apurado no puede conceder la
+ * cámara. También cuando la ventana vuelve a tomar el foco, que es cuando se
+ * relee la pregunta: volver al diálogo deja el foco en la respuesta segura.
+ */
+const focusDeny = async () => {
+	await nextTick();
+	denyButton.value?.$el.focus();
 };
 
 /** The permission service knows exactly who is asking and what for. */
@@ -143,24 +157,33 @@ onUnmounted(() => unlistenFocus?.());
 
 				<div class="mt-auto flex justify-end gap-2">
 					<!-- Refusing is the default action: it is the reversible one, and
-					     the safe answer for someone who is not sure. -->
-					<button
-						type="button"
+					     the safe answer for someone who is not sure.
+
+					     Los dos de la librería: «No permitir» es la acción secundaria
+					     (contorno, sin color de marca) y «Permitir» la principal. El
+					     de antes pasaba a `bg-secondary` al apuntarlo, o sea que la
+					     acción que concede el permiso cambiaba de color justo cuando
+					     uno estaba por apretarla. `lg` es el de 40 con `px-4`, el
+					     relleno de antes; eran de 36 de alto.
+
+					     El foco en «No permitir» lo pone `focusDeny()` y no un
+					     `autofocus`: el componente no declara ese atributo y, además,
+					     `autofocus` sólo actúa la primera vez que se arma el
+					     documento, y esta ventana se reusa entre preguntas. -->
+					<ActionButton
+						variant="secondary"
+						size="lg"
+						:label="t('dialog.deny')"
+						ref="denyButton"
 						:disabled="answering"
-						autofocus
-						class="rounded-corner border border-ui-border px-4 py-2 text-sm text-tx-main hover:bg-ui-surface disabled:opacity-50"
 						@click="answer(false)"
-					>
-						{{ t('dialog.deny') }}
-					</button>
-					<button
-						type="button"
+					/>
+					<ActionButton
+						size="lg"
+						:label="t('dialog.allow')"
 						:disabled="answering"
-						class="rounded-corner bg-primary px-4 py-2 text-sm font-semibold text-tx-on-primary hover:bg-secondary disabled:opacity-50"
 						@click="answer(true)"
-					>
-						{{ t('dialog.allow') }}
-					</button>
+					/>
 				</div>
 			</template>
 
