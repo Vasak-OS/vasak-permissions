@@ -83,11 +83,13 @@ function stripComments(text: string): string {
 			index = end === -1 ? text.length : end + pair[1].length;
 			continue;
 		}
-		// `//` de línea, salvo dentro de una dirección (`https://`) o un texto
+		// `//` de línea, salvo dentro de una dirección (`https://`, con su
+		// esquema delante: un `clave: // nota` sí es comentario) o de un texto
 		// con comilla simple, que no se sigue: en la prosa de una plantilla es
 		// un apóstrofo y no abre nada.
 		const previous = text[index - 1] ?? '';
-		if (text.startsWith('//', index) && !':\'`'.includes(previous)) {
+		const isUrl = /[a-z][a-z0-9+.-]*:$/i.test(text.slice(Math.max(0, index - 32), index));
+		if (text.startsWith('//', index) && !isUrl && previous !== "'") {
 			const end = text.indexOf('\n', index);
 			index = end === -1 ? text.length : end;
 			continue;
@@ -292,6 +294,17 @@ describe('los colores salen del esquema', () => {
 		expect(await read(APP_CSS)).not.toMatch(/(?<![\w-])\.background\b/);
 	});
 
+	test('respeta a quien pidió menos movimiento', async () => {
+		// `tokens.css` no lo trae: lo pone cada aplicación. Sin esto, la
+		// transición de colores de `body *` y las entradas de los componentes
+		// siguen moviéndose para quien lo pidió (WCAG 2.3.3).
+		const css = await read(APP_CSS);
+		const block = css.slice(css.indexOf('@media (prefers-reduced-motion: reduce)'));
+		expect(block.length, 'falta el bloque de prefers-reduced-motion').toBeGreaterThan(0);
+		expect(block).toMatch(/transition-duration:\s*0\.01ms\s*!important/);
+		expect(block).toMatch(/animation-iteration-count:\s*1\s*!important/);
+	});
+
 	test('ni las copias de lo que trae `tokens.css`', async () => {
 		// Los radios y el piso del foco viven en la librería. Una copia acá,
 		// por venir después, le gana: así el foco volvía al primario (2,64:1
@@ -316,6 +329,9 @@ describe('los colores salen del esquema', () => {
 		const once = new RegExp(LITERAL_COLOR.source);
 		expect(stripComments('<div title="a // b" class="bg-white rounded-md"></div>')).toMatch(once);
 		expect(stripComments('<div title="a /* b" class="bg-white"></div> */')).toMatch(once);
+		// Y una dirección no es un comentario, pero `clave: // nota` sí.
+		expect(stripComments("src: url(https://x/bg-white)")).toMatch(once);
+		expect(stripComments('gap: // bg-white')).not.toMatch(once);
 	});
 });
 

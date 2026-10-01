@@ -249,3 +249,34 @@
 ::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--color-tx-muted) 70%, transparent);
 }
+
+/* ── Accesibilidad: el movimiento ─────────────────────────────────────────── */
+
+/*
+ * Menos movimiento para quien lo pidió (WCAG 2.3.3, y 2.2.2 para lo que no para).
+ *
+ * En el escritorio hay 378 transiciones y 41 animaciones **infinitas** —pulsos de
+ * «conectando», ruedas de carga—, y cero soporte de esta preferencia. Para alguien
+ * con trastorno vestibular eso no es una molestia estética.
+ *
+ * No se apaga del todo: una duración mínima en lugar de `none` conserva los eventos
+ * `transitionend` y `animationend`, que hay código que espera. Y `iteration-count: 1`
+ * es lo que detiene lo infinito, que es la parte que de verdad marea.
+ */
+/* biome-ignore-start lint/complexity/noImportantStyles: acá `!important` es la
+   regla, no la excepción. Lo que hay que pisar son las transiciones que cada
+   componente declara con utilidades de Tailwind, que tienen más especificidad
+   que un selector universal: sin `!important` esta preferencia no gana ninguna
+   y la persona que la pidió sigue viendo todo moverse. Es además lo que hace
+   la propia hoja de reinicio de Tailwind y lo que recomienda WCAG 2.3.3. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* biome-ignore-end lint/complexity/noImportantStyles: fin del bloque de movimiento. */
