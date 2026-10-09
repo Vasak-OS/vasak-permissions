@@ -3767,9 +3767,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-config-manager"
-version = "2.9.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c8d2be166dbde4fb90d7ff8ec9ffa2468f9b88fb102beb02e97299486b44f7"
+checksum = "303125a33539d51c468063b7dea115813cbc7b03e1170ea83efd8ccba45abb78"
 dependencies = [
  "dirs 6.0.0",
  "home",
@@ -3898,7 +3898,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.21",
- "toml 1.1.6+spec-1.1.0",
+ "toml 0.9.12+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
