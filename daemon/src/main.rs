@@ -33,7 +33,7 @@ use zbus::{interface, Connection};
 use agent::{AgentRegistry, SharedAgents};
 use identity::PinnedCaller;
 use policy::PolicyStore;
-use throttle::{NoticeThrottle, PromptThrottle};
+use throttle::{NoticeThrottle, PromptThrottle, ReaskThrottle};
 use vasak_permissions_protocol::{
     Decision, PermissionRequest, Resource, SERVICE_INTERFACE, SERVICE_NAME, SERVICE_PATH,
 };
@@ -54,6 +54,12 @@ struct PermissionService {
     /// conexión**: un navegador que abre tres a PipeWire consultaría tres veces
     /// por lo mismo antes de que la primera quede anotada.
     notices: Arc<Mutex<NoticeThrottle>>,
+    /// Cada cuánto una aplicación puede volver a pedirse a sí misma un permiso.
+    ///
+    /// `RequestAgain` no pasa por polkit a propósito —el sentido es que la
+    /// aplicación se re-pida sola—, así que este techo es lo que impide que se
+    /// convierta en una forma de reabrir el diálogo hasta cansar a la persona.
+    reask: Arc<Mutex<ReaskThrottle>>,
     /// Lo que algún perfil ajeno bloqueó y todavía nadie decidió.
     ///
     /// Va acá y no en la política porque es otra cosa: la política guarda
@@ -377,6 +383,82 @@ impl PermissionService {
 
         Ok(decision.is_allowed())
     }
+
+    /// El núcleo de `RequestAgain`, con la identidad del llamante ya resuelta y
+    /// el instante inyectado, para poder probar el alcance, el techo y el olvido
+    /// sin un bus — el mismo patrón que `pin_delegated_subject`.
+    ///
+    /// Sólo olvida la decisión del **propio** llamante sobre **ese** recurso.
+    /// Nunca concede: lo más que puede provocar es que el próximo chequeo quede
+    /// `Unknown` y vuelva a preguntar.
+    async fn reask(
+        &self,
+        uid: u32,
+        binary_path: &str,
+        resource_id: &str,
+        now: std::time::Instant,
+    ) -> zbus::fdo::Result<()> {
+        // Un recurso desconocido, o uno que no se puede hacer cumplir contra este
+        // llamante, no tiene diálogo que reabrir: se rechaza igual que en
+        // `check_permission`, y antes de tocar nada.
+        check_resource(resource_id, binary_path)?;
+
+        // Sólo dentro del alcance declarado del programa. Que el gestor de
+        // archivos «se vuelva a pedir» el correo es el mismo fallo o ataque que
+        // pedirlo de cero, y la respuesta es la misma: no. Se valida antes del
+        // techo, para que un pedido fuera de alcance dé siempre `AccessDenied` y
+        // no gaste cupo.
+        if !vasak_permissions_protocol::may_request(binary_path, resource_id) {
+            tracing::warn!(
+                "FUERA DE ALCANCE — {binary_path} quiso volver a pedir \
+                 '{resource_id}', que no está entre sus recursos. Se niega"
+            );
+            return Err(FdoError::AccessDenied(format!(
+                "{binary_path} no puede pedir '{resource_id}', así que tampoco \
+                 puede volver a pedirlo"
+            )));
+        }
+
+        // El techo contra la fatiga de permisos. Un re-pedido cada
+        // `REASK_COOLDOWN` por (persona, programa, recurso); el segundo seguido
+        // no olvida nada y no reabre ningún diálogo.
+        if !self
+            .reask
+            .lock()
+            .await
+            .allow(uid, binary_path, resource_id, now)
+        {
+            tracing::info!(
+                "Re-pedido de '{resource_id}' por {binary_path} (usuario {uid}) \
+                 demasiado seguido; no se reabre el diálogo"
+            );
+            return Err(FdoError::LimitsExceeded(format!(
+                "ya se volvió a pedir '{resource_id}' hace poco; esperá un momento"
+            )));
+        }
+
+        // Olvidar sólo este recurso de este programa. `forget` (entero) borraría
+        // las demás decisiones; acá se saca una sola, para que el próximo chequeo
+        // quede `Unknown` y vuelva a preguntar sin perder lo demás.
+        let _guard = self.write_lock.lock().await;
+        let mut policy = self.store.load(uid).map_err(FdoError::Failed)?;
+        if policy.forget_resource(binary_path, resource_id) {
+            self.store.save(uid, &policy).map_err(FdoError::Failed)?;
+            tracing::info!(
+                "Re-pedido de '{resource_id}' por {binary_path} (usuario {uid}); \
+                 se olvidó la decisión anterior, el próximo chequeo vuelve a preguntar"
+            );
+        } else {
+            // No había nada que olvidar: ya estaba en `Unknown`, así que el
+            // próximo chequeo iba a preguntar igual. Se deja constancia y no se
+            // reescribe el archivo.
+            tracing::info!(
+                "Re-pedido de '{resource_id}' por {binary_path} (usuario {uid}); \
+                 no había decisión que olvidar"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[interface(name = "ar.net.vasak.os.Permissions")]
@@ -639,6 +721,55 @@ impl PermissionService {
         self.store
             .save(caller.uid, &policy)
             .map_err(FdoError::Failed)
+    }
+
+    /// Deja que una aplicación vuelva a pedir **su propio** permiso sobre un
+    /// recurso: olvida la decisión que tenía para ese recurso, de modo que el
+    /// próximo chequeo quede `Unknown` y vuelva a abrir el diálogo. Es el
+    /// prerequisito de un botón «pedir permiso de nuevo».
+    ///
+    /// ── Por qué NO pasa por polkit, a diferencia de `ForgetPermission` ────────
+    ///
+    /// `ForgetPermission` olvida un programa **cualquiera**, elegido por quien
+    /// llama, y por eso está detrás de polkit: sin él una aplicación le borraría
+    /// a otra lo que la persona decidió. Esto es lo contrario, y la diferencia es
+    /// lo que lo hace seguro sin autenticar:
+    ///
+    /// - **Sólo por sí misma.** La identidad del llamante sale de la **conexión**
+    ///   —el ejecutable detrás de su pid fijado, igual que en `CheckPermission`—
+    ///   y no de un parámetro. No hay forma de nombrar otro binario, así que no
+    ///   se puede re-pedir por otro. Un parámetro `binary_path` lo permitiría: por
+    ///   eso no existe.
+    /// - **Sólo un recurso suyo, y dentro de su alcance.** `may_request` lo acota
+    ///   igual que a `SetPermission`; fuera de alcance es `AccessDenied`.
+    /// - **Nunca concede.** Lo único que hace es olvidar, que a lo sumo provoca
+    ///   una pregunta. No hay camino por el que termine en `Allowed`.
+    ///
+    /// Pedir la contraseña para que una aplicación se vuelva a preguntar a sí
+    /// misma enseñaría a tipearla sin leer, como en `RecordPortalDecision`.
+    ///
+    /// ── Qué la contiene igual ────────────────────────────────────────────────
+    ///
+    /// Que no haya polkit no quiere decir que no haya límite. Sin uno, esto sería
+    /// una forma de reabrir el diálogo una y otra vez hasta que la persona ceda
+    /// de cansada —la fatiga de permisos que polkit evita en `ForgetPermission`—.
+    /// Así que hay un techo por (persona, programa, recurso): un re-pedido cada
+    /// minuto; el segundo seguido devuelve error y no reabre nada. Ver
+    /// [`throttle::ReaskThrottle`].
+    async fn request_again(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        resource_id: String,
+    ) -> zbus::fdo::Result<()> {
+        let caller = caller_of(connection, &header).await?;
+        self.reask(
+            caller.uid,
+            &caller.binary_path(),
+            &resource_id,
+            std::time::Instant::now(),
+        )
+        .await
     }
 
     /// Lo que se decidió para una aplicación que llegó por el portal.
@@ -958,6 +1089,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_lock,
         throttle: Arc::new(Mutex::new(PromptThrottle::default())),
         notices: Arc::new(Mutex::new(NoticeThrottle::default())),
+        reask: Arc::new(Mutex::new(ReaskThrottle::default())),
         pendientes: Arc::clone(&pendientes),
     };
 
@@ -1142,6 +1274,7 @@ mod tests_interfaz {
             write_lock: Arc::new(Mutex::new(())),
             throttle: Arc::new(Mutex::new(PromptThrottle::default())),
             notices: Arc::new(Mutex::new(NoticeThrottle::default())),
+            reask: Arc::new(Mutex::new(ReaskThrottle::default())),
             pendientes: Default::default(),
         }
     }
@@ -1264,6 +1397,46 @@ mod tests_interfaz {
         assert_ne!(entradas(&pregunta), entradas(&lee));
     }
 
+    /// `RequestAgain` existe y se llama como las aplicaciones consumidoras creen.
+    ///
+    /// Lo llaman por su nombre en una cadena procesos que se compilan por
+    /// separado —correo, calendario, contactos, escritorio—, así que un renombre
+    /// de este lado compila perfecto y las deja llamando a un método que no
+    /// existe.
+    #[test]
+    fn el_re_pedido_se_llama_como_los_consumidores_creen() {
+        let xml = introspeccion();
+        let metodo = vasak_permissions_protocol::REQUEST_AGAIN_METHOD;
+        assert!(
+            xml.contains(&format!(r#"<method name="{metodo}">"#)),
+            "la interfaz no exporta {metodo}:\n{xml}"
+        );
+    }
+
+    /// Y toma **sólo** el id del recurso, no contesta nada, y en particular **no
+    /// toma un binario**.
+    ///
+    /// Esto es lo que prueba la propiedad de seguridad central: la identidad del
+    /// llamante sale de la conexión, no de un parámetro, así que una aplicación
+    /// no puede re-pedir por otra. Un parámetro `binary_path` aparecería acá como
+    /// una segunda entrada `s`, y la prueba se caería.
+    #[test]
+    fn el_re_pedido_toma_solo_el_recurso_y_nada_de_binarios() {
+        let xml = introspeccion();
+        let bloque = bloque_del_metodo(&xml, vasak_permissions_protocol::REQUEST_AGAIN_METHOD);
+
+        assert_eq!(
+            entradas(&bloque),
+            vec!["s"],
+            "RequestAgain tiene que tomar sólo el id del recurso; un segundo \
+             argumento sería un binario, y eso dejaría re-pedir por otro\n{bloque}"
+        );
+        assert!(
+            salidas(&bloque).is_empty(),
+            "RequestAgain no contesta nada\n{bloque}"
+        );
+    }
+
     fn bloque_del_metodo(xml: &str, metodo: &str) -> String {
         let inicio = xml
             .find(&format!(r#"<method name="{metodo}">"#))
@@ -1290,5 +1463,200 @@ mod tests_interfaz {
 
     fn salidas(bloque: &str) -> Vec<String> {
         argumentos(bloque, "out")
+    }
+}
+
+#[cfg(test)]
+mod tests_reask {
+    use super::*;
+
+    use std::time::Instant;
+
+    use vasak_permissions_protocol::{Application, Decision, Provenance};
+
+    /// Un servicio con un almacén en un directorio temporal: `un_servicio`
+    /// apunta a `/var/lib`, que no se puede escribir en una prueba.
+    fn servicio_con_almacen(dir: &tempfile::TempDir) -> PermissionService {
+        PermissionService {
+            store: PolicyStore::at(dir.path().to_path_buf()),
+            agents: Arc::new(Mutex::new(AgentRegistry::default())),
+            write_lock: Arc::new(Mutex::new(())),
+            throttle: Arc::new(Mutex::new(PromptThrottle::default())),
+            notices: Arc::new(Mutex::new(NoticeThrottle::default())),
+            reask: Arc::new(Mutex::new(ReaskThrottle::default())),
+            pendientes: Default::default(),
+        }
+    }
+
+    fn app(binary_path: &str) -> Application {
+        Application {
+            binary_path: binary_path.into(),
+            display_name: "prueba".into(),
+            provenance: Provenance::SystemInstalled,
+        }
+    }
+
+    fn con_decision(
+        service: &PermissionService,
+        uid: u32,
+        binary: &str,
+        resource: &str,
+        d: Decision,
+    ) {
+        let mut policy = service.store.load(uid).unwrap();
+        policy.record(&app(binary), resource, d, true);
+        service.store.save(uid, &policy).unwrap();
+    }
+
+    /// (a) Tras un «denegado» recordado, el re-pedido deja el recurso en
+    /// `Unknown` — que es, exactamente, lo que hace que el próximo chequeo vuelva
+    /// a preguntar (ver las pruebas de `decide`/`policy`, donde `Unknown` es el
+    /// único estado que abre el diálogo). Sin el cambio no habría cómo pasar de
+    /// un rechazo recordado a una nueva pregunta por reintentar.
+    #[tokio::test]
+    async fn tras_un_denegado_recordado_el_recurso_vuelve_a_sin_decidir() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-connect";
+        con_decision(&service, 1000, binary, "camera", Decision::Denied);
+
+        service
+            .reask(1000, binary, "camera", Instant::now())
+            .await
+            .expect("el re-pedido tiene que pasar");
+
+        assert_eq!(
+            service.store.load(1000).unwrap().decision(binary, "camera"),
+            Decision::Unknown,
+            "unknown es lo que hace que el próximo chequeo vuelva a preguntar"
+        );
+    }
+
+    /// (c) Nunca concede: sólo puede dejar un recurso en `Unknown`, nunca en
+    /// `Allowed`. Ni partiendo de un «permitido» previo (que degrada a `Unknown`,
+    /// no mantiene el permiso), ni partiendo de nada.
+    #[tokio::test]
+    async fn nunca_concede_solo_puede_dejar_sin_decidir() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-connect";
+
+        // Partiendo de «permitido».
+        con_decision(&service, 1000, binary, "camera", Decision::Allowed);
+        service
+            .reask(1000, binary, "camera", Instant::now())
+            .await
+            .expect("pasa");
+        assert_ne!(
+            service.store.load(1000).unwrap().decision(binary, "camera"),
+            Decision::Allowed,
+            "el re-pedido no puede dejar un recurso permitido"
+        );
+
+        // Partiendo de nada: tampoco inventa un permiso.
+        let service2 = servicio_con_almacen(&dir);
+        service2
+            .reask(1001, binary, "microphone", Instant::now())
+            .await
+            .expect("pasa");
+        assert_eq!(
+            service2
+                .store
+                .load(1001)
+                .unwrap()
+                .decision(binary, "microphone"),
+            Decision::Unknown,
+            "sin decisión previa sigue en unknown, nunca allowed"
+        );
+    }
+
+    /// (d) El techo corta el segundo re-pedido seguido, y un re-pedido cortado no
+    /// cambia el estado: no puede usarse para machacar el diálogo.
+    #[tokio::test]
+    async fn el_techo_corta_el_segundo_re_pedido_seguido() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-connect";
+        let ahora = Instant::now();
+
+        con_decision(&service, 1000, binary, "camera", Decision::Denied);
+        service
+            .reask(1000, binary, "camera", ahora)
+            .await
+            .expect("el primero pasa");
+
+        // Se vuelve a dejar un «denegado» para comprobar que el segundo no lo
+        // toca.
+        con_decision(&service, 1000, binary, "camera", Decision::Denied);
+        let resultado = service.reask(1000, binary, "camera", ahora).await;
+
+        assert!(
+            matches!(resultado, Err(FdoError::LimitsExceeded(_))),
+            "el segundo seguido se corta, y con un error claro"
+        );
+        assert_eq!(
+            service.store.load(1000).unwrap().decision(binary, "camera"),
+            Decision::Denied,
+            "un re-pedido cortado no puede cambiar el estado"
+        );
+    }
+
+    /// (e) Un recurso fuera del alcance declarado da `AccessDenied`, igual que
+    /// pedirlo de cero: el gestor de archivos sólo llega a los discos en la nube,
+    /// así que no puede volver a pedir el correo.
+    #[tokio::test]
+    async fn un_recurso_fuera_de_alcance_da_access_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+
+        let resultado = service
+            .reask(
+                1000,
+                "/usr/bin/vasak-file-manager",
+                "account.email",
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(resultado, Err(FdoError::AccessDenied(_))),
+            "el gestor de archivos no puede re-pedir el correo"
+        );
+    }
+
+    /// Un fuera-de-alcance no gasta cupo: se rechaza antes de tocar el techo, así
+    /// que no puede dejar sin re-pedir a un recurso que sí estaba permitido pedir.
+    #[tokio::test]
+    async fn el_fuera_de_alcance_no_gasta_el_cupo() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let gestor = "/usr/bin/vasak-file-manager";
+        let ahora = Instant::now();
+
+        // Varios intentos fuera de alcance seguidos.
+        for _ in 0..3 {
+            assert!(service
+                .reask(1000, gestor, "account.email", ahora)
+                .await
+                .is_err());
+        }
+        // El recurso que sí puede pedir se re-pide igual: el techo está intacto.
+        service
+            .reask(1000, gestor, "account.drive", ahora)
+            .await
+            .expect("un recurso en alcance se re-pide aunque antes se hayan rechazado otros");
+    }
+
+    /// Un recurso desconocido se rechaza con `InvalidArgs`, antes que nada, igual
+    /// que en `check_permission`.
+    #[tokio::test]
+    async fn un_recurso_desconocido_se_rechaza() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+
+        let resultado = service
+            .reask(1000, "/usr/bin/vasak-connect", "no-existe", Instant::now())
+            .await;
+        assert!(matches!(resultado, Err(FdoError::InvalidArgs(_))));
     }
 }

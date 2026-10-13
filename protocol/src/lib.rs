@@ -52,6 +52,23 @@ pub const RECORD_PORTAL_DECISION_METHOD: &str = "RecordPortalDecision";
 /// para todos sin que nada diga por qué.
 pub const QUERY_PERMISSION_FOR_METHOD: &str = "QueryPermissionFor";
 
+/// El método con el que una aplicación se vuelve a pedir **a sí misma** un
+/// permiso: olvida su propia decisión sobre un recurso para que el próximo
+/// chequeo vuelva a abrir el diálogo.
+///
+/// Acá, junto a los otros nombres de método, porque lo llaman procesos que se
+/// compilan por separado: las aplicaciones de correo, calendario y contactos y
+/// el escritorio, detrás de un botón «pedir permiso de nuevo», lo nombran por
+/// esta cadena. Un renombre de este lado compila perfecto y las deja llamando a
+/// un método que no existe.
+///
+/// Toma un solo argumento —el id del recurso— y no contesta nada. La identidad
+/// del llamante sale de la **conexión** (el ejecutable detrás de su pid), no de
+/// un parámetro, justamente para que una aplicación no pueda re-pedir por otra.
+/// Una prueba del demonio comprueba que la interfaz exporte este nombre con esa
+/// firma.
+pub const REQUEST_AGAIN_METHOD: &str = "RequestAgain";
+
 /// polkit action guarding every change made from the settings interface.
 ///
 /// Without it, any program could call `SetPermission` and grant itself what it
