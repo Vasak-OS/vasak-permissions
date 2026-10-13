@@ -90,6 +90,30 @@ impl UserPolicy {
         self.applications.remove(binary_path).is_some()
     }
 
+    /// Olvida **una sola** decisión de un programa, dejando las demás en pie.
+    ///
+    /// A diferencia de [`Self::forget`], que borra el programa entero, esto saca
+    /// nada más el recurso indicado: es lo que deja que una aplicación vuelva a
+    /// pedir **un** permiso suyo —el botón «pedir permiso de nuevo»— sin perder
+    /// lo que ya había decidido sobre los otros. El próximo chequeo de ese
+    /// recurso queda en `Unknown` y vuelve a abrir el diálogo.
+    ///
+    /// Si era la última decisión del programa, el programa sale del archivo,
+    /// igual que si se lo hubiera olvidado entero: un programa sin ninguna
+    /// decisión no es nada que la pantalla tenga que mostrar.
+    ///
+    /// Devuelve si había algo que olvidar.
+    pub fn forget_resource(&mut self, binary_path: &str, resource_id: &str) -> bool {
+        let Some(app) = self.applications.get_mut(binary_path) else {
+            return false;
+        };
+        let removed = app.decisions.remove(resource_id).is_some();
+        if app.decisions.is_empty() {
+            self.applications.remove(binary_path);
+        }
+        removed
+    }
+
     /// Lo que la pantalla muestra.
     ///
     /// Se sacan las decisiones que caen fuera del alcance declarado del
@@ -424,6 +448,69 @@ mod tests {
             Decision::Unknown
         );
         assert!(!policy.forget("/usr/bin/meet"), "already gone");
+    }
+
+    /// Olvidar un recurso deja los demás en pie: es la diferencia con `forget`,
+    /// y es lo que hace que «pedir de nuevo» la cámara no borre lo decidido para
+    /// el micrófono.
+    #[test]
+    fn olvidar_un_recurso_no_toca_los_demas() {
+        let mut policy = UserPolicy::default();
+        let app = application("/usr/bin/meet");
+        policy.record(&app, "camera", Decision::Denied, true);
+        policy.record(&app, "microphone", Decision::Allowed, true);
+
+        assert!(policy.forget_resource("/usr/bin/meet", "camera"));
+        assert_eq!(
+            policy.decision("/usr/bin/meet", "camera"),
+            Decision::Unknown,
+            "el recurso olvidado vuelve a sin decidir"
+        );
+        assert_eq!(
+            policy.decision("/usr/bin/meet", "microphone"),
+            Decision::Allowed,
+            "olvidar la cámara no puede borrar el micrófono"
+        );
+    }
+
+    /// Si era la última decisión, el programa sale del archivo entero, igual que
+    /// con `forget`: un programa sin decisiones no es nada que la pantalla
+    /// muestre.
+    #[test]
+    fn olvidar_el_ultimo_recurso_saca_el_programa() {
+        let mut policy = UserPolicy::default();
+        policy.record(
+            &application("/usr/bin/meet"),
+            "camera",
+            Decision::Denied,
+            true,
+        );
+
+        assert!(policy.forget_resource("/usr/bin/meet", "camera"));
+        assert!(
+            policy.entries().is_empty(),
+            "sin ninguna decisión no queda entrada del programa"
+        );
+    }
+
+    /// Olvidar lo que no estaba no inventa nada y no toca lo que sí estaba.
+    #[test]
+    fn olvidar_lo_que_no_estaba_no_hace_nada() {
+        let mut policy = UserPolicy::default();
+        policy.record(
+            &application("/usr/bin/meet"),
+            "camera",
+            Decision::Denied,
+            true,
+        );
+
+        assert!(!policy.forget_resource("/usr/bin/meet", "microphone"));
+        assert!(!policy.forget_resource("/usr/bin/otro", "camera"));
+        assert_eq!(
+            policy.decision("/usr/bin/meet", "camera"),
+            Decision::Denied,
+            "lo que había sigue intacto"
+        );
     }
 
     #[test]

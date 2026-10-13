@@ -100,6 +100,54 @@ impl NoticeThrottle {
     }
 }
 
+/// Un techo sobre cada cuánto una aplicación puede volver a pedirse **a sí
+/// misma** un permiso.
+///
+/// Distinto de los otros dos y por otro motivo. `RequestAgain` no pasa por
+/// polkit —el sentido es que la aplicación se re-pida sola, detrás de un botón—,
+/// así que sin este techo sería una forma de reabrir el diálogo una y otra vez
+/// hasta que la persona ceda de cansada: justo la fatiga de permisos que
+/// `ForgetPermission` evita quedándose detrás de polkit. Un programa recién
+/// denegado no tiene por qué volver a preguntar al segundo; una persona que de
+/// verdad quiere reintentar puede esperar [`REASK_COOLDOWN`].
+///
+/// Se recuerda por persona, programa y recurso: que una aplicación se re-pida la
+/// cámara no puede callar su re-pedido del micrófono, ni el de otra aplicación,
+/// ni el de otra sesión.
+#[derive(Default)]
+pub struct ReaskThrottle {
+    last: HashMap<(u32, String, String), Instant>,
+}
+
+/// Cuánto tiene que pasar entre dos «pedir de nuevo» del mismo programa por el
+/// mismo recurso.
+///
+/// Un minuto: alto como para que una aplicación no pueda machacar el diálogo, y
+/// bajo como para que alguien que denegó por error y quiere reintentar no quede
+/// trabado. Lo elige este archivo a propósito, para que ajustarlo sea un solo
+/// cambio y la revisión de seguridad tenga dónde mirarlo.
+const REASK_COOLDOWN: Duration = Duration::from_secs(60);
+
+impl ReaskThrottle {
+    /// Si se puede volver a pedir ahora. Anota el momento **sólo cuando devuelve
+    /// `true`**: un intento rechazado no corre el reloj, así que la ventana se
+    /// mide desde el último re-pedido que de verdad ocurrió y no se puede estirar
+    /// a fuerza de insistir.
+    pub fn allow(&mut self, uid: u32, binary_path: &str, resource_id: &str, now: Instant) -> bool {
+        // Que el mapa no crezca sin techo en una sesión larga; de paso saca lo
+        // que ya cumplió el enfriamiento.
+        self.last
+            .retain(|_, when| now.duration_since(*when) < REASK_COOLDOWN);
+
+        let key = (uid, binary_path.to_string(), resource_id.to_string());
+        if self.last.contains_key(&key) {
+            return false;
+        }
+        self.last.insert(key, now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +296,73 @@ mod tests {
         assert!(techo.should_notify(1000, "/usr/bin/otro", "camera", ahora));
         assert!(techo.should_notify(1000, "/usr/bin/navegador", "microphone", ahora));
         assert!(techo.should_notify(1001, "/usr/bin/navegador", "camera", ahora));
+    }
+
+    /// El caso que justifica el techo de re-pedidos: un re-pedido pasa y el
+    /// siguiente, seguido, no. Sin esto un botón «pedir de nuevo» sería una
+    /// forma de abrir el diálogo a repetición.
+    #[test]
+    fn un_re_pedido_pasa_y_el_siguiente_seguido_no() {
+        let mut techo = ReaskThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.allow(1000, "/usr/bin/vasak-mail", "account.email", ahora));
+        assert!(!techo.allow(1000, "/usr/bin/vasak-mail", "account.email", ahora));
+    }
+
+    /// Pasado el enfriamiento se puede volver a pedir.
+    #[test]
+    fn pasado_el_enfriamiento_vuelve_a_pasar() {
+        let mut techo = ReaskThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.allow(1000, "/usr/bin/vasak-mail", "account.email", ahora));
+        assert!(techo.allow(
+            1000,
+            "/usr/bin/vasak-mail",
+            "account.email",
+            ahora + REASK_COOLDOWN
+        ));
+    }
+
+    /// Un intento cortado no corre el reloj: la ventana se mide desde el último
+    /// re-pedido que de verdad ocurrió, no desde el que se rechazó. Si corriera,
+    /// una aplicación insistente podría estirar su propio enfriamiento para
+    /// siempre y nunca dejar pasar el próximo que sí correspondía.
+    #[test]
+    fn un_intento_cortado_no_corre_el_reloj() {
+        let mut techo = ReaskThrottle::default();
+        let inicio = Instant::now();
+
+        assert!(techo.allow(1000, "/usr/bin/vasak-mail", "account.email", inicio));
+        // A mitad del enfriamiento se insiste y se corta.
+        assert!(!techo.allow(
+            1000,
+            "/usr/bin/vasak-mail",
+            "account.email",
+            inicio + Duration::from_secs(40)
+        ));
+        // Al cumplirse el enfriamiento desde el **primero**, vuelve a pasar. Si
+        // el intento cortado hubiera corrido el reloj, acá todavía estaría
+        // bloqueado.
+        assert!(techo.allow(
+            1000,
+            "/usr/bin/vasak-mail",
+            "account.email",
+            inicio + REASK_COOLDOWN
+        ));
+    }
+
+    /// Callar un re-pedido no puede callar otro: otro recurso, otro programa u
+    /// otra persona se piden igual.
+    #[test]
+    fn otro_recurso_programa_o_persona_no_se_callan() {
+        let mut techo = ReaskThrottle::default();
+        let ahora = Instant::now();
+
+        assert!(techo.allow(1000, "/usr/bin/vasak-mail", "account.email", ahora));
+        assert!(techo.allow(1000, "/usr/bin/vasak-mail", "camera", ahora));
+        assert!(techo.allow(1000, "/usr/bin/vasak-calendar", "account.email", ahora));
+        assert!(techo.allow(1001, "/usr/bin/vasak-mail", "account.email", ahora));
     }
 }
