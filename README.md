@@ -1,159 +1,397 @@
-# vasak-permissions
+# Vasak permissions
 
-El servicio de permisos de VasakOS. Responde una sola pregunta —«¿puede este
-programa usar esto?»— para la cámara, el micrófono, la captura de pantalla y las
-cuentas en línea, y recuerda lo que la persona contestó.
+Gestor de permisos y portales de seguridad.
 
-## Por qué es un servicio de sistema
+---
 
-Las dos cosas que hacen falta para que un permiso signifique algo son
-imposibles dentro de la sesión del usuario:
+## Tecnología
 
-- **Saber quién llama** exige leer `/proc/<pid>/exe` de un proceso ajeno, que un
-  proceso sin privilegios no puede hacer.
-- **Guardar la respuesta** exige un archivo que los programas del usuario no
-  puedan reescribir. Si vive en su directorio de configuración, cualquier
-  programa se otorga lo que quiera y la lista es decorativa.
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![Tauri](https://img.shields.io/badge/Tauri-2.0-24283b?style=flat&logo=tauri)](https://tauri.app/) [![Vue](https://img.shields.io/badge/Vue-3.5-42b883?style=flat&logo=vue.js)](https://vuejs.org/) [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178c6?style=flat&logo=typescript)](https://www.typescriptlang.org/) [![systemd](https://img.shields.io/badge/systemd-user-24283b?style=flat&logo=systemd)](https://systemd.io/)
 
-Por eso corre como root en el bus del sistema, y la política vive en
-`/var/lib/vasak-permissions/<uid>.json` con modo 0600.
+## Estado
 
-## Las tres piezas
+[![CI](https://github.com/Vasak-OS/vasak-permissions/actions/workflows/ci.yml/badge.svg)](https://github.com/Vasak-OS/vasak-permissions/actions/workflows/ci.yml)
+[![Versión](https://img.shields.io/github/v/release/Vasak-OS/vasak-permissions?style=flat&label=Versi%C3%B3n)](https://github.com/Vasak-OS/vasak-permissions/releases)
+[![Licencia](https://img.shields.io/github/license/Vasak-OS/vasak-permissions?style=flat)](LICENSE)
+[![Cobertura](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-permissions&metric=coverage&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-permissions)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-permissions&metric=alert_status&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-permissions)
+[![Tamaño repo](https://img.shields.io/github/repo-size/Vasak-OS/vasak-permissions?style=flat)](https://github.com/Vasak-OS/vasak-permissions)
 
-| Directorio | Qué es |
-|---|---|
-| `protocol/` | El contrato D-Bus, compartido, para que las dos puntas no se desincronicen |
-| `daemon/` | El servicio de sistema (`/usr/bin/vasak-permissions`) |
-| `src-tauri/`, `src/` | El agente de diálogo (`/usr/bin/vasak-permissions-agent`) |
+---
 
-El agente no crea ninguna ventana hasta que llega una consulta: un proceso Tauri
-con la ventana oculta cuesta unos 150 MB permanentes, y un permiso se pregunta
-un puñado de veces en la vida del sistema.
+## Descripción
 
-## Cómo no se puede engañar
+Gestor de permisos y portales de seguridad.
 
-- El demonio **solo acepta como agente** a un proceso cuyo ejecutable sea
-  exactamente `/usr/bin/vasak-permissions-agent`. Escribir en `/usr/bin` requiere
-  root, así que ningún programa del usuario puede hacerse pasar por el agente y
-  aprobarse todo solo.
-- Cambiar un permiso pasa por polkit (`ar.net.vasak.os.permissions.manage`). Sin
-  eso, un programa al que se le negó el micrófono llamaría a `SetPermission` y se
-  lo otorgaría.
-- El PID del llamante se fija con `pidfd` **antes** de leer nada sobre él, para
-  que el ejecutable resuelto no pueda ser el de otro proceso que reutilizó el
-  número.
-- Cada aplicación del sistema tiene **declarado hasta dónde puede pedir**
-  (`SCOPED_BINARIES`), y lo que queda afuera se niega **sin preguntar**. Que el
-  gestor de archivos pida el correo no es una decisión que alguien tenga que
-  tomar: es un fallo o un ataque, y mostrar un diálogo pondría a la persona a
-  autorizar justamente lo que la lista existe para impedir. Ver abajo.
+**Para el usuario:** 
 
-## El alcance de cada aplicación
+**Integración VasakOS:** Integra con el ecosistema VasakOS vía D-Bus y configuración compartida.
 
-El reparto de capacidades entre aplicaciones —el gestor de archivos a los discos
-en la nube, el calendario al calendario— era una convención y nada más. Sin nada
-que lo sostenga, bastaba reemplazar el binario del gestor de archivos para pedir
-`account.email` con un diálogo que se ve igual que cualquier otro, y la persona
-diría que sí porque confía en el gestor de archivos.
+---
 
-`SCOPED_BINARIES`, en el crate del protocolo y al lado de `DELEGATE_BINARIES`,
-declara el alcance de cada aplicación propia. Está compilada y no en un archivo
-por lo mismo que la otra: es un límite de seguridad, no un catálogo — un archivo
-en `/etc` lo cambia root, que es quien instala las aplicaciones de todas formas,
-así que no gana nada y sí agrega un lugar más que auditar.
+## Arquitectura (diagramas)
 
-Se hace cumplir en tres puntos, y los tres hacen falta:
+> Copia y pega la plantilla que necesites, descomenta y adapta.
 
-| Dónde | Qué impide |
-|---|---|
-| `decide()` | Que el programa lo pida. Se niega antes de mirar lo guardado y antes de preguntar. |
-| `SetPermission` | Que la pantalla lo conceda. Si no, quedaría un interruptor encendido que `decide()` niega igual. |
-| `ListPermissions` | Que la pantalla lo muestre. Un interruptor que no hace nada en ninguna de sus dos posiciones es peor que ninguno. |
+### Flujo de datos
 
-**Acota, no habilita.** Un programa que no figura en la lista sigue como
-siempre: pide, y la persona decide — no se puede enumerar todo lo que alguien
-instala, y negar lo no enumerado dejaría al sistema sin poder correr nada de
-terceros. Y estar en la lista con un recurso tampoco lo concede: lo sigue
-decidiendo la persona.
+```mermaid
+graph TD
+    A[Entrada: Teclado / Ratón / D-Bus / Sistema / systemd socket] --> B[Procesamiento: Core Rust + Tauri Commands + systemd daemon]
+    B --> C[Salida: UI actualizada / Acciones del sistema / D-Bus]
+    style A fill:#e1f5fe
+    style C fill:#e8f5e9
+```
 
-**Un alcance puede ser vacío**, y el de la pantalla de configuración lo es. Esa
-pantalla administra las cuentas —las agrega, las quita, muestra qué aplicaciones
-tienen acceso— y no las usa, así que no puede pedir ningún recurso: una
-configuración reemplazada no llega a ningún token y ni siquiera puede preguntar.
+### Componentes internos
 
-Lo que el alcance vacío **no** limita, porque de otra forma asustaría: pedir un
-recurso es una cosa y administrar la política es otra. `ListPermissions` y
-`SetPermission` consultan el alcance del programa **administrado**, no el de
-quien administra, así que la configuración sigue pudiendo conceder y quitar
-permisos de otros programas. Lo único que no puede es concederse algo a sí misma.
+```mermaid
+flowchart LR
+    subgraph App[Vasak permissions]
+        UI[Frontend Vue 3 + vue-libvasak]
+        Core[Core Rust: panel, overview, notifications, media + daemon systemd]
+        IPC[Tauri Commands / Eventos + D-Bus]
+    end
+    UI --> IPC
+    IPC --> Core
+    Core --> DBus[(D-Bus / zbus)]
+    Core --> System[Systemd --user / D-Bus / Wayfire IPC / PipeWire]
+    style UI fill:#f3e5f5
+    style Core fill:#e3f2fd
+    style DBus fill:#fff3e0
+    style System fill:#fce4ec
+```
 
-El sincronizador —`vasak-accounts-sync`— también está en la lista, con
-`account.email`, `account.calendar` y `account.contacts` y nada más. Baja las
-tres áreas a un almacén local cifrado, y la meta es que sea el **único** proceso
-que llega a la credencial: a medida que cada aplicación migre a leer del
-almacén, pierde su `account.<área>` y gana el `store.<área>` correspondiente.
-Hoy no migró ninguna, así que ninguna tiene `store.*` en su alcance, y el
-calendario y los contactos conservan su `account.*`.
+### Integración en el sistema VasakOS
 
-## Leer el almacén local: `store.*`
+```mermaid
+C4Context
+    title Vasak permissions en VasakOS
+    Person(usuario, "Usuario", "Persona que usa el sistema")
+    System_Boundary(c1, "VasakOS") {
+        System(app, "Vasak permissions", "Gestor de permisos y portales de seguridad.")
+        System_Ext(settings, "vasak-settings", "Configuración central")
+        System_Ext(keyring, "vasak-keyring", "Secrets y claves")
+        System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
+        System_Ext(permissions, "vasak-permissions", "Permisos y portales")
+    }
+    System_Ext(systemd, "systemd --user", "Socket-activated via D-Bus")
+    System_Ext(dbus, "D-Bus sesión", "Bus de mensajes")
+    System_Ext(wayland, "Wayland / Wayfire", "Compositor + plugins")
+    System_Ext(pipewire, "PipeWire", "Control de medios MPRIS")
+    Rel(usuario, app, "Usa")
+    Rel(app, settings, "Lee/escribe config")
+    Rel(app, keyring, "Guarda/lee secrets")
+    Rel(app, accounts, "Identidad de cuenta")
+    Rel(app, permissions, "Solicita permisos")
+    Rel(app, systemd, "Socket-activated via D-Bus")
+    Rel(app, dbus, "Expone interfaces D-Bus")
+    Rel(app, wayland, "Wayfire IPC: workspaces, ventanas")
+    Rel(app, pipewire, "MPRIS: metadatos y controles")
+```
 
-`store.email`, `store.calendar` y `store.contacts` son **leer lo que el
-sincronizador guardó**, y no llegar a la cuenta. La diferencia importa:
-`account.calendar` entrega el token, y en un servidor como Nextcloud esa
-contraseña abre también los contactos y los archivos; `store.calendar` sólo deja
-ver los eventos que ya se bajaron. Un recurso por área, de lectura: dos diálogos
-casi iguales confunden más de lo que protegen.
+---
 
-Quien pregunta es el sincronizador, en nombre de la aplicación que lee: por eso
-está en `DELEGATE_BINARIES`. Corre como la persona, así que —igual que
-WirePlumber— **sólo puede preguntar por procesos de su propio usuario**; por uno
-ajeno se le niega sin diálogo. El único delegado que habla por cualquiera es el
-servicio de cuentas, que corre como root.
+## Instalación
 
-Decidir `store.*` cambia algo —el sincronizador consulta antes de servir cada
-lectura— pero un rechazo **no es una frontera**: la base es un archivo de la
-persona y su clave vive en el llavero de la sesión, que le entrega sus secretos
-a cualquier proceso de ese mismo usuario. Por eso `is_enforceable` contesta que
-no: es consentimiento y visibilidad, no contención.
+### Arch Linux (repo oficial)
 
-## El camino del portal
+```bash
+pacman -S vasak-permissions
+```
 
-Cámara y captura de pantalla llegan además por `xdg-desktop-portal`, que le
-pide el diálogo a un backend. Ese backend es el agente de este repositorio, y
-desde ahí **consulta lo guardado antes de preguntar**: lo que ya se concedió no
-se vuelve a preguntar, lo que se rechazó se rechaza sin diálogo, y las dos cosas
-se pueden retirar desde Configuración.
+### Debian / Ubuntu (.deb)
 
-Antes se preguntaba y se descartaba la respuesta. Medido con Chrome pidiendo
-compartir la pantalla: cuatro diálogos idénticos en veinte segundos, y nada
-anotado en ninguna parte.
+```bash
+wget https://github.com/Vasak-OS/vasak-permissions/releases/download/v{{VERSION}}/vasak-permissions_{{VERSION}}_amd64.deb
+sudo apt install ./vasak-permissions_{{VERSION}}_amd64.deb
+```
 
-### Contra qué se guarda, y cuánto vale
+### Desde fuente
 
-Contra el `app_id` que entrega el portal, que **no** es la ruta del ejecutable
-con la que se identifica todo lo demás. La declara la propia aplicación llamando
-a `Register` en `org.freedesktop.host.portal.Registry`, y nadie comprueba que le
-corresponda: un programa puede registrarse como `com.google.Chrome` y heredar lo
-que Chrome tenga concedido.
+```bash
+git clone https://github.com/Vasak-OS/vasak-permissions.git
+cd vasak-permissions
 
-Se usa igual porque la alternativa era peor. Un diálogo que reaparece cada vez
-no deja a nadie más seguro: enseña a conceder sin leer. Lo que sí se hace es no
-disimularlo — estas entradas quedan como no verificadas, viven en un espacio de
-nombres aparte (`portal:<app_id>`) y se distinguen a simple vista en el archivo
-de política.
+# Desarrollo (recarga en caliente frontend + backend)
+bun run dev
 
-Un `app_id` vacío —lo que llega de todo programa que no se registró— se sigue
-preguntando cada vez y no se guarda.
+# Build producción
+bun run build
+```
 
-## Lo que este servicio todavía no puede hacer cumplir
+### Flatpak / AppImage
 
-El camino de arriba cubre lo que **pasa por el portal**, que es por donde piden
-la cámara los navegadores y las aplicaciones de videollamada. Lo que no cubre es
-la otra puerta: una aplicación que abre `/dev/video0` directamente o que le
-habla al socket de PipeWire no pasa por acá y no se entera de ninguna decisión.
+> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
 
-Para eso hay un perfil de AppArmor, y sólo alcanza a los AppImage: todo lo que
-instaló el gestor de paquetes no tiene perfil. Cerrar la vía de PipeWire está
-pendiente de que WirePlumber aplique permisos por cliente — el registro de ese
-camino, con lo medido y lo descartado, está en
-`vasak-desktop-settings/docs/permisos-de-medios.md`.
+---
+
+## Uso rápido
+
+```bash
+# Se lanza automáticamente al iniciar la sesión Wayfire (systemd --user socket-activated)
+# Para lanzar manualmente (debug):
+vasak-permissions
+```
+
+### Atajos / flags principales
+
+| Acción | Comando / Tecla |
+|--------|-----------------|
+| Acción principal | `vasak-permissions` |
+| Configuración | `vasak-permissions --config` |
+| Ayuda | `vasak-permissions --help` |
+
+> **Captura:** `assets/demo.gif` *(placeholder — sustituir por GIF real)*
+
+---
+
+## Configuración
+
+### Archivo de configuración
+
+```
+~/.config/vasak/permissions.toml
+```
+
+Ejemplo mínimo:
+
+```toml
+[panel]
+position = "top"
+height = 36
+autohide = false
+
+[overview]
+blur_background = true
+show_recent = true
+max_recent = 8
+
+[notifications]
+position = "right"
+width = 360
+max_visible = 10
+
+[media]
+show_artwork = true
+preferred_players = ["spotify", "firefox", "mpv"]
+```
+
+### Variables de entorno
+
+| Variable | Descripción | Por defecto |
+|----------|-------------|-------------|
+| `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
+| `VASAK_PROFILE` | Perfil de rendimiento: balanced, performance, power-save | `balanced` |
+
+### Integración con `tauri-plugin-config-manager`
+
+- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
+- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
+- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
+- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
+
+---
+
+## Desarrollo
+
+### Requisitos
+
+- **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
+- **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
+- **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
+- *`libgtk-layer-shell-dev`, `wayland-protocols`, `wayfire-dev` para Wayland*
+
+### Dependencias de desarrollo
+
+#### Sistema (paquetes Arch / Debian / Fedora)
+
+`base-devel`, `pkgconf`, `libssl-dev`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `libpipewire-0.3-dev`, `libwireplumber-0.5-dev`, `libdbus-1-dev`, `libudev-dev`, `libxkbcommon-dev`, `libwayland-dev`, `meson`, `ninja`, `clang`, `lld`
+
+#### Rust
+
+`rustup` → `stable` + `rustfmt` + `clippy`
+
+#### Node
+
+**Solo `bun`** (nunca npm/yarn/pnpm para apps Tauri). `bun --version` ≥ 1.1
+
+#### Herramientas CLI
+
+`just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
+
+### Correr en desarrollo
+
+```bash
+# Frontend (Vite dev server + Tauri dev)
+bun run tauri dev
+
+# Solo frontend (Vite)
+bun run dev
+
+# Solo backend (cargo watch)
+cargo watch -x "run --bin vasak-permissions`
+```
+
+### Compilar / Build de release
+
+```bash
+# Build completo (frontend + backend + bundle)
+bun run tauri build
+
+# Solo frontend (para testear bundle después)
+bun run build
+
+# Solo backend Rust (binario optimizado)
+cargo build --release --locked
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-permissions/
+# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+```
+
+### Targets principales
+
+```bash
+# Desarrollo
+bun run dev
+
+# Build producción
+bun run build
+
+# Solo frontend
+bun run build:frontend
+
+# Solo backend Rust
+cargo build --release --locked
+
+# Lint + tipos (pre-commit / CI)
+bunx --bun biome check .
+bunx vue-tsc --noEmit
+cargo fmt --check
+```
+
+### Pruebas
+
+```bash
+# Suite completa JS (Vitest via bun:test)
+bun test
+
+# Suite completa Rust (crates en pruebas_rust del CI)
+cargo test -p vasak-permissions-core -p vasak-permissions-ui --locked
+
+# Integración (requiere Wayfire corriendo)
+cargo test -p vasak-permissions-integration --locked -- --ignored
+```
+
+### Convención de commits
+
+[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/):
+
+```
+<tipo>(<ámbito>): <descripción corta>
+
+[cuerpo opcional]
+
+[pie opcional: Closes #N]
+```
+
+Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `refactor`, `perf`, `test`.
+
+### Cómo abrir PR
+
+1. Rama desde `origin/main`:
+   ```bash
+   git worktree add -b feat/{{TEMA}} ~/wt/vasak-permissions-{{TEMA}} origin/main
+   ```
+2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
+3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
+4. Al abrir PR, **cuatro cosas obligatorias**:
+   - Asignado a `JoaquinDecima`
+   - Etiqueta `enhancement` o `bug` (+ `ci` / `dependencies` si aplica)
+   - Añadido al proyecto «VasakOS Roadmap»
+   - Status **In Progress**
+
+---
+
+## Arquitectura (texto)
+
+### Crates / módulos principales
+
+| Crate / Módulo | Responsabilidad |
+|----------------|-----------------|
+| `vasak-permissions-core` | Lógica compartida: estado, D-Bus, IPC |
+| `vasak-permissions-ui` | Frontend Vue 3 + componentes vue-libvasak |
+| `vasak-permissions-tauri` | Puente Tauri: commands, eventos, WebView |
+
+### Interfaces D-Bus / zbus expuestas
+
+| Interfaz | Métodos / Señales / Propiedades | Descripción |
+|----------|----------------------------------|-------------|
+| `org.vasak.Vasak-permissions` | `GetState()`, `StateChanged(dict)`, `SetConfig(dict)` | Estado y control principal |
+| `org.vasak.Vasak-permissions.Panel` | `SetPosition(string)`, `SetAutohide(bool)`, `Height(u32)` | Configuración panel en runtime |
+
+### Puntos de extensión
+
+- **Plugins:** Sistema de plugins modular
+- **Hooks:** Hooks de ciclo de vida
+- **API pública Rust:** API pública del crate principal
+
+### Features / Cargo features
+
+| Feature | Descripción | Default |
+|---------|-------------|---------|
+| `system-tray` | Bandeja del sistema + menú contextual | ✓ |
+| `notifications` | Integración libnotify / freedesktop | ✓ |
+| `updater` | Auto-actualización (tauri-plugin-updater) | |
+| `devtools` | DevTools en release (solo debug) | |
+| `experimental-wayland` | Protocolo Wayland inestable | |
+
+Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+
+---
+
+## Pruebas y calidad
+
+- **Cobertura objetivo:** ≥ 80 % del código nuevo (SonarCloud Quality Gate)
+- **Informes:** GitHub Actions → pestaña *SonarCloud Code Analysis* → enlace a SonarCloud
+- **Añadir pruebas:** ver `AGENTS.md` sección 9 (mapa de repos y comandos de prueba)
+- **Regla:** toda corrección lleva prueba escrita por `qa` que falla sin el fix
+
+---
+
+## Contribuir
+
+- **Guía:** [CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [ISSUE_TEMPLATE](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
+
+---
+
+## Contribuidores
+
+> **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
+
+<div align="center">
+  <a href="https://github.com/JoaquinDecima" target="_blank"><img src="https://avatars.githubusercontent.com/u/11674229?v=4&s=40" width="40" height="40" alt="JoaquinDecima" style="border-radius: 50%; margin: 2px;" title="JoaquinDecima (166 contribuciones)"></a>
+</div>
+
+[Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-permissions/graphs/contributors)
+
+---
+
+## Donadores / Sponsors
+
+[![Sponsors](https://img.shields.io/github/sponsors/Vasak-OS?style=flat&label=Sponsors)](https://github.com/sponsors/Vasak-OS)
+
+> **Backers:** *Actualizado automáticamente en CI desde GitHub Sponsors / OpenCollective / Polar.*
+
+[💖 Donar al proyecto](https://github.com/sponsors/Vasak-OS)
+
+---
+
+## Licencia
+
+`GPL-3.0` — Copyright © 2026 **Vasak-OS Contributors**
+
+[Ver licencia completa](LICENSE)
