@@ -26,13 +26,13 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 const TIEMPO_DE_AVISO: Duration = Duration::from_secs(10);
 
 /// The unique bus name and object path of one registered agent.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct RegisteredAgent {
     unique_name: String,
     object_path: String,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct AgentRegistry {
     by_uid: HashMap<u32, RegisteredAgent>,
 }
