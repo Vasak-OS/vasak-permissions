@@ -21,6 +21,7 @@ mod policy;
 mod polkit;
 mod procesos;
 mod throttle;
+const INTROSPECTION_XML: &str = include_str!("introspection.xml");
 
 use std::sync::Arc;
 

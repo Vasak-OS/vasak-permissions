@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 5;
 const WINDOW: Duration = Duration::from_secs(60);
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PromptThrottle {
     /// When each recent prompt was shown, per user, oldest first.
     recent: HashMap<u32, Vec<Instant>>,
@@ -66,8 +66,7 @@ impl PromptThrottle {
 ///
 /// Se recuerda por persona, programa y recurso, que es exactamente lo que el
 /// aviso dice. Dos programas distintos, o el mismo pidiendo dos cosas, son
-/// avisos distintos y tienen que salir los dos.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct NoticeThrottle {
     shown: HashMap<(u32, String, String), Instant>,
 }

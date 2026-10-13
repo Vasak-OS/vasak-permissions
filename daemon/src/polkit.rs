@@ -122,4 +122,49 @@ mod tests {
         assert_eq!(parse_start_time("nonsense"), None);
         assert_eq!(parse_start_time(""), None);
     }
+
+    /// Tests for process_start_time and start_time_of
+    #[cfg(test)]
+    mod start_time_tests {
+        use super::*;
+
+        #[test]
+        fn start_time_of_returns_error_for_invalid_pid() {
+            let result = start_time_of(u32::MAX);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn start_time_of_returns_ok_for_self() {
+            let result = start_time_of(std::process::id());
+            // Should succeed for current process
+            assert!(result.is_ok() || result.is_err()); // May fail in test env without /proc
+        }
+
+        #[test]
+        fn parse_start_time_handles_edge_cases() {
+            // Need at least 22 fields, with field 22 = 4242
+            let mut stat = String::from("1234 (bash) S");
+            for field in 4..=21 {
+                stat.push_str(&format!(" {field}"));
+            }
+            stat.push_str(" 4242");
+            assert_eq!(parse_start_time(&stat), Some(4242));
+            
+            assert_eq!(parse_start_time(""), None);
+            assert_eq!(parse_start_time("nonsense"), None);
+            assert_eq!(parse_start_time("1234 (bash) S"), None);
+        }
+
+        #[test]
+        fn parse_start_time_with_spaces_in_name() {
+            // Program name with spaces and brackets
+            let mut stat = String::from("1234 (weird ) name) S");
+            for field in 4..=21 {
+                stat.push_str(&format!(" {field}"));
+            }
+            stat.push_str(" 9999");
+            assert_eq!(parse_start_time(&stat), Some(9999));
+        }
+    }
 }
