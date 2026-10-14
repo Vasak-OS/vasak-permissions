@@ -4511,6 +4511,7 @@ dependencies = [
  "tracing-subscriber",
  "vasak-permissions-protocol",
  "zbus",
+ "zbus_macros",
 ]
 
 [[package]]

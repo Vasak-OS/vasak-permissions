@@ -15,6 +15,7 @@ vasak-permissions-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zbus.workspace = true
+zbus_macros = { version = "5", features = ["default"] }
 tokio.workspace = true
 libc = "0.2"
 tracing = "0.1"

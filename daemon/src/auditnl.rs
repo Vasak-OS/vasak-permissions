@@ -323,4 +323,36 @@ mod tests {
         m[0..4].copy_from_slice(&4u32.to_ne_bytes());
         assert_eq!(texto_de_mensaje(&m), None);
     }
+
+    /// Pruebas para el tipo de mensaje inválido.
+    #[test]
+    fn tipo_de_mensaje_invalido() {
+        let m = mensaje(1000, UNA_DENEGACION);
+        assert_eq!(texto_de_mensaje(&m), None);
+    }
+
+    /// Mensaje vacío.
+    #[test]
+    fn mensaje_vacio() {
+        assert_eq!(texto_de_mensaje(&[]), None);
+    }
+
+    /// Mensaje con tipo exactamente en el límite.
+    #[test]
+    fn tipo_en_limite() {
+        let m = mensaje(PRIMER_TIPO_DE_EVENTO - 1, UNA_DENEGACION);
+        assert_eq!(texto_de_mensaje(&m), None);
+
+        let m = mensaje(PRIMER_TIPO_DE_EVENTO, UNA_DENEGACION);
+        assert_eq!(texto_de_mensaje(&m), Some(UNA_DENEGACION));
+    }
+
+    /// Texto con caracteres UTF-8 válidos.
+    #[test]
+    fn texto_utf8_valido() {
+        let texto =
+            "audit(123.456:789): apparmor=\"DENIED\" operation=\"open\" name=\"/home/user/文件\"";
+        let m = mensaje(1400, texto);
+        assert_eq!(texto_de_mensaje(&m), Some(texto));
+    }
 }
