@@ -150,7 +150,7 @@ mod tests {
             }
             stat.push_str(" 4242");
             assert_eq!(parse_start_time(&stat), Some(4242));
-            
+
             assert_eq!(parse_start_time(""), None);
             assert_eq!(parse_start_time("nonsense"), None);
             assert_eq!(parse_start_time("1234 (bash) S"), None);

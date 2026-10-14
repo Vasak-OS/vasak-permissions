@@ -533,5 +533,4 @@ mod tests {
         let cache = con(7, &[("/home/x/a.AppImage", 10)]);
         assert_eq!(recordada(&cache, 7, en(10 + MEMORIA.as_secs() + 1)), None);
     }
-
-    }
+}

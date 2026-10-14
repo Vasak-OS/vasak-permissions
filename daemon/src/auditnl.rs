@@ -342,7 +342,7 @@ mod tests {
     fn tipo_en_limite() {
         let m = mensaje(PRIMER_TIPO_DE_EVENTO - 1, UNA_DENEGACION);
         assert_eq!(texto_de_mensaje(&m), None);
-        
+
         let m = mensaje(PRIMER_TIPO_DE_EVENTO, UNA_DENEGACION);
         assert_eq!(texto_de_mensaje(&m), Some(UNA_DENEGACION));
     }
@@ -350,7 +350,8 @@ mod tests {
     /// Texto con caracteres UTF-8 válidos.
     #[test]
     fn texto_utf8_valido() {
-        let texto = "audit(123.456:789): apparmor=\"DENIED\" operation=\"open\" name=\"/home/user/文件\"";
+        let texto =
+            "audit(123.456:789): apparmor=\"DENIED\" operation=\"open\" name=\"/home/user/文件\"";
         let m = mensaje(1400, texto);
         assert_eq!(texto_de_mensaje(&m), Some(texto));
     }
