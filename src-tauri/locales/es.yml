@@ -55,15 +55,15 @@ resources:
       Va a poder ver los mensajes que ya se bajaron de tus cuentas. No va a
       poder entrar a tu casilla ni enviar nada.
   store.calendar:
-    title: ¿Querés que {0} lea el calendario guardado en este equipo?
+    title: ¿Querés que {0} vea y cambie el calendario guardado en este equipo?
     explanation: >-
-      Va a poder ver los eventos y las tareas que ya se bajaron de tus cuentas.
-      No va a poder entrar a tu cuenta ni cambiar nada.
+      Va a poder ver y modificar los eventos y las tareas que ya se bajaron de
+      tus cuentas. No le da acceso directo a tu cuenta en la nube.
   store.contacts:
-    title: ¿Querés que {0} lea los contactos guardados en este equipo?
+    title: ¿Querés que {0} vea y cambie los contactos guardados en este equipo?
     explanation: >-
-      Va a poder ver la libreta de direcciones que ya se bajó de tus cuentas.
-      No va a poder entrar a tu cuenta ni cambiar nada.
+      Va a poder ver y modificar la libreta de direcciones que ya se bajó de
+      tus cuentas. No le da acceso directo a tu cuenta en la nube.
 
 blocked:
   camera: "{0} quiso usar la cámara"
