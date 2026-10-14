@@ -6,7 +6,7 @@ Gestor de permisos y portales de seguridad.
 
 ## Tecnología
 
-[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![Tauri](https://img.shields.io/badge/Tauri-2.0-24283b?style=flat&logo=tauri)](https://tauri.app/) [![Vue](https://img.shields.io/badge/Vue-3.5-42b883?style=flat&logo=vue.js)](https://vuejs.org/) [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178c6?style=flat&logo=typescript)](https://www.typescriptlang.org/) [![systemd](https://img.shields.io/badge/systemd-user-24283b?style=flat&logo=systemd)](https://systemd.io/)
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![systemd](https://img.shields.io/badge/systemd-user-24283b?style=flat&logo=systemd)](https://systemd.io/) [![D-Bus](https://img.shields.io/badge/D-Bus-1.15%2B-42b883?style=flat&logo=dbus)](https://dbus.freedesktop.org/) [![zbus](https://img.shields.io/badge/zbus-4.0-orange?style=flat&logo=rust)](https://github.com/dbus2/zbus)
 
 ## Estado
 
@@ -21,22 +21,22 @@ Gestor de permisos y portales de seguridad.
 
 ## Descripción
 
-Gestor de permisos y portales de seguridad.
+`vasak-permissions` es un servicio de sistema (daemon) que gestiona los permisos y portales de seguridad en VasakOS. Actúa como guardián centralizado que decide qué aplicaciones pueden acceder a recursos sensibles (cámara, micrófono, pantalla, archivos, etc.) basándose en políticas configuradas por el usuario.
 
-**Para el usuario:** 
+**Para el usuario:** Control centralizado de qué aplicaciones pueden acceder a recursos sensibles (cámara, micrófono, pantalla, archivos, etc.) mediante una interfaz de diálogos de consentimiento.
 
-**Integración VasakOS:** Integra con el ecosistema VasakOS vía D-Bus y configuración compartida.
+**Integración VasakOS:** Expone la interfaz D-Bus `org.vasak.Permissions` para que el portal de escritorio y las aplicaciones consulten y soliciten permisos. Se integra con `vasak-keyring` para almacenamiento seguro de decisiones y con `vasak-accounts` para identidad de aplicaciones.
 
 ---
 
-## Arquitectura (diagramas)
+## Arquitectura
 
 ### Flujo de datos
 
 ```mermaid
 graph TD
-    A[Entrada: Teclado / Ratón / D-Bus / Sistema] --> B[Procesamiento: Core Rust + Tauri Commands]
-    B --> C[Salida: UI actualizada / Acciones del sistema]
+    A[Entrada: Portal D-Bus / App delegada] --> B[Procesamiento: Políticas + Excepciones AppArmor]
+    B --> C[Salida: Decisión permitida/denegada + Notificación si es primera vez]
     style A fill:#e1f5fe
     style C fill:#e8f5e9
 ```
@@ -45,47 +45,45 @@ graph TD
 
 ```mermaid
 flowchart LR
-    subgraph App[Vasak permissions]
-        UI[Frontend Vue 3 + vue-libvasak]
-        Core[Core Rust: panel, overview, notifications, media + daemon systemd]
-        IPC[Tauri Commands / Eventos + D-Bus]
+    subgraph App[vasak-permissions]
+        Core[Core Rust: Políticas + AppArmor + D-Bus]
+        IPC[D-Bus / zbus]
+        Audit[Audit: AppArmor + Kernel]
     end
-    UI --> IPC
     IPC --> Core
     Core --> DBus[(D-Bus / zbus)]
-    Core --> System[Systemd --user / D-Bus / Wayfire IPC / PipeWire]
-    style UI fill:#f3e5f5
+    Core --> Audit
+    Core --> AppArmor[(AppArmor Profiles)]
+    Audit --> Core
     style Core fill:#e3f2fd
-    style DBus fill:#fff3e0
-    style System fill:#fce4ec
+    style Audit fill:#fff3e0
+    style DBus fill:#f3e5f5
 ```
 
 ### Integración en el sistema VasakOS
 
 ```mermaid
 C4Context
-    title Vasak permissions en VasakOS
+    title vasak-permissions en VasakOS
     Person(usuario, "Usuario", "Persona que usa el sistema")
     System_Boundary(c1, "VasakOS") {
-        System(app, "Vasak permissions", "Gestor de permisos y portales de seguridad.")
-        System_Ext(settings, "vasak-settings", "Configuración central")
+        System(perms, "vasak-permissions", "Gestor de permisos y portales")
         System_Ext(keyring, "vasak-keyring", "Secrets y claves")
         System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
-        
+        System_Ext(settings, "vasak-settings", "Configuración central")
     }
     System_Ext(systemd, "systemd --user", "Socket-activated via D-Bus")
     System_Ext(dbus, "D-Bus sesión", "Bus de mensajes")
-    System_Ext(wayland, "Wayland / Wayfire", "Compositor + plugins")
-    System_Ext(pipewire, "PipeWire", "Control de medios MPRIS")
-    Rel(usuario, app, "Usa")
-    Rel(app, settings, "Lee/escribe config")
-    Rel(app, keyring, "Guarda/lee secrets")
-    Rel(app, accounts, "Identidad de cuenta")
-    Rel(app, permissions, "Solicita permisos")
-    Rel(app, systemd, "Socket-activated via D-Bus")
-    Rel(app, dbus, "Expone interfaces D-Bus")
-    Rel(app, wayland, "Wayfire IPC: workspaces, ventanas")
-    Rel(app, pipewire, "MPRIS: metadatos y controles")
+    System_Ext(apparmor, "AppArmor", "Perfiles de seguridad")
+    System_Ext(portal, "xdg-desktop-portal", "Portal de escritorio")
+    Rel(usuario, perms, "Configura permisos vía vasak-settings")
+    Rel(perms, keyring, "Almacena decisiones cifradas")
+    Rel(perms, accounts, "Identidad de aplicaciones")
+    Rel(perms, settings, "Lee/escribe configuración")
+    Rel(perms, systemd, "Socket-activated via D-Bus")
+    Rel(perms, dbus, "Expone org.vasak.Permissions")
+    Rel(perms, apparmor, "Carga/actualiza perfiles")
+    Rel(portal, perms, "Consulta permisos vía D-Bus")
 ```
 
 ---
@@ -111,36 +109,47 @@ sudo apt install ./vasak-permissions_{{VERSION}}_amd64.deb
 git clone https://github.com/Vasak-OS/vasak-permissions.git
 cd vasak-permissions
 
-# Desarrollo (recarga en caliente frontend + backend)
-bun run dev
+# Build completo
+cargo build --release --locked
 
-# Build producción
-bun run build
+# Instalar binario
+cargo install --locked --path .
 ```
 
-### Flatpak / AppImage
+### Paquetes nativos
 
-> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
+```bash
+# Arch: makepkg -sf en PKGBUILDS/vasak-permissions/
+# Debian: cargo deb --no-build --target-dir target/release/debian
+```
 
 ---
 
-## Uso rápido
+## Uso
+
+El servicio se ejecuta automáticamente como servicio systemd --user (socket-activated vía D-Bus). No se lanza manualmente normalmente.
+
+Para debugging:
 
 ```bash
-# Se lanza automáticamente al iniciar la sesión Wayfire (systemd --user socket-activated)
-# Para lanzar manualmente (debug):
-vasak-permissions
+cargo run --bin vasak-permissions
 ```
 
-### Atajos / flags principales
+### D-Bus Interface
 
-| Acción | Comando / Tecla |
-|--------|-----------------|
-| Acción principal | `vasak-permissions` |
-| Configuración | `vasak-permissions --config` |
-| Ayuda | `vasak-permissions --help` |
+El servicio expone la interfaz `org.vasak.Permissions` en el bus de sesión:
 
-> **Captura:** `assets/demo.gif` *(placeholder — sustituir por GIF real)*
+| Método | Descripción |
+|--------|-------------|
+| `CheckPermission(resource_id, detail)` | Verifica/consulta permiso, pregunta al usuario si es primera vez |
+| `QueryPermissionFor(pid, start_time, resource_id)` | Consulta decisión guardada sin preguntar (para portal) |
+| `SetPermission(binary_path, resource_id, allowed)` | Cambia permiso desde vasak-settings (requiere polkit) |
+| `ForgetPermission(binary_path)` | Olvida decisión guardada |
+| `ListPermissions` | Lista todas las decisiones guardadas |
+| `AllowBlocked(profile, path)` | Permite acceso bloqueado por AppArmor (polkit) |
+| `ListBlocked` | Lista bloqueos AppArmor pendientes |
+| `ListAllowed(profile)` | Lista reglas AppArmor permitidas |
+| `RevokeBlocked(profile, rule)` | Revoca regla AppArmor (polkit) |
 
 ---
 
@@ -149,30 +158,15 @@ vasak-permissions
 ### Archivo de configuración
 
 ```
-~/.config/vasak/permissions.toml
+/etc/vasak/permissions.toml  (sistema)
+~/.config/vasak/permissions.toml  (usuario, si aplica)
 ```
 
 Ejemplo mínimo:
 
 ```toml
-[panel]
-position = "top"
-height = 36
-autohide = false
-
-[overview]
-blur_background = true
-show_recent = true
-max_recent = 8
-
-[notifications]
-position = "right"
-width = 360
-max_visible = 10
-
-[media]
-show_artwork = true
-preferred_players = ["spotify", "firefox", "mpv"]
+[general]
+log_level = "info"
 ```
 
 ### Variables de entorno
@@ -180,14 +174,7 @@ preferred_players = ["spotify", "firefox", "mpv"]
 | Variable | Descripción | Por defecto |
 |----------|-------------|-------------|
 | `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
-| `VASAK_PROFILE` | Perfil de rendimiento: balanced, performance, power-save | `balanced` |
-
-### Integración con `tauri-plugin-config-manager`
-
-- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
-- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
-- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
-- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
+| `RUST_LOG` | Nivel de log (trace, debug, info, warn, error) | `info` |
 
 ---
 
@@ -196,119 +183,65 @@ preferred_players = ["spotify", "firefox", "mpv"]
 ### Requisitos
 
 - **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
-- **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
-- **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
-- *`libgtk-layer-shell-dev`, `wayland-protocols`, `wayfire-dev` para Wayland*
+- **Sistema:** `pkg-config`, `libdbus-1-dev`, `libsystemd-dev`, `libapparmor-dev`, `libsqlcipher-dev`
 
 ### Dependencias de desarrollo
 
 #### Sistema (paquetes Arch / Debian / Fedora)
 
-`base-devel`, `pkgconf`, `libssl-dev`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `libpipewire-0.3-dev`, `libwireplumber-0.5-dev`, `libdbus-1-dev`, `libudev-dev`, `libxkbcommon-dev`, `libwayland-dev`, `meson`, `ninja`, `clang`, `lld`
+`base-devel`, `pkgconf`, `libdbus-1-dev`, `libsystemd-dev`, `libapparmor-dev`, `libsqlcipher-dev`, `libssl-dev`, `libudev-dev`
 
 #### Rust
 
 `rustup` → `stable` + `rustfmt` + `clippy`
 
-#### Node
-
-**Solo `bun`** (nunca npm/yarn/pnpm para apps Tauri). `bun --version` ≥ 1.1
-
-#### Herramientas CLI
-
-`just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
-
 ### Correr en desarrollo
 
 ```bash
-# Frontend (Vite dev server + Tauri dev)
-bun run tauri dev
+# Backend con recarga en caliente
+cargo watch -x "run --bin vasak-permissions"
 
-# Solo frontend (Vite)
-bun run dev
-
-# Solo backend (cargo watch)
-cargo watch -x "run --bin vasak-permissions`
+# Solo tests
+cargo test --locked
 ```
 
 ### Compilar / Build de release
 
 ```bash
-# Build completo (frontend + backend + bundle)
-bun run tauri build
-
-# Solo frontend (para testear bundle después)
-bun run build
-
-# Solo backend Rust (binario optimizado)
+# Build release optimizado
 cargo build --release --locked
+
+# Instalar
+cargo install --locked --path .
 
 # Paquetes nativos
 # Arch: makepkg -sf en PKGBUILDS/vasak-permissions/
-# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+# Debian: cargo deb --no-build --target-dir target/release/debian
 ```
 
 ### Targets principales
 
 ```bash
-# Desarrollo
-bun run dev
-
-# Build producción
-bun run build
-
-# Solo frontend
-bun run build:frontend
-
-# Solo backend Rust
+# Build release optimizado
 cargo build --release --locked
 
-# Lint + tipos (pre-commit / CI)
-bunx --bun biome check .
-bunx vue-tsc --noEmit
+# Tests
+cargo test --locked
+
+# Lint
 cargo fmt --check
+cargo clippy -- -D warnings
 ```
 
 ### Pruebas
 
 ```bash
-# Suite completa JS (Vitest via bun:test)
-bun test
+# Suite completa Rust
+cargo test --locked
 
-# Suite completa Rust (crates en pruebas_rust del CI)
-cargo test -p vasak-permissions-core -p vasak-permissions-ui --locked
-
-# Integración (requiere Wayfire corriendo)
-cargo test -p vasak-permissions-integration --locked -- --ignored
+# Tests de integración (requieren D-Bus)
+cargo test --locked -- --ignored
 ```
-
-### Convención de commits
-
-[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/):
-
-```
-<tipo>(<ámbito>): <descripción corta>
-
-[cuerpo opcional]
-
-[pie opcional: Closes #N]
-```
-
-Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `refactor`, `perf`, `test`.
-
-### Cómo abrir PR
-
-1. Rama desde `origin/main`:
-   ```bash
-   git worktree add -b feat/{{TEMA}} ~/wt/vasak-permissions-{{TEMA}} origin/main
-   ```
-2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
-3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
-4. Al abrir PR, **cuatro cosas obligatorias**:
-   - Asignado a `JoaquinDecima`
-   - Etiqueta `enhancement` o `bug` (+ `ci` / `dependencies` si aplica)
-   - Añadido al proyecto «VasakOS Roadmap»
-   - Status **In Progress**
 
 ---
 
@@ -318,34 +251,28 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 
 | Crate / Módulo | Responsabilidad |
 |----------------|-----------------|
-| `vasak-permissions-core` | Lógica compartida: estado, D-Bus, IPC |
-| `vasak-permissions-ui` | Frontend Vue 3 + componentes vue-libvasak |
-| `vasak-permissions-tauri` | Puente Tauri: commands, eventos, WebView |
+| `vasak-permissions` | Binario principal / daemon systemd |
+| `vasak-permissions-protocol` | Definiciones D-Bus compartidas |
 
 ### Interfaces D-Bus / zbus expuestas
 
 | Interfaz | Métodos / Señales / Propiedades | Descripción |
 |----------|----------------------------------|-------------|
-| `org.vasak.Vasak-permissions` | `GetState()`, `StateChanged(dict)`, `SetConfig(dict)` | Estado y control principal |
-| `org.vasak.Vasak-permissions.Panel` | `SetPosition(string)`, `SetAutohide(bool)`, `Height(u32)` | Configuración panel en runtime |
+| `org.vasak.Permissions` | `CheckPermission`, `QueryPermissionFor`, `SetPermission`, `ForgetPermission`, `ListPermissions`, `AllowBlocked`, `ListBlocked`, `ListAllowed`, `RevokeBlocked`, `RegisterAgent` | Gestión completa de permisos |
 
 ### Puntos de extensión
 
-- **Plugins:** Sistema de plugins modular
-- **Hooks:** Hooks de ciclo de vida
-- **API pública Rust:** API pública del crate principal
+- **Políticas:** Sistema de políticas declarativas por aplicación/recurso
+- **Excepciones AppArmor:** Generación dinámica de perfiles
+- **Notificaciones:** Integración con `vasak-flare-daemon` para avisos
 
 ### Features / Cargo features
 
 | Feature | Descripción | Default |
 |---------|-------------|---------|
-| `system-tray` | Bandeja del sistema + menú contextual | ✓ |
-| `notifications` | Integración libnotify / freedesktop | ✓ |
-| `updater` | Auto-actualización (tauri-plugin-updater) | |
-| `devtools` | DevTools en release (solo debug) | |
-| `experimental-wayland` | Protocolo Wayland inestable | |
-
-Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+| `systemd` | Integración systemd (socket activation) | ✓ |
+| `tracing` | Logging estructurado con tracing | ✓ |
+| `admin` | API administrativa (solo root) | |
 
 ---
 
@@ -360,9 +287,9 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 
 ## Contribuir
 
-- **Guía:** [CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
-- **Plantillas de issue:** [ISSUE_TEMPLATE](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
-- **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
+- **Guía:** [`.github/CONTRIBUTING.md`](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [`.github/ISSUE_TEMPLATE/`](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Código de conducta:** [`CODE_OF_CONDUCT.md`](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
 
 ---
 
@@ -371,7 +298,7 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 > **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
 
 <div align="center">
-  <a href="https://github.com/JoaquinDecima" target="_blank"><img src="https://avatars.githubusercontent.com/u/11674229?v=4&s=40" width="40" height="40" alt="JoaquinDecima" style="border-radius: 50%; margin: 2px;" title="JoaquinDecima (166 contribuciones)"></a>
+  <!-- Avatares generados en CI -->
 </div>
 
 [Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-permissions/graphs/contributors)
@@ -390,6 +317,6 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 
 ## Licencia
 
-`GPL-3.0` — Copyright © 2026 **Vasak-OS Contributors**
+`MIT` — Copyright © 2026 **Vasak-OS Contributors**
 
 [Ver licencia completa](LICENSE)
