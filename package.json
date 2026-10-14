@@ -1,7 +1,7 @@
 {
   "name": "vasak-permissions-agent",
   "private": true,
-  "version": "0.18.0",
+  "version": "0.18.1",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
@@ -32,12 +32,12 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
-    "@happy-dom/global-registrator": "^20.14.6",
+    "@happy-dom/global-registrator": "^21.0.1",
     "@tauri-apps/cli": "^2.12.2",
     "@types/node": "^26.6.5",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vue/test-utils": "^2.5.1",
-    "happy-dom": "^20.14.6",
+    "happy-dom": "^21.0.1",
     "tailwindcss": "^4.3.3",
     "typescript": "~5.9.3",
     "vite": "^8.3.4",
