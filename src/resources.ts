@@ -26,6 +26,10 @@ export const KNOWN_RESOURCES = [
 	'store.email',
 	'store.calendar',
 	'store.contacts',
+	// Más angosto que `store.email`: sólo el historial de correo con una
+	// dirección —fechas, asuntos y direcciones, sin los cuerpos—, para la ficha
+	// de un contacto.
+	'store.email.interactions',
 ] as const;
 
 export type KnownResource = (typeof KNOWN_RESOURCES)[number];

@@ -65,6 +65,12 @@ resources:
     explanation: >-
       It will be able to see and change the address book already downloaded from
       your accounts. It does not give direct access to your account in the cloud.
+  store.email.interactions:
+    title: Let {0} see your email history?
+    explanation: >-
+      It will be able to see the dates and subjects of the emails you exchanged
+      with each contact. It will not be able to read the contents of the
+      messages, the rest of your email, or get into your mailbox.
 
 blocked:
   camera: "{0} tried to use the camera"

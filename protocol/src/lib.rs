@@ -268,7 +268,17 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     //
     // Provisorio como el del calendario: cuando lea del almacén cambia
     // `account.contacts` por `store.contacts`.
-    ("/usr/bin/vasak-contacts", &["account.contacts"]),
+    //
+    // Y además `store.email.interactions`: la ficha de un contacto muestra el
+    // historial de correo con esa persona, que le pide al sincronizador. Es un
+    // recurso angosto —fechas, asuntos y direcciones, no los cuerpos ni el
+    // resto de la casilla— y **no** es `store.email`: la libreta no lee todo el
+    // correo guardado, sólo lo que se intercambió con quien está mirando. Y no
+    // viene con `account.email`, así que nunca llega a la credencial del correo.
+    (
+        "/usr/bin/vasak-contacts",
+        &["account.contacts", "store.email.interactions"],
+    ),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -454,16 +464,36 @@ pub enum AccountResource {
 
 /// Las áreas del almacén local que se pueden leer.
 ///
-/// Son tres y no las seis de [`AccountResource`] porque son las que el
-/// sincronizador guarda. Los chats, los discos en la nube y las tareas de las
-/// APIs propias de cada proveedor no pasan por el almacén; las tareas de
-/// CalDAV viajan con el calendario, que es donde las guarda el servidor.
+/// Las tres áreas ([`StoreResource::ALL`]) son las que el sincronizador guarda
+/// —y no las seis de [`AccountResource`]—: los chats, los discos en la nube y
+/// las tareas de las APIs propias de cada proveedor no pasan por el almacén;
+/// las tareas de CalDAV viajan con el calendario, que es donde las guarda el
+/// servidor.
+///
+/// [`StoreResource::EmailInteractions`] no es un área: es una lectura **más
+/// angosta** dentro del correo, para que una aplicación de otra área pueda
+/// mostrar el historial de correo con una persona sin leer la casilla entera.
+/// Por eso queda fuera de `ALL`, que recorren los catálogos de idioma y la
+/// pantalla de Configuración pensando en áreas sincronizables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StoreResource {
     Email,
     Calendar,
     Contacts,
+    /// El historial de correo con una dirección: las fechas, los asuntos y las
+    /// direcciones de los mensajes que se intercambiaron con una persona, sin
+    /// los cuerpos y sin el resto de la casilla.
+    ///
+    /// Más angosto que [`StoreResource::Email`] a propósito: lo pide la libreta
+    /// de direcciones para la ficha de un contacto, y concederlo **no** da
+    /// `store.email` —leer todo el correo guardado— ni al revés. Son dos
+    /// decisiones distintas, y una no se puede leer como la otra.
+    ///
+    /// `as_id` lo deletrea `email.interactions`, así que el id completo es
+    /// `store.email.interactions`.
+    #[serde(rename = "email.interactions")]
+    EmailInteractions,
 }
 
 impl Resource {
@@ -649,6 +679,7 @@ impl StoreResource {
             StoreResource::Email => "email",
             StoreResource::Calendar => "calendar",
             StoreResource::Contacts => "contacts",
+            StoreResource::EmailInteractions => "email.interactions",
         }
     }
 
@@ -657,6 +688,7 @@ impl StoreResource {
             "email" => Some(StoreResource::Email),
             "calendar" => Some(StoreResource::Calendar),
             "contacts" => Some(StoreResource::Contacts),
+            "email.interactions" => Some(StoreResource::EmailInteractions),
             _ => None,
         }
     }
@@ -1112,19 +1144,29 @@ mod scope_tests {
         }
     }
 
-    /// Ninguna aplicación tiene `store.*` todavía.
+    /// Ninguna aplicación tiene un **área** del almacén todavía.
     ///
-    /// El recurso entra en el alcance de cada una cuando migre a leer del
-    /// almacén, en el mismo cambio que le saca su `account.*`. Antes no: una
-    /// aplicación con los dos llegaría a la credencial **y** a lo guardado, y
-    /// el reparto quedaría peor que hoy.
+    /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
+    /// alcance de cada aplicación cuando migre a leer del almacén, en el mismo
+    /// cambio que le saca su `account.*`. Antes no: una aplicación con los dos
+    /// llegaría a la credencial **y** a lo guardado de esa área, y el reparto
+    /// quedaría peor que hoy.
+    ///
+    /// La única excepción es el sub-recurso angosto `store.email.interactions`
+    /// de la libreta de direcciones (ver [`StoreResource::EmailInteractions`]):
+    /// no es un área —no deja leer la casilla— y no viene con `account.email`,
+    /// así que no abre ese camino a la credencial.
     #[test]
-    fn ninguna_aplicacion_tiene_el_almacen_todavia() {
+    fn ninguna_aplicacion_tiene_un_area_del_almacen_todavia() {
+        let areas: Vec<String> = StoreResource::ALL
+            .iter()
+            .map(|area| Resource::Store(area.clone()).as_id())
+            .collect();
         for (binary, scope) in SCOPED_BINARIES {
             for id in scope {
                 assert!(
-                    !id.starts_with("store."),
-                    "{binary} tiene '{id}' antes de haber migrado al almacén"
+                    !areas.contains(&id.to_string()),
+                    "{binary} tiene el área '{id}' antes de haber migrado al almacén"
                 );
             }
         }
