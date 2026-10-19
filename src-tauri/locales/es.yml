@@ -64,6 +64,12 @@ resources:
     explanation: >-
       Va a poder ver y modificar la libreta de direcciones que ya se bajó de
       tus cuentas. No le da acceso directo a tu cuenta en la nube.
+  store.email.interactions:
+    title: ¿Querés que {0} vea tu historial de correo?
+    explanation: >-
+      Va a poder ver las fechas y los asuntos de los correos que intercambiaste
+      con cada contacto. No va a poder leer el contenido de los mensajes, ni el
+      resto de tu correo, ni entrar a tu casilla.
 
 blocked:
   camera: "{0} quiso usar la cámara"
