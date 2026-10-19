@@ -1245,6 +1245,29 @@ mod delegation_tests {
         }
     }
 
+    /// El historial de correo de la libreta se acepta contra su ejecutable, no
+    /// se puede hacer cumplir como frontera (la base está al alcance de la misma
+    /// persona) y por el portal no llega: no hay nada que guardar ahí.
+    #[test]
+    fn el_servicio_acepta_el_historial_de_correo_de_la_libreta() {
+        let id = "store.email.interactions";
+        assert!(
+            check_resource(id, "/usr/bin/vasak-contacts").is_ok(),
+            "{id} no se acepta"
+        );
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(matches!(
+            check_resource(id, &key),
+            Err(FdoError::NotSupported(_))
+        ));
+        // Un id parecido es un recurso desconocido, no el recorte de `store.email`.
+        assert!(matches!(
+            check_resource("store.email.interactions.extra", "/usr/bin/vasak-contacts"),
+            Err(FdoError::InvalidArgs(_))
+        ));
+    }
+
     /// Un área inventada es un recurso desconocido, y contra una identidad del
     /// portal no hay nada que guardar: por ahí no llega ninguna lectura.
     #[test]
@@ -1646,6 +1669,39 @@ mod tests_reask {
             .reask(1000, gestor, "account.drive", ahora)
             .await
             .expect("un recurso en alcance se re-pide aunque antes se hayan rechazado otros");
+    }
+
+    /// El historial de correo entra por el mismo camino que el resto: la libreta
+    /// lo re-pide, y ni ella pide `store.email` ni otra aplicación pide el
+    /// historial.
+    #[tokio::test]
+    async fn el_historial_de_correo_solo_lo_re_pide_la_libreta() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let ahora = Instant::now();
+
+        service
+            .reask(
+                1000,
+                "/usr/bin/vasak-contacts",
+                "store.email.interactions",
+                ahora,
+            )
+            .await
+            .expect("la libreta re-pide el historial de correo");
+
+        for (binario, recurso) in [
+            ("/usr/bin/vasak-contacts", "store.email"),
+            ("/usr/bin/vasak-contacts", "account.email"),
+            ("/usr/bin/vasak-mail", "store.email.interactions"),
+            ("/usr/bin/vasak-file-manager", "store.email.interactions"),
+        ] {
+            let resultado = service.reask(1000, binario, recurso, ahora).await;
+            assert!(
+                matches!(resultado, Err(FdoError::AccessDenied(_))),
+                "{binario} no tenía que poder re-pedir {recurso}: {resultado:?}"
+            );
+        }
     }
 
     /// Un recurso desconocido se rechaza con `InvalidArgs`, antes que nada, igual

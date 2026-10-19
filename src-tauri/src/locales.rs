@@ -256,6 +256,41 @@ mod tests {
         }
     }
 
+    /// El historial de correo no está en `StoreResource::ALL` —no es un área—,
+    /// así que la prueba de arriba no lo recorre y quedaría sin textos sin que
+    /// nada lo dijera: el diálogo saldría en blanco justo en esa pregunta.
+    ///
+    /// La clave tiene puntos adentro (`store.email.interactions`) y el plugin
+    /// aplana el YAML uniendo con puntos, así que se comprueba la clave plana
+    /// entera, sin pisar la de `store.email`.
+    #[test]
+    fn el_historial_de_correo_tiene_sus_textos_sin_pisar_los_del_correo() {
+        let id = "store.email.interactions";
+        assert!(
+            vasak_permissions_protocol::Resource::from_id(id).is_some(),
+            "{id} no se reconoce como recurso"
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        for language in SOPORTADOS {
+            let keys = catalog_keys(
+                &std::fs::read_to_string(root.join(format!("{language}.yml"))).unwrap(),
+            );
+            for field in ["title", "explanation"] {
+                for resource in [id, "store.email"] {
+                    let key = format!("resources.{resource}.{field}");
+                    assert!(keys.contains(&key), "{language}.yml no tiene {key}");
+                }
+            }
+            // `store.email.interactions` es una rama con sus dos textos y no un
+            // texto suelto que tape a la del correo.
+            assert!(
+                !keys.contains(&format!("resources.{id}")),
+                "{language}.yml: {id} tiene que ser una rama, no un texto"
+            );
+        }
+    }
+
     /// Que los dos catálogos digan lo mismo, y que se puedan leer.
     ///
     /// Sin esto, un YAML roto se envía callado: la aplicación abre igual y
