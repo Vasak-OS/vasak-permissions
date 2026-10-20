@@ -7,6 +7,7 @@
 
 mod aviso;
 mod capturas;
+mod commands;
 mod dialog;
 mod locales;
 mod mas_tarde;
@@ -57,6 +58,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dialog::pending_request,
             dialog::answer,
+            commands::webkit::tune_webview,
         ])
         .setup(move |app| {
             app.manage(dialog::DialogState::default());
