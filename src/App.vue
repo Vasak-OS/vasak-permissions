@@ -83,6 +83,8 @@ const answer = async (allowed: boolean) => {
 };
 
 onMounted(async () => {
+	// Afina el WebKit de la ventana para bajar su consumo de memoria.
+	invoke('tune_webview').catch(() => {});
 	await load();
 	// Reloading on focus is what makes a second question appear correctly in
 	// the same reused window.
