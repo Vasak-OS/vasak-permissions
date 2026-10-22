@@ -23,7 +23,7 @@ tauri = { version = "2", features = [] }
 gtk = "0.18"
 webkit2gtk = "2.0"
 tauri-plugin-vicons = "2"
-tauri-plugin-config-manager = "2"
+tauri-plugin-config-manager = "2.13"
 tauri-plugin-i18n-vsk = "2.3.0"
 serde.workspace = true
 serde_json.workspace = true
