@@ -4,6 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VApp</title>
+    <script>
+      // Reaplica el tema del último arranque antes de que monte Vue, para que la
+      // ventana no abra con el esquema por defecto y vire al del usuario con el
+      // fade de 300 ms. El gestor lo corrige después si cambió. Sin cache, no hace nada.
+      try {
+        var theme = JSON.parse(localStorage.getItem("vsk-theme") || "null");
+        if (theme) {
+          if (theme.dark) document.documentElement.classList.add("dark");
+          var vars = theme.vars || {};
+          for (var name in vars) {
+            document.documentElement.style.setProperty(name, vars[name]);
+          }
+        }
+      } catch (e) {
+        /* localStorage puede no estar disponible: sin cache, arranca como antes. */
+      }
+    </script>
   </head>
 
   <body>
