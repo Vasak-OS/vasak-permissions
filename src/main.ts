@@ -4,6 +4,7 @@ import { createApp } from 'vue';
 import App from '@/App.vue';
 import { sanearUrl } from '@/tools/csp';
 import { disableNativeContextMenu } from '@/tools/native-menu';
+import { saveTheme } from '@/tools/theme-cache';
 import '@/assets/main.css';
 
 // Una violación de CSP no se ve: el recurso no carga y la interfaz queda a
@@ -47,9 +48,13 @@ app.use(pinia);
 const configuracion = useConfigStore();
 
 await Promise.race([
-	configuracion.loadConfig().catch((error: unknown) => {
-		console.error('No se pudo cargar la configuración', error);
-	}),
+	// El tema se guarda sólo si la lectura salió bien: un fallo no debe dejar uno vacío.
+	configuracion
+		.loadConfig()
+		.then(() => saveTheme())
+		.catch((error: unknown) => {
+			console.error('No se pudo cargar la configuración', error);
+		}),
 	new Promise((resolve) => setTimeout(resolve, PLAZO_CONFIGURACION_MS)),
 ]);
 
