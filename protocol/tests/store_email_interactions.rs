@@ -13,6 +13,7 @@ use vasak_permissions_protocol::{may_request, Resource, StoreResource, SCOPED_BI
 
 const ID: &str = "store.email.interactions";
 const LIBRETA: &str = "/usr/bin/vasak-contacts";
+const CALENDARIO: &str = "/usr/bin/vasak-calendar";
 
 fn recurso() -> Resource {
     Resource::from_id(ID).unwrap_or_else(|| panic!("{ID} no se reconoce como recurso"))
@@ -175,16 +176,50 @@ fn el_historial_de_correo_se_decide_pero_no_es_una_frontera() {
     assert!(!recurso.decision_has_effect_for(&portal));
 }
 
-/// El único `store.*` que aparece en el alcance de alguna aplicación es el
-/// historial de la libreta. Cierra el hueco que deja la prueba de «ningún área»:
-/// ésa sólo mira las tres áreas, y un `store.*` nuevo o repartido de más
-/// pasaría sin que nadie lo vea.
+/// Los únicos `store.*` que aparecen en el alcance de alguna aplicación son el
+/// historial de la libreta y el área del calendario (que lee los eventos del
+/// almacén). Cierra el hueco que deja la prueba de «ningún área»: ésa sólo mira
+/// las tres áreas, y un `store.*` nuevo o repartido de más pasaría sin que nadie
+/// lo vea. La separación calendario/contactos queda fijada de los dos lados.
 #[test]
-fn el_unico_recurso_del_almacen_en_un_alcance_es_el_historial_de_la_libreta() {
+fn los_unicos_recursos_del_almacen_en_un_alcance_son_el_historial_y_el_calendario() {
     let del_almacen: Vec<(&str, &str)> = SCOPED_BINARIES
         .iter()
         .flat_map(|(binario, alcance)| alcance.iter().map(move |id| (*binario, *id)))
         .filter(|(_, id)| id.starts_with("store."))
         .collect();
-    assert_eq!(del_almacen, [(LIBRETA, ID)]);
+    assert_eq!(del_almacen, [(CALENDARIO, "store.calendar"), (LIBRETA, ID)]);
+}
+
+/// El calendario no se lleva nada de la libreta, ni la libreta nada del
+/// calendario: lo guardado de uno no se ve desde la otra.
+#[test]
+fn el_almacen_del_calendario_y_el_de_la_libreta_no_se_mezclan() {
+    for prohibido in [
+        "store.contacts",
+        "store.email",
+        ID,
+        "account.contacts",
+        "account.email",
+    ] {
+        assert!(
+            !may_request(CALENDARIO, prohibido),
+            "el calendario no tenía que poder pedir '{prohibido}'"
+        );
+    }
+    assert!(may_request(CALENDARIO, "store.calendar"));
+    assert!(!may_request(LIBRETA, "store.calendar"));
+}
+
+/// El correo sigue sin alcance: ni el almacén del calendario le toca.
+#[test]
+fn el_correo_sigue_sin_alcance() {
+    assert_eq!(
+        SCOPED_BINARIES
+            .iter()
+            .find(|(binario, _)| *binario == "/usr/bin/vasak-mail")
+            .map(|(_, alcance)| *alcance),
+        Some(&[][..])
+    );
+    assert!(!may_request("/usr/bin/vasak-mail", "store.calendar"));
 }
