@@ -190,8 +190,10 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// con los recursos `store.<área>`, y a medida que cada una migre pierde su
 /// `account.<área>` en esta lista y gana el `store.<área>` que le corresponde.
 ///
-/// Todavía no migró ninguna, así que ninguna tiene `store.*`: una prueba lo
-/// fija, para que el recurso entre con la migración y no antes.
+/// El calendario fue la primera en leer del almacén, pero todavía lee también
+/// por CalDAV, así que durante la transición lleva **las dos**: `account.calendar`
+/// y `store.calendar`. Una prueba fija qué `store.*` tiene cada binario, para que
+/// un recurso del almacén entre con la migración de su aplicación y no antes.
 pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
@@ -231,16 +233,20 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
         "/usr/bin/vasak-accounts-sync",
         &["account.email", "account.calendar", "account.contacts"],
     ),
-    // El calendario. Hoy lee los eventos por CalDAV de las cuentas conectadas,
-    // y por eso conserva `account.calendar`.
+    // El calendario. Lee los eventos de dos lados: por CalDAV de las cuentas
+    // conectadas (`account_events` → `account.calendar`) y del almacén local que
+    // mantiene el sincronizador (`store_events` → `store.calendar`), así que lleva
+    // los dos recursos.
     //
-    // Es provisorio: cuando lea del almacén cambia `account.calendar` por
-    // `store.calendar`, y la credencial queda sólo en el sincronizador. Mientras
-    // tanto, nunca los contactos, aunque vivan en el mismo servidor y detrás de
-    // la misma contraseña: un servidor Nextcloud entrega las dos cosas con la
-    // misma credencial, así que sin esta línea la separación sería una
-    // convención y no un límite.
-    ("/usr/bin/vasak-calendar", &["account.calendar"]),
+    // El camino CalDAV es provisorio: cuando lea sólo del almacén pierde
+    // `account.calendar` y la credencial queda sólo en el sincronizador. Nunca los
+    // contactos, aunque vivan en el mismo servidor y detrás de la misma contraseña:
+    // un servidor Nextcloud entrega las dos cosas con la misma credencial, así que
+    // sin esta línea la separación sería una convención y no un límite.
+    (
+        "/usr/bin/vasak-calendar",
+        &["account.calendar", "store.calendar"],
+    ),
     // La aplicación de correo. **Nada**, y es la más expuesta de todas.
     //
     // Lo que muestra lo escribió cualquiera que sepa la dirección de la persona:
@@ -1144,41 +1150,52 @@ mod scope_tests {
         }
     }
 
-    /// Ninguna aplicación tiene un **área** del almacén todavía.
+    /// Sólo el calendario tiene un **área** del almacén, y sólo la suya.
     ///
     /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
-    /// alcance de cada aplicación cuando migre a leer del almacén, en el mismo
-    /// cambio que le saca su `account.*`. Antes no: una aplicación con los dos
-    /// llegaría a la credencial **y** a lo guardado de esa área, y el reparto
-    /// quedaría peor que hoy.
+    /// alcance de cada aplicación cuando ésta lee del almacén. El calendario ya
+    /// lo hace (`store_events`), así que lleva `store.calendar`; ninguna otra
+    /// aplicación tiene un área, y la suya menos todavía: una con el área de
+    /// otra vería lo guardado de ella.
     ///
-    /// La única excepción es el sub-recurso angosto `store.email.interactions`
-    /// de la libreta de direcciones (ver [`StoreResource::EmailInteractions`]):
-    /// no es un área —no deja leer la casilla— y no viene con `account.email`,
-    /// así que no abre ese camino a la credencial.
+    /// La excepción angosta es `store.email.interactions` de la libreta de
+    /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
+    /// —no deja leer la casilla— y no viene con `account.email`.
     #[test]
-    fn ninguna_aplicacion_tiene_un_area_del_almacen_todavia() {
+    fn solo_el_calendario_tiene_un_area_del_almacen() {
         let areas: Vec<String> = StoreResource::ALL
             .iter()
             .map(|area| Resource::Store(area.clone()).as_id())
             .collect();
+        let mut con_area = Vec::new();
         for (binary, scope) in SCOPED_BINARIES {
             for id in scope {
-                assert!(
-                    !areas.contains(&id.to_string()),
-                    "{binary} tiene el área '{id}' antes de haber migrado al almacén"
-                );
+                if areas.contains(&id.to_string()) {
+                    con_area.push((binary, *id));
+                }
             }
         }
+        assert_eq!(
+            con_area,
+            [("/usr/bin/vasak-calendar", "store.calendar")],
+            "el reparto de las áreas del almacén cambió"
+        );
     }
 
-    /// El calendario conserva su `account.calendar` hasta migrar: sacárselo
-    /// antes lo dejaría sin eventos, porque todavía no lee del almacén.
+    /// Regresión: el calendario lee los eventos de dos lados —`account_events`
+    /// por CalDAV y `store_events` del almacén— y sólo declaraba el primero. El
+    /// demonio negaba `store.calendar` «sin preguntar» por fuera de alcance, y
+    /// el re-pedido daba `AccessDenied`: la aplicación mostraba «sin permiso» y
+    /// no dejaba volver a pedirlo.
     #[test]
-    fn el_calendario_conserva_su_cuenta_hasta_migrar() {
+    fn el_calendario_puede_pedir_el_almacen_y_conserva_su_cuenta() {
+        let calendario = "/usr/bin/vasak-calendar";
+
+        assert!(may_request(calendario, "store.calendar"));
+        assert!(may_request(calendario, "account.calendar"));
         assert_eq!(
-            scope_of("/usr/bin/vasak-calendar"),
-            Some(&["account.calendar"][..])
+            scope_of(calendario),
+            Some(&["account.calendar", "store.calendar"][..])
         );
     }
 
@@ -1195,6 +1212,9 @@ mod scope_tests {
         assert!(may_request(calendario, "account.calendar"));
         for prohibido in [
             "account.contacts",
+            "store.contacts",
+            "store.email",
+            "store.email.interactions",
             "account.email",
             "account.drive",
             "account.chat",
@@ -1222,6 +1242,7 @@ mod scope_tests {
         assert!(may_request(contactos, "account.contacts"));
         for prohibido in [
             "account.calendar",
+            "store.calendar",
             "account.email",
             "account.drive",
             "account.chat",
