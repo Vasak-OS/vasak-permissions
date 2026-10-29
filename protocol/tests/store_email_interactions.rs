@@ -177,18 +177,25 @@ fn el_historial_de_correo_se_decide_pero_no_es_una_frontera() {
 }
 
 /// Los únicos `store.*` que aparecen en el alcance de alguna aplicación son el
-/// historial de la libreta y el área del calendario (que lee los eventos del
-/// almacén). Cierra el hueco que deja la prueba de «ningún área»: ésa sólo mira
+/// historial de la libreta, el área del calendario (que lee los eventos del
+/// almacén) y el área del correo (lo guardado por el sincronizador). Cierra el hueco que deja la prueba de «ningún área»: ésa sólo mira
 /// las tres áreas, y un `store.*` nuevo o repartido de más pasaría sin que nadie
 /// lo vea. La separación calendario/contactos queda fijada de los dos lados.
 #[test]
-fn los_unicos_recursos_del_almacen_en_un_alcance_son_el_historial_y_el_calendario() {
+fn los_unicos_recursos_del_almacen_en_un_alcance_son_el_historial_el_calendario_y_el_correo() {
     let del_almacen: Vec<(&str, &str)> = SCOPED_BINARIES
         .iter()
         .flat_map(|(binario, alcance)| alcance.iter().map(move |id| (*binario, *id)))
         .filter(|(_, id)| id.starts_with("store."))
         .collect();
-    assert_eq!(del_almacen, [(CALENDARIO, "store.calendar"), (LIBRETA, ID)]);
+    assert_eq!(
+        del_almacen,
+        [
+            (CALENDARIO, "store.calendar"),
+            ("/usr/bin/vasak-mail", "store.email"),
+            (LIBRETA, ID)
+        ]
+    );
 }
 
 /// El calendario no se lleva nada de la libreta, ni la libreta nada del
@@ -211,15 +218,23 @@ fn el_almacen_del_calendario_y_el_de_la_libreta_no_se_mezclan() {
     assert!(!may_request(LIBRETA, "store.calendar"));
 }
 
-/// El correo sigue sin alcance: ni el almacén del calendario le toca.
+/// El correo pide lo guardado (`store.email`) y nada más: ni la contraseña de la
+/// casilla (`account.email`), ni el almacén del calendario, ni el historial de
+/// la libreta.
 #[test]
-fn el_correo_sigue_sin_alcance() {
+fn el_correo_solo_alcanza_lo_guardado() {
     assert_eq!(
         SCOPED_BINARIES
             .iter()
             .find(|(binario, _)| *binario == "/usr/bin/vasak-mail")
             .map(|(_, alcance)| *alcance),
-        Some(&[][..])
+        Some(&["store.email"][..])
     );
-    assert!(!may_request("/usr/bin/vasak-mail", "store.calendar"));
+    assert!(may_request("/usr/bin/vasak-mail", "store.email"));
+    for prohibido in ["account.email", "store.calendar", ID] {
+        assert!(
+            !may_request("/usr/bin/vasak-mail", prohibido),
+            "el correo no tenía que poder pedir '{prohibido}'"
+        );
+    }
 }
