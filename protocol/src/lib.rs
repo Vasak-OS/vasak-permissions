@@ -259,10 +259,12 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // diálogo pidiéndole permiso para algo que la aplicación de verdad nunca
     // necesitó — y que si concede, entrega la contraseña de su casilla.
     //
-    // Cuando lea del almacén va a ganar `store.email`, que es leer lo que el
-    // sincronizador guardó y no llegar a la casilla. `account.email` no lo gana
-    // nunca.
-    ("/usr/bin/vasak-mail", &[]),
+    // Gana `store.email`, que es leer lo que el sincronizador guardó y no llegar a
+    // la casilla; es también el recurso con el que `vasak-accounts` gatea importar
+    // y quitar la identidad S/MIME de la cuenta (la firma del correo cae bajo el
+    // mismo consentimiento que ver su correo guardado). `account.email` —la
+    // contraseña de la casilla— no lo gana nunca.
+    ("/usr/bin/vasak-mail", &["store.email"]),
     // La libreta de direcciones. El otro lado de la línea que separa los
     // contactos de los calendarios.
     //
