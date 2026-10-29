@@ -1703,6 +1703,28 @@ mod tests_reask {
         }
     }
 
+    /// El correo re-pide `store.email` (lo guardado) y nunca `account.email`
+    /// (la contraseña de la casilla).
+    #[tokio::test]
+    async fn el_correo_re_pide_lo_guardado_y_no_la_casilla() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let ahora = Instant::now();
+
+        service
+            .reask(1000, "/usr/bin/vasak-mail", "store.email", ahora)
+            .await
+            .expect("el correo re-pide lo guardado");
+
+        let resultado = service
+            .reask(1000, "/usr/bin/vasak-mail", "account.email", ahora)
+            .await;
+        assert!(
+            matches!(resultado, Err(FdoError::AccessDenied(_))),
+            "el correo no tenía que poder re-pedir account.email: {resultado:?}"
+        );
+    }
+
     /// Un recurso desconocido se rechaza con `InvalidArgs`, antes que nada, igual
     /// que en `check_permission`.
     #[tokio::test]

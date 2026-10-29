@@ -259,10 +259,12 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
     // diálogo pidiéndole permiso para algo que la aplicación de verdad nunca
     // necesitó — y que si concede, entrega la contraseña de su casilla.
     //
-    // Cuando lea del almacén va a ganar `store.email`, que es leer lo que el
-    // sincronizador guardó y no llegar a la casilla. `account.email` no lo gana
-    // nunca.
-    ("/usr/bin/vasak-mail", &[]),
+    // Gana `store.email`, que es leer lo que el sincronizador guardó y no llegar a
+    // la casilla; es también el recurso con el que `vasak-accounts` gatea importar
+    // y quitar la identidad S/MIME de la cuenta (la firma del correo cae bajo el
+    // mismo consentimiento que ver su correo guardado). `account.email` —la
+    // contraseña de la casilla— no lo gana nunca.
+    ("/usr/bin/vasak-mail", &["store.email"]),
     // La libreta de direcciones. El otro lado de la línea que separa los
     // contactos de los calendarios.
     //
@@ -1162,7 +1164,7 @@ mod scope_tests {
     /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
     /// —no deja leer la casilla— y no viene con `account.email`.
     #[test]
-    fn solo_el_calendario_tiene_un_area_del_almacen() {
+    fn solo_el_calendario_y_el_correo_tienen_un_area_del_almacen() {
         let areas: Vec<String> = StoreResource::ALL
             .iter()
             .map(|area| Resource::Store(area.clone()).as_id())
@@ -1177,7 +1179,10 @@ mod scope_tests {
         }
         assert_eq!(
             con_area,
-            [("/usr/bin/vasak-calendar", "store.calendar")],
+            [
+                ("/usr/bin/vasak-calendar", "store.calendar"),
+                ("/usr/bin/vasak-mail", "store.email"),
+            ],
             "el reparto de las áreas del almacén cambió"
         );
     }
@@ -1256,26 +1261,28 @@ mod scope_tests {
         }
     }
 
-    /// La aplicación de correo tampoco puede pedir nada, y es el caso que más
-    /// se gana.
+    /// La aplicación de correo puede pedir lo guardado y **no** la casilla.
     ///
     /// Es la más expuesta del escritorio —lo que muestra lo escribió cualquiera
     /// que sepa la dirección de la persona— y no lee el correo: se lo pide ya
-    /// interpretado al sincronizador. Sin esta línea, una copia reemplazada
-    /// podría pedir `account.email` y la persona vería un diálogo pidiéndole
-    /// permiso para algo que la aplicación de verdad nunca necesitó.
+    /// interpretado al sincronizador. `store.email` es lo que éste guardó (y el
+    /// recurso que gatea la identidad S/MIME); `account.email` es la contraseña
+    /// de la casilla, y sin esta línea una copia reemplazada podría pedirla.
     #[test]
-    fn el_correo_no_puede_pedir_ni_el_correo() {
+    fn el_correo_pide_el_almacen_y_no_la_casilla() {
         let mail_app = "/usr/bin/vasak-mail";
 
-        assert_eq!(scope_of(mail_app), Some(&[][..]));
+        assert_eq!(scope_of(mail_app), Some(&["store.email"][..]));
+        assert!(may_request(mail_app, "store.email"));
         for resource in [
             "account.email",
             "account.contacts",
             "account.calendar",
             "account.drive",
-            // Tampoco lo guardado, hasta que migre a leer del almacén.
-            "store.email",
+            // Ni el resto del almacén: sólo el suyo.
+            "store.calendar",
+            "store.contacts",
+            "store.email.interactions",
             "credentials",
         ] {
             assert!(
