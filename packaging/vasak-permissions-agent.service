@@ -26,46 +26,50 @@ RestartSec=2
 # Este es el proceso que **otorga** permisos: el diálogo donde decís que sí o
 # que no a la cámara, al micrófono o a una cuenta. Todo el modelo de seguridad
 # del servicio descansa en que sea el único /usr/bin/vasak-permissions-agent
-# —por eso el binario está en una ruta que necesita root para escribirse—, y sin
-# embargo corría sin una sola restricción, mientras el servicio al que le
-# contesta tenía catorce.
+# —por eso el binario está en una ruta que necesita root para escribirse—.
 #
-# Sin red: lo que decidís acá se lo dice al servicio por D-Bus, que es un socket
-# local. No hay nada que mandar afuera.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
-
+# # Por qué este proceso no puede llevar seccomp
+#
+# El agente dibuja un diálogo Tauri (GTK3 + WebKit). GTK carga los íconos de los
+# botones de la ventana (`window-minimize/maximize/close-symbolic`, SVG) con
+# gdk-pixbuf → glycin, que aísla cada decodificación en un `bwrap` anidado. Ese
+# bwrap **no arranca si el proceso lleva un filtro seccomp**: no puede armar su
+# espacio de nombres de montaje —devuelve EPERM en «Failed to make / slave»—, la
+# carga del ícono falla y GTK la trata como **fatal** (`Bail out!`). El agente se
+# caía al abrir el diálogo, y sin diálogo no se puede conceder ningún permiso. Las
+# demás aplicaciones del escritorio cargan los mismos íconos bien porque no corren
+# con este endurecimiento. Es un bug de upstream (glycin + WebKitGTK + GTK);
+# mientras no se arregle arriba, este proceso no puede filtrar syscalls.
+#
+# Comprobado en vivo: con cualquier directiva que instale un filtro seccomp el
+# bwrap de glycin falla y el diálogo se cae; sin ellas se dibuja y responde. Por
+# eso quedan afuera las que **instalan seccomp**: SystemCallFilter,
+# SystemCallArchitectures, SystemCallErrorNumber, LockPersonality, RestrictRealtime,
+# RestrictSUIDSGID, RestrictAddressFamilies, ProtectClock, ProtectKernelLogs y
+# ProtectKernelModules.
+#
+# Se **mantiene** todo el aislamiento que NO usa seccomp, que es lo que de verdad
+# contiene a este proceso: no escala privilegios (NoNewPrivileges), no tiene
+# capabilities, el sistema es de sólo lectura (ProtectSystem), `/tmp` y `/dev` son
+# propios —de /dev sólo la placa de video, para dibujar—, `/proc` queda oculto
+# (ProtectProc) y se conservan las protecciones de montaje/UTS que NO son seccomp:
+# ProtectHostname, ProtectKernelTunables y ProtectControlGroups. La pérdida real es
+# el filtro de syscalls y las protecciones de kernel basadas en seccomp; a cambio,
+# el diálogo de permisos vuelve a funcionar.
+#
+# El **daemon** —que aplica y guarda la política— conserva todo su endurecimiento;
+# esto relaja sólo el proceso de la UI que propone. Re-endurecer cuando glycin/GTK
+# decodifiquen íconos bajo seccomp (Vasak-OS/vasak-permissions#100).
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 PrivateTmp=yes
-ProtectClock=yes
-ProtectControlGroups=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-ProtectProc=invisible
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
 ProtectSystem=full
-
-# De todo /dev ve la placa de video, para dibujar el diálogo, y nada más. Que el
-# proceso que te pregunta por la cámara no pueda abrir la cámara es exactamente
-# la propiedad que uno quiere acá.
-#
-# Va con PrivateDevices + BindPaths y no con DeviceAllow porque —comprobado— el
-# filtro de dispositivos no se aplica en unidades de usuario: depende de un
-# programa BPF que el gestor sin privilegios no puede cargar, así que ahí habría
-# quedado de adorno.
+ProtectProc=invisible
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
 PrivateDevices=yes
 BindPaths=-/dev/dri
-
-# Quedan afuera MemoryDenyWriteExecute y RestrictNamespaces: el diálogo es una
-# ventana Tauri, y WebKit compila su JavaScript en memoria y usa espacios de
-# nombres para su propio aislamiento.
 
 [Install]
 WantedBy=graphical-session.target

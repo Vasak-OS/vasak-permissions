@@ -38,17 +38,70 @@ fn la_unidad_se_da_por_arrancada_recien_cuando_el_nombre_existe() {
     );
 }
 
-/// El backend del portal habla por el bus de **sesión**, que es un socket de
-/// dominio UNIX. Si alguien saca `AF_UNIX` de la lista, el agente no puede
-/// tomar su nombre y el portal vuelve a quedarse esperándolo.
-#[test]
-fn la_unidad_deja_pasar_el_bus_de_sesion() {
-    let linea = UNIDAD
+/// Las directivas activas de la unidad (las que no están comentadas).
+fn directivas() -> Vec<&'static str> {
+    UNIDAD
         .lines()
-        .find(|l| l.starts_with("RestrictAddressFamilies="))
-        .expect("la unidad ya no restringe familias de direcciones");
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+fn tiene(directiva: &str) -> bool {
+    directivas().iter().any(|l| l.starts_with(directiva))
+}
+
+/// GTK3 carga los íconos de los botones de la ventana con gdk-pixbuf → glycin,
+/// que aísla la decodificación en un `bwrap` anidado. Ese `bwrap` no arranca si
+/// el proceso lleva un filtro seccomp, GTK trata el fallo como fatal y el agente
+/// se cae al abrir el diálogo: sin diálogo no se concede ningún permiso. Cada
+/// una de estas directivas instala un filtro seccomp (`ProtectHostname`,
+/// `ProtectKernelTunables` y `ProtectControlGroups` no: son de espacios de
+/// nombres de montaje/UTS y se conservan).
+#[test]
+fn la_unidad_no_instala_ningun_filtro_seccomp_que_tumbe_el_dialogo() {
+    let instaladas: Vec<_> = [
+        "SystemCallFilter=",
+        "SystemCallArchitectures=",
+        "SystemCallErrorNumber=",
+        "LockPersonality=",
+        "RestrictRealtime=",
+        "RestrictSUIDSGID=",
+        "RestrictAddressFamilies=",
+        "ProtectClock=",
+        "ProtectKernelLogs=",
+        "ProtectKernelModules=",
+    ]
+    .into_iter()
+    .filter(|d| tiene(d))
+    .collect();
     assert!(
-        linea.contains("AF_UNIX"),
-        "sin AF_UNIX no hay bus de sesión, y sin bus de sesión no hay backend de portal: {linea}"
+        instaladas.is_empty(),
+        "la unidad volvió a instalar seccomp ({instaladas:?}): el diálogo de permisos \
+         se cae al cargar sus íconos (glycin/bwrap no arranca bajo seccomp)"
     );
+}
+
+/// Lo que sí se conserva: el aislamiento que no usa seccomp. Si alguna se saca,
+/// el agente que otorga permisos queda con menos contención de la acordada.
+#[test]
+fn la_unidad_conserva_el_aislamiento_que_no_usa_seccomp() {
+    for esperada in [
+        "NoNewPrivileges=yes",
+        "CapabilityBoundingSet=",
+        "PrivateTmp=yes",
+        "ProtectSystem=full",
+        "ProtectProc=invisible",
+        "ProtectHostname=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectControlGroups=yes",
+        "PrivateDevices=yes",
+        "BindPaths=-/dev/dri",
+    ] {
+        assert!(
+            directivas().contains(&esperada),
+            "a la unidad le falta «{esperada}»: es parte del aislamiento que se \
+             mantiene aunque no pueda filtrar syscalls"
+        );
+    }
 }
