@@ -53,9 +53,13 @@ RestartSec=2
 # capabilities, el sistema es de sólo lectura (ProtectSystem), `/tmp` y `/dev` son
 # propios —de /dev sólo la placa de video, para dibujar—, `/proc` queda oculto
 # (ProtectProc) y se conservan las protecciones de montaje/UTS que NO son seccomp:
-# ProtectHostname, ProtectKernelTunables y ProtectControlGroups. La pérdida real es
-# el filtro de syscalls y las protecciones de kernel basadas en seccomp; a cambio,
-# el diálogo de permisos vuelve a funcionar.
+# ProtectHostname, ProtectKernelTunables y ProtectControlGroups. La propiedad «sin
+# red» que daba RestrictAddressFamilies la restaura ahora —sin seccomp— el perfil
+# AppArmor del agente (packaging/vasak-permissions-agent.apparmor, en
+# /etc/apparmor.d/): AppArmor no toca el namespace del bwrap, así que deniega inet/
+# inet6 sin reintroducir el crash. La pérdida real que queda es el filtro de
+# syscalls y las protecciones de kernel basadas en seccomp; a cambio, el diálogo de
+# permisos vuelve a funcionar.
 #
 # El **daemon** —que aplica y guarda la política— conserva todo su endurecimiento;
 # esto relaja sólo el proceso de la UI que propone. Re-endurecer cuando glycin/GTK
