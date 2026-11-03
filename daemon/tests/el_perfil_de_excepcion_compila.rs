@@ -19,8 +19,8 @@ fn perfil_con(nombre: &str, ruta: &str, negaciones: &str) -> String {
     format!(
         "abi <abi/4.0>,\ninclude <tunables/global>\nprofile {nombre} \"{ruta}\" {{\n  \
          file,\n  network,\n  unix,\n  signal,\n  ptrace,\n  dbus,\n  capability,\n  \
-         mount,\n  umount,\n  pivot_root,\n  change_profile,\n  io_uring,\n  mqueue,\n  \
-         userns,\n{negaciones}\n}}\n"
+         mount,\n  umount,\n  pivot_root,\n  io_uring,\n  mqueue,\n  \
+         userns,\n  audit deny change_profile,\n{negaciones}\n}}\n"
     )
 }
 
