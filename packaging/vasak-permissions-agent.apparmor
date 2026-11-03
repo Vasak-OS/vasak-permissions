@@ -1,0 +1,80 @@
+# Perfil AppArmor del agente de diálogos de permisos.
+#
+# El agente perdió `RestrictAddressFamilies=AF_UNIX AF_NETLINK` cuando se le sacó
+# el endurecimiento basado en seccomp (vasak-permissions#100): esa directiva
+# instala un filtro seccomp, y el `bwrap` que glycin usa para decodificar los
+# íconos del diálogo (GTK3 + gdk-pixbuf → glycin) no arranca bajo seccomp —falla el
+# armado de su espacio de nombres de montaje y GTK aborta el proceso—. AppArmor no
+# usa seccomp ni toca el namespace del bwrap, así que puede devolver la propiedad
+# «sin red IP» sin reintroducir el crash.
+#
+# Este perfil es **permisivo salvo la red IP**: su único objetivo es denegar
+# `inet`/`inet6`. Mantiene todo lo demás que el agente necesita —incluido
+# `userns`/`mount`/`capability` para el bwrap de glycin, y `dbus`/`unix`/`netlink`
+# para hablar con el servicio de permisos y con el escritorio—. Se engancha a la
+# ruta exacta del binario (que necesita root para escribirse), igual que el resto
+# del modelo. El cargador del sistema toma `/etc/apparmor.d/vasak-*` en cada
+# arranque.
+#
+# Se saca cuando glycin/GTK puedan decodificar íconos bajo un filtro seccomp y se
+# restaure el endurecimiento seccomp del unit (condición de salida: #100).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# `attach_disconnected`: el agente corre en un espacio de nombres de montaje (el
+# unit le da PrivateTmp/PrivateDevices/ProtectSystem), donde algunos paths —el
+# socket del bus de D-Bus en /run/user/*/bus, entre otros— quedan «desconectados»
+# de la raíz que ve AppArmor. Sin esta flag AppArmor los niega («Failed name
+# lookup - disconnected path») y el agente no llega a registrarse. La flag los
+# reconecta a la raíz para la evaluación; no afea el resto del perfil.
+profile vasak-permissions-agent /usr/bin/vasak-permissions-agent flags=(attach_disconnected) {
+  file,
+  network,
+  unix,
+  signal,
+  ptrace,
+  dbus,
+  capability,
+  mount,
+  umount,
+  pivot_root,
+  io_uring,
+  mqueue,
+  userns,
+
+  # Red IP: el agente decide permisos y se los comunica al servicio por D-Bus (un
+  # socket local); no tiene nada que mandar afuera. Si llegara a ser corrompido en
+  # memoria, no puede exfiltrar por inet. El deny va silencioso (sin `audit`) para
+  # no ofrecerle al agente un «desbloquear red».
+  deny network inet,
+  deny network inet6,
+
+  # No puede cambiar de perfil. Sin esto, un agente corrompido podría saltar a
+  # `unconfined` o a `vasak-appimage` —que permiten inet— con `aa_change_profile()`
+  # y anular el deny de arriba. El bwrap de glycin y WebKitGTK transicionan por
+  # espacios de nombres, no con `aa_change_profile`, así que esto no toca el diálogo.
+  deny change_profile,
+
+  # Credenciales: el estándar del proyecto (el perfil general `vasak-appimage` y los
+  # de excepción, ver daemon/src/excepcion.rs) niega estas rutas con
+  # `audit deny ... rwkl`; el agente no tiene ninguna razón legítima de leerlas
+  # —menos el llavero, cuya base guarda todas las contraseñas de la sesión—. Las
+  # mismas reglas acá. `rwkl` incluye la `l`: sin negar los enlaces duros, se podría
+  # crear uno fuera del directorio negado y leer el archivo por ahí.
+  audit deny @{HOME}/.ssh/** rwkl,
+  audit deny @{HOME}/.gnupg/** rwkl,
+  audit deny @{HOME}/.local/share/vasak-keyring/** rwkl,
+  audit deny /run/user/*/ssh-agent.socket rw,
+  audit deny /run/user/*/gnupg/** rw,
+  audit deny @{HOME}/.netrc rwkl,
+  audit deny @{HOME}/.git-credentials rwkl,
+  audit deny @{HOME}/.npmrc rwkl,
+  audit deny @{HOME}/.aws/** rwkl,
+  audit deny @{HOME}/.kube/** rwkl,
+  audit deny @{HOME}/.config/gh/** rwkl,
+  audit deny @{HOME}/.docker/config.json rwkl,
+
+  include if exists <local/vasak-permissions-agent>
+}
