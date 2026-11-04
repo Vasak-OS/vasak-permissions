@@ -21,7 +21,9 @@ fn perfil_con(nombre: &str, ruta: &str, negaciones: &str) -> String {
          file,\n  network,\n  unix,\n  signal,\n  ptrace,\n  dbus,\n  capability,\n  \
          mount,\n  umount,\n  pivot_root,\n  io_uring,\n  mqueue,\n  \
          userns,\n  audit deny change_profile,\n  \
-         audit deny /sys/kernel/security/apparmor/** w,\n{negaciones}\n}}\n"
+         audit deny /sys/kernel/security/apparmor/** w,\n  \
+         audit deny /run/user/*/pipewire-0-priv rw,\n  \
+         audit deny /run/user/*/pipewire-0-manager rw,\n{negaciones}\n}}\n"
     )
 }
 
@@ -104,7 +106,7 @@ fn un_perfil_con_una_negacion_tambien_compila() {
     let texto = perfil_con(
         "vasak-permitida-parcial",
         "/home/alguien/Apps/cosa.AppImage",
-        "  audit deny /dev/snd/pcmC*D*c rwk,",
+        "  audit deny /dev/snd/pcmC*D*c rwk,\n  audit deny /run/user/*/vasak-keyring/** rw,",
     );
     if let Err(error) = compila(&texto) {
         panic!("el perfil parcial no compila:\n{error}\n\nperfil:\n{texto}");
