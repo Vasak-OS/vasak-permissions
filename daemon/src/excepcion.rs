@@ -184,10 +184,13 @@ profile {nombre} "{ruta}" {{
   mount,
   umount,
   pivot_root,
-  change_profile,
   io_uring,
   mqueue,
   userns,
+  # El salto de perfil, negado del todo —va siempre, no depende de lo concedido—.
+  # Sin esto un AppImage confinado podría `aa_change_profile("unconfined")` y
+  # anular todas las negaciones de abajo. Mismo criterio que el perfil general.
+  audit deny change_profile,
 {negaciones}
   include if exists <local/{nombre}>
 }}
@@ -393,6 +396,26 @@ mod tests {
         assert!(perfil.contains("file,"));
     }
 
+    /// Sin esta negación un AppImage confinado podría saltar a `unconfined` con
+    /// `aa_change_profile` y anular todas las negaciones por recurso. Se mira la
+    /// regla, no la palabra: el comentario del perfil también la nombra.
+    #[test]
+    fn el_perfil_de_excepcion_no_deja_saltar_a_otro_perfil() {
+        for permitidos in [&[][..], &[Resource::Camera, Resource::Microphone][..]] {
+            let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", permitidos).unwrap();
+            let reglas: Vec<&str> = perfil.lines().map(str::trim).collect();
+
+            assert!(
+                reglas.contains(&"audit deny change_profile,"),
+                "falta la negación del salto de perfil:\n{perfil}"
+            );
+            assert!(
+                !reglas.contains(&"change_profile,"),
+                "el perfil permite el salto de perfil a secas:\n{perfil}"
+            );
+        }
+    }
+
     /// El caso real: el AppImage del equipo de pruebas tiene espacios.
     #[test]
     fn una_ruta_con_espacios_se_acepta_y_queda_entre_comillas() {
@@ -447,9 +470,14 @@ mod tests {
     fn permitirlo_todo_no_deja_ninguna_negacion() {
         let todos: Vec<Resource> = NEGACIONES.iter().map(|(r, _)| r.clone()).collect();
         let completo = perfil_para("/home/x/a.AppImage", &todos).unwrap();
+        // El salto de perfil se niega siempre, concedido lo que se conceda.
+        let resto: Vec<&str> = completo
+            .lines()
+            .filter(|l| l.contains("deny") && l.trim() != "audit deny change_profile,")
+            .collect();
         assert!(
-            !completo.contains("deny"),
-            "quedó una negación con todo permitido:\n{completo}"
+            resto.is_empty(),
+            "quedó una negación con todo permitido: {resto:?}\n{completo}"
         );
     }
 
