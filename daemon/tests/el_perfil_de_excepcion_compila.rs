@@ -20,7 +20,8 @@ fn perfil_con(nombre: &str, ruta: &str, negaciones: &str) -> String {
         "abi <abi/4.0>,\ninclude <tunables/global>\nprofile {nombre} \"{ruta}\" {{\n  \
          file,\n  network,\n  unix,\n  signal,\n  ptrace,\n  dbus,\n  capability,\n  \
          mount,\n  umount,\n  pivot_root,\n  io_uring,\n  mqueue,\n  \
-         userns,\n  audit deny change_profile,\n{negaciones}\n}}\n"
+         userns,\n  audit deny change_profile,\n  \
+         audit deny /sys/kernel/security/apparmor/** w,\n{negaciones}\n}}\n"
     )
 }
 

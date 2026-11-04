@@ -191,6 +191,11 @@ profile {nombre} "{ruta}" {{
   # Sin esto un AppImage confinado podría `aa_change_profile("unconfined")` y
   # anular todas las negaciones de abajo. Mismo criterio que el perfil general.
   audit deny change_profile,
+  # Lo mismo por la otra puerta: apparmorfs. Con `capability,` y `file,` amplios,
+  # en teoría un AppImage podría escribir `/sys/kernel/security/apparmor/.replace`
+  # y cambiarse el perfil. El kernel ya lo rechaza (confinado no administra
+  # política), pero se niega la escritura igual. Sólo `w`: leer es legítimo.
+  audit deny /sys/kernel/security/apparmor/** w,
 {negaciones}
   include if exists <local/{nombre}>
 }}
@@ -416,6 +421,22 @@ mod tests {
         }
     }
 
+    /// La otra puerta al mismo salto: escribir en apparmorfs (`.replace`) con
+    /// `file,` y `capability,` amplios. Se mira la línea entera, no la ruta: el
+    /// comentario del perfil también la nombra.
+    #[test]
+    fn el_perfil_de_excepcion_niega_escribir_en_apparmorfs() {
+        for permitidos in [&[][..], &[Resource::Camera, Resource::Microphone][..]] {
+            let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", permitidos).unwrap();
+            let reglas: Vec<&str> = perfil.lines().map(str::trim).collect();
+
+            assert!(
+                reglas.contains(&"audit deny /sys/kernel/security/apparmor/** w,"),
+                "falta la negación de escritura en apparmorfs:\n{perfil}"
+            );
+        }
+    }
+
     /// El caso real: el AppImage del equipo de pruebas tiene espacios.
     #[test]
     fn una_ruta_con_espacios_se_acepta_y_queda_entre_comillas() {
@@ -470,10 +491,15 @@ mod tests {
     fn permitirlo_todo_no_deja_ninguna_negacion() {
         let todos: Vec<Resource> = NEGACIONES.iter().map(|(r, _)| r.clone()).collect();
         let completo = perfil_para("/home/x/a.AppImage", &todos).unwrap();
-        // El salto de perfil se niega siempre, concedido lo que se conceda.
+        // El salto de perfil y la escritura en apparmorfs se niegan siempre,
+        // concedido lo que se conceda.
+        let incondicionales = [
+            "audit deny change_profile,",
+            "audit deny /sys/kernel/security/apparmor/** w,",
+        ];
         let resto: Vec<&str> = completo
             .lines()
-            .filter(|l| l.contains("deny") && l.trim() != "audit deny change_profile,")
+            .filter(|l| l.contains("deny") && !incondicionales.contains(&l.trim()))
             .collect();
         assert!(
             resto.is_empty(),
