@@ -235,7 +235,8 @@ pub fn recurso_de(ruta: &str) -> Option<Resource> {
 const CREDENCIALES: &[&str] = &[
     "/.ssh/",
     "/.gnupg/",
-    "/.local/share/vasak-keyring/",
+    // El socket en /run/user y la base en ~/.local/share: ambos son del llavero.
+    "/vasak-keyring/",
     "/ssh-agent.socket",
     "/gnupg/",
     "/.netrc",
@@ -1009,6 +1010,7 @@ mod tests {
             "/home/ana/.ssh/id_ed25519",
             "/home/ana/.gnupg/private-keys-v1.d/x.key",
             "/home/ana/.local/share/vasak-keyring/llavero.db",
+            "/run/user/1000/vasak-keyring/control.sock",
             "/run/user/1000/ssh-agent.socket",
             "/home/ana/.netrc",
             "/home/ana/.git-credentials",

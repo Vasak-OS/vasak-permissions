@@ -114,6 +114,11 @@ pub(crate) const NEGACIONES: &[(Resource, &[&str])] = &[
             // El llavero del escritorio: su base guarda todas las contraseñas
             // de la sesión.
             "audit deny @{HOME}/.local/share/vasak-keyring/** rwkl,",
+            // Y el socket del llavero, por donde llega la contraseña al iniciar
+            // sesión. El perfil general lo tiene en este mismo grupo, así que
+            // con Credentials concedido se levanta como los demás; sin conceder,
+            // queda negado igual que la base del llavero.
+            "audit deny /run/user/*/vasak-keyring/** rw,",
             // El agente de SSH es peor que la clave: con el socket no hace
             // falta leer ningún archivo para firmar con ella.
             "audit deny /run/user/*/ssh-agent.socket rw,",
@@ -196,6 +201,14 @@ profile {nombre} "{ruta}" {{
   # y cambiarse el perfil. El kernel ya lo rechaza (confinado no administra
   # política), pero se niega la escritura igual. Sólo `w`: leer es legítimo.
   audit deny /sys/kernel/security/apparmor/** w,
+  # Los sockets privilegiados de medios, negados siempre. El perfil general los
+  # niega sin condición y NO son un recurso que se conceda —ni con Camera: el
+  # acceso legítimo a la cámara va por el `pipewire-0` normal que media
+  # WirePlumber, no por estos—, así que van acá, en la base, no en `NEGACIONES`.
+  # `-priv` es la entrada del portal; `-manager` ve todo el grafo, incluidos los
+  # streams de otras apps (decisión 4). Sin esto cualquier excepción los reabría.
+  audit deny /run/user/*/pipewire-0-priv rw,
+  audit deny /run/user/*/pipewire-0-manager rw,
 {negaciones}
   include if exists <local/{nombre}>
 }}
@@ -421,6 +434,12 @@ mod tests {
         }
     }
 
+    /// Las negaciones siempre-on de la base que no son recursos concedibles.
+    const SOCKETS_DE_MEDIOS: &[&str] = &[
+        "audit deny /run/user/*/pipewire-0-priv rw,",
+        "audit deny /run/user/*/pipewire-0-manager rw,",
+    ];
+
     /// La otra puerta al mismo salto: escribir en apparmorfs (`.replace`) con
     /// `file,` y `capability,` amplios. Se mira la línea entera, no la ruta: el
     /// comentario del perfil también la nombra.
@@ -435,6 +454,45 @@ mod tests {
                 "falta la negación de escritura en apparmorfs:\n{perfil}"
             );
         }
+    }
+
+    /// Los sockets privilegiados de PipeWire se niegan siempre, con o sin
+    /// recursos concedidos: el perfil general los niega y la tabla `NEGACIONES`
+    /// no, así que sin esto una excepción los reabría.
+    #[test]
+    fn el_perfil_de_excepcion_niega_siempre_los_sockets_de_medios() {
+        for permitidos in [&[][..], &[Resource::Camera][..]] {
+            let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", permitidos).unwrap();
+            let reglas: Vec<&str> = perfil.lines().map(str::trim).collect();
+
+            for regla in SOCKETS_DE_MEDIOS {
+                assert!(
+                    reglas.contains(regla),
+                    "falta la negación `{regla}` con {permitidos:?}:\n{perfil}"
+                );
+            }
+        }
+    }
+
+    /// El socket del llavero es de Credentials, como el de ssh-agent: sin
+    /// concederlas se niega y con ellas se levanta. Se mira la línea entera y
+    /// no la tabla, para que quitarla de `NEGACIONES` rompa la prueba.
+    #[test]
+    fn el_socket_del_llavero_se_niega_sin_credenciales_y_se_levanta_con_ellas() {
+        let regla = "audit deny /run/user/*/vasak-keyring/** rw,";
+        for permitidos in [&[][..], &[Resource::Camera][..]] {
+            let perfil = perfil_para("/home/alguien/Apps/cosa.AppImage", permitidos).unwrap();
+            assert!(
+                perfil.lines().map(str::trim).any(|l| l == regla),
+                "falta la negación del socket del llavero con {permitidos:?}:\n{perfil}"
+            );
+        }
+        let con =
+            perfil_para("/home/alguien/Apps/cosa.AppImage", &[Resource::Credentials]).unwrap();
+        assert!(
+            !con.lines().map(str::trim).any(|l| l == regla),
+            "con Credentials concedido el socket del llavero sigue negado:\n{con}"
+        );
     }
 
     /// El caso real: el AppImage del equipo de pruebas tiene espacios.
@@ -499,7 +557,10 @@ mod tests {
         ];
         let resto: Vec<&str> = completo
             .lines()
-            .filter(|l| l.contains("deny") && !incondicionales.contains(&l.trim()))
+            .filter(|l| l.contains("deny"))
+            .filter(|l| {
+                !incondicionales.contains(&l.trim()) && !SOCKETS_DE_MEDIOS.contains(&l.trim())
+            })
             .collect();
         assert!(
             resto.is_empty(),
