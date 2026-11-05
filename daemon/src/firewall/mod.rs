@@ -130,9 +130,12 @@ impl<M: MotorBpf> Firewall<M> {
     /// Marca un pid como bloqueado: a partir de ahora el programa corta sus
     /// `connect()`. Idempotente (reescribe la misma clave).
     pub fn block(&mut self, uid: u32, pid: u32) -> Result<(), String> {
-        self.motor
-            .insertar(clave(uid, pid), DENY)
-            .map_err(|e| format!("no se pudo marcar el pid {pid} (uid {uid}): {}", con_causas(&e)))
+        self.motor.insertar(clave(uid, pid), DENY).map_err(|e| {
+            format!(
+                "no se pudo marcar el pid {pid} (uid {uid}): {}",
+                con_causas(&e)
+            )
+        })
     }
 
     /// Desmarca un pid: sus `connect()` vuelven a pasar. No es error desmarcar uno
