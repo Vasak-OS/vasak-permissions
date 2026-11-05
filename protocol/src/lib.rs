@@ -851,9 +851,72 @@ pub struct PermissionRequest {
     pub profile: String,
 }
 
+/// Una conexión de egreso observada por el cortafuegos, para el mapa en vivo
+/// (M1 del #93).
+///
+/// La produce el programa eBPF por cada `connect()` —permitido **y** bloqueado—,
+/// el daemon la enriquece con el ejecutable y la sirve por `ListConnections` como
+/// JSON, igual que `ListBlocked` sirve los bloqueos pendientes.
+///
+/// # Observacional y efímera
+///
+/// No es política ni decisión: es un hecho que se vio pasar. El modelo vive
+/// **sólo en memoria** y se desvanece al reiniciar (decisión 5 del diseño); nada
+/// de esto se persiste. `last_seen_secs` y `count` existen para ordenar y agrupar
+/// en la pantalla, no para llevar un registro de tráfico.
+///
+/// # Por qué lleva el `uid`
+///
+/// El programa clava el uid **real** del syscall (`bpf_get_current_uid_gid()`),
+/// el mismo con el que se enrola en el mapa `BLOCKED`. El daemon filtra
+/// `ListConnections` por el uid del llamante —como `list_blocked`—, así que un
+/// cliente sin privilegios sólo ve lo suyo y nunca los destinos de otra persona.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedConnection {
+    /// El usuario real que abrió la conexión. Parte de la identidad: el mismo
+    /// destino desde dos sesiones no se funde en una sola fila.
+    pub uid: u32,
+    /// El ejecutable que conectó, canonicalizado como el resto de la política.
+    /// `pid <n>` cuando el proceso ya no está para resolverlo.
+    pub binary_path: String,
+    /// La IP de destino, tal como la app la resolvió (texto: v4 o v6).
+    pub ip: String,
+    /// El puerto de destino, en orden de host.
+    pub port: u16,
+    /// `tcp`, `udp` u `other` según el protocolo del socket.
+    pub proto: String,
+    /// Si el cortafuegos la dejó pasar. `false` = la cortó (kill-switch activo).
+    pub allowed: bool,
+    /// Cuántas veces se vio esta misma tupla (uid, exe, ip, puerto, proto).
+    pub count: u32,
+    /// Cuándo se vio por última vez, en segundos desde el epoch. Sólo en
+    /// memoria, para ordenar «lo más reciente primero» en la pantalla.
+    pub last_seen_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El registro de conexión viaja como JSON por el bus (igual que los
+    /// bloqueos): una vuelta por serde tiene que devolver lo mismo, campo por
+    /// campo, o la pantalla del mapa en vivo leería basura.
+    #[test]
+    fn el_registro_de_conexion_sobrevive_el_json() {
+        let conn = ObservedConnection {
+            uid: 1000,
+            binary_path: "/home/x/navegador.AppImage".into(),
+            ip: "192.0.2.1".into(),
+            port: 443,
+            proto: "tcp".into(),
+            allowed: false,
+            count: 3,
+            last_seen_secs: 1_788_000_000,
+        };
+        let json = serde_json::to_string(&conn).expect("serializa");
+        let vuelta: ObservedConnection = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(conn, vuelta);
+    }
 
     /// These strings are written to disk. If a rename ever changes one, every
     /// decision recorded under the old spelling silently stops matching and
