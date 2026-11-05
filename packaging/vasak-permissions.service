@@ -57,6 +57,21 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
+# El cortafuegos por aplicación (issue #93) carga un programa eBPF al arranque, y
+# para eso llama `bpf()`, que `@system-service` NO incluye: sin esta línea la
+# carga falla con EPERM. Las dos directivas `SystemCallFilter` se unen (las dos
+# son listas de permitidos), así que esto sólo **suma** `bpf` al conjunto, sin
+# abrir nada más.
+#
+# El resto del endurecimiento se queda tal cual, y no por inercia: la carga BPF
+# no pide memoria W^X en el proceso (el JIT es del kernel), así que
+# `MemoryDenyWriteExecute=yes` sigue; y adjuntar el programa usa `bpf()`, no un
+# socket, así que `RestrictAddressFamilies` tampoco se toca (AF_NETLINK ya está
+# para el conector de procesos y el registro de auditoría). Las capacidades
+# `CAP_BPF`/`CAP_NET_ADMIN` que la carga necesita ya las tiene root, que es como
+# corre esta unidad; si algún día se agrega `CapabilityBoundingSet`, tiene que
+# incluir `CAP_BPF CAP_NET_ADMIN` además de `CAP_AUDIT_READ`.
+SystemCallFilter=bpf
 SystemCallErrorNumber=EPERM
 
 [Install]

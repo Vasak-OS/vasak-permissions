@@ -1,0 +1,37 @@
+# El programa BPF del cortafuegos por aplicación (M0 del issue #93).
+#
+# Es un crate aparte, deliberadamente FUERA del workspace del servicio: se
+# compila al target `bpfel-unknown-none` con Rust nightly + `bpf-linker`, lo que
+# el build estable del daemon no puede ni debe hacer. El objeto resultante se
+# commitea (ver `daemon/src/firewall/`), y el daemon lo carga ya compilado; así
+# `cargo build` del daemon sigue siendo estable y sin toolchain extra.
+#
+# Regenerar el objeto: `./build.sh` (en este directorio). El comando exacto está
+# ahí y en el README del módulo `firewall` del daemon.
+[package]
+name = "vasak-firewall-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "vasak-firewall"
+path = "src/main.rs"
+
+[dependencies]
+# El lado BPF de aya. El lado userspace (`aya`) vive en el daemon.
+aya-ebpf = "0.3"
+
+# Sólo-veredicto y diminuto: sin información de depuración, para que el objeto
+# commiteado sea estable y chico, y para que el verificador no tropiece con BTF
+# de más.
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# Su propio workspace, para que un `cargo` corrido desde la raíz del repo nunca
+# intente compilar este crate con el toolchain estable.
+[workspace]

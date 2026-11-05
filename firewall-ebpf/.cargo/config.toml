@@ -1,0 +1,12 @@
+# `bpf-linker` es el enlazador del target BPF: rustc emite bitcode y él lo enlaza
+# al objeto ELF cargable. `--btf` emite la info de tipos que aya usa para
+# relocalizar los mapas al cargar.
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+rustflags = ["-C", "link-arg=--btf"]

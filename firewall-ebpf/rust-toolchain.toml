@@ -1,0 +1,7 @@
+# `aya-ebpf` exige nightly y el target BPF necesita compilar `core` desde la
+# fuente (`build-std`), que sólo nightly permite. El build del daemon NO usa este
+# toolchain: este archivo sólo rige dentro de este crate.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["bpfel-unknown-none"]
