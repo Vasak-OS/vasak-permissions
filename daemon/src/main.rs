@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 use zbus::fdo::{DBusProxy, Error as FdoError};
 use zbus::message::Header;
 use zbus::names::BusName;
+use zbus::object_server::SignalEmitter;
 use zbus::{interface, Connection};
 
 use agent::{AgentRegistry, SharedAgents};
@@ -79,6 +80,11 @@ struct PermissionService {
     /// `SetPermission(network)` lo actualiza para que los `exec` futuros vean el
     /// cambio sin releer el disco.
     red: firewall::enrolar::RedCortada,
+    /// El mapa de conexiones en vivo (M1 del #93), compartido con el lector del
+    /// ring buffer. Observacional y **sólo en memoria**: `ListConnections` sirve
+    /// la foto filtrada por uid y nada se persiste. Queda vacío si el cortafuegos
+    /// no se cargó (el lector no se lanza).
+    modelo: firewall::conexiones::ModeloCompartido,
 }
 
 /// Rejects anything this service cannot honour.
@@ -970,6 +976,42 @@ impl PermissionService {
             .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    /// El mapa de conexiones en vivo del cortafuegos, como JSON, para la pantalla
+    /// (M1 del #93). Read-only y observacional: lista qué destinos vio cada
+    /// ejecutable, con el veredicto, el conteo y la última vez.
+    ///
+    /// Filtrado por el uid del llamante, igual que `list_blocked` y por el mismo
+    /// motivo: este servicio atiende a todo el equipo y los destinos son datos de
+    /// la persona. Un cliente sin privilegios sólo ve los suyos; nunca los de
+    /// otra. El programa BPF clava el uid real del `connect()`, así que el filtro
+    /// no se puede eludir cambiando de uid efectivo.
+    ///
+    /// No persiste nada: el modelo vive en memoria y se desvanece al reiniciar.
+    async fn list_connections(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let caller = caller_of(connection, &header).await?;
+        let foto = self
+            .modelo
+            .lock()
+            .map(|m| m.instantanea(caller.uid))
+            .unwrap_or_default();
+        serde_json::to_string(&foto)
+            .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Avisa de que se observó una conexión **nueva** para un usuario, para que la
+    /// pantalla del mapa en vivo se refresque sin sondear.
+    ///
+    /// Lleva **sólo** el uid, no el destino: la señal viaja por el bus del sistema
+    /// y se entrega a cualquiera, así que no puede cargar los destinos de una
+    /// persona. Es un «refrescá»; el cliente llama a `ListConnections`, que filtra
+    /// por su uid y sólo le da lo suyo.
+    #[zbus(signal)]
+    async fn connection_observed(emisor: &SignalEmitter<'_>, uid: u32) -> zbus::Result<()>;
+
     /// Permite exactamente lo que se bloqueó: ese perfil, esa ruta, esos
     /// permisos.
     ///
@@ -1162,17 +1204,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fuerte y se sigue sin él —el resto del servicio (cámara, cuentas) no
     // depende del cortafuegos—, pero nunca se cree que está activo cuando no lo
     // está.
+    // El modelo del mapa en vivo (M1): sólo en memoria, se desvanece al reiniciar.
+    // Se comparte entre el lector del ring buffer y `ListConnections`.
+    let modelo = firewall::conexiones::modelo_nuevo();
+
+    // Al cargar el cortafuegos se le saca el ring buffer `EVENTS` (el mapa en
+    // vivo) **antes** de envolverlo en el `Enforcer`: sale del `Ebpf` una sola vez
+    // y se lo lleva el lector; el mapa `BLOCKED` del enforcement queda en el
+    // `Ebpf`. Si no carga, no hay ring que leer y el mapa en vivo queda vacío.
+    let (enforcer_inicial, ring_eventos) = match firewall::Firewall::load() {
+        Ok(mut fw) => {
+            let ring = fw.tomar_eventos();
+            (Some(firewall::Enforcer::nuevo(fw)), ring)
+        }
+        Err(e) => {
+            tracing::error!(
+                "No se pudo cargar el cortafuegos por aplicación: {e}. \
+                 El kill-switch de red NO está activo; el resto del servicio sí"
+            );
+            (None, None)
+        }
+    };
     let enforcer: firewall::enrolar::EnforcerCompartido =
-        Arc::new(std::sync::Mutex::new(match firewall::Firewall::load() {
-            Ok(fw) => Some(firewall::Enforcer::nuevo(fw)),
-            Err(e) => {
-                tracing::error!(
-                    "No se pudo cargar el cortafuegos por aplicación: {e}. \
-                     El kill-switch de red NO está activo; el resto del servicio sí"
-                );
-                None
-            }
-        }));
+        Arc::new(std::sync::Mutex::new(enforcer_inicial));
     let red: firewall::enrolar::RedCortada =
         Arc::new(std::sync::Mutex::new(store.red_cortada_inicial()));
 
@@ -1186,6 +1240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pendientes: Arc::clone(&pendientes),
         enforcer: Arc::clone(&enforcer),
         red: Arc::clone(&red),
+        modelo: Arc::clone(&modelo),
     };
 
     let connection = service_bus()?
@@ -1221,6 +1276,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::task::spawn_blocking(move || firewall::enrolar::resincronizar(&contexto_inicial))
             .await;
     std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo, Some(contexto)));
+
+    // El lector del mapa en vivo (M1): lee el ring buffer `EVENTS`, enriquece con
+    // el ejecutable del pid (la misma caché) y vuelca al modelo. Sólo si el
+    // cortafuegos cargó y entregó el ring; si no, el enforcement sigue y el mapa en
+    // vivo queda vacío. Degrada ruidoso sin tumbar el servicio.
+    if let Some(ring) = ring_eventos {
+        tokio::spawn(firewall::mapa::escuchar(
+            ring,
+            connection.clone(),
+            Arc::clone(&modelo),
+            Arc::clone(&procesos),
+        ));
+    }
 
     tokio::spawn(audit::vigilar(
         connection.clone(),
@@ -1410,6 +1478,7 @@ mod tests_interfaz {
             pendientes: Default::default(),
             enforcer: Arc::new(std::sync::Mutex::new(None)),
             red: Arc::new(std::sync::Mutex::new(Default::default())),
+            modelo: firewall::conexiones::modelo_nuevo(),
         }
     }
 
@@ -1418,6 +1487,28 @@ mod tests_interfaz {
         let mut xml = String::new();
         servicio.introspect_to_writer(&mut xml, 0);
         xml
+    }
+
+    /// El mapa en vivo se llama como la pantalla cree, no recibe nada y contesta
+    /// un JSON (`s`); y la señal lleva **sólo el uid** (`u`): la señal va al bus
+    /// del sistema, y si llevara el destino lo vería cualquiera.
+    #[test]
+    fn el_mapa_en_vivo_expone_list_connections_y_una_senal_que_solo_lleva_el_uid() {
+        let xml = introspeccion();
+        let metodo = bloque_del_metodo(&xml, "ListConnections");
+        assert!(entradas(&metodo).is_empty(), "{metodo}");
+        assert_eq!(salidas(&metodo), vec!["s"], "{metodo}");
+
+        let inicio = xml
+            .find(r#"<signal name="ConnectionObserved">"#)
+            .unwrap_or_else(|| panic!("falta la señal ConnectionObserved en:\n{xml}"));
+        let senal = &xml[inicio..inicio + xml[inicio..].find("</signal>").unwrap()];
+        assert_eq!(
+            senal.matches("<arg").count(),
+            1,
+            "la señal lleva un solo argumento: {senal}"
+        );
+        assert!(senal.contains(r#"type="u""#), "{senal}");
     }
 
     /// La interfaz exporta los nombres que el agente llama.
@@ -1621,6 +1712,7 @@ mod tests_reask {
             pendientes: Default::default(),
             enforcer: Arc::new(std::sync::Mutex::new(None)),
             red: Arc::new(std::sync::Mutex::new(Default::default())),
+            modelo: firewall::conexiones::modelo_nuevo(),
         }
     }
 

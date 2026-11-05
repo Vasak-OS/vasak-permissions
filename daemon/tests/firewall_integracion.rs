@@ -15,12 +15,15 @@
 //! puede importar el módulo `firewall`: carga el mismo objeto commiteado con aya
 //! directamente, lo que además ejercita el objeto de punta a punta.
 
-use aya::maps::HashMap as BpfHashMap;
+use aya::maps::{HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::{CgroupAttachMode, CgroupSockAddr};
 use aya::Ebpf;
 
 const CGROUP_RAIZ: &str = "/sys/fs/cgroup";
 const DENY: u8 = 1;
+/// El tamaño del `ConnectionEvent` del programa (32 bytes con relleno explícito);
+/// el parser del daemon usa los mismos desplazamientos.
+const EVENTO_LEN: usize = 32;
 
 /// El objeto commiteado, el mismo que embebe el daemon. `include_bytes_aligned!`
 /// (no `include_bytes!`): el parser de aya exige el ELF alineado, y los bytes de
@@ -74,6 +77,12 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
     }
 
     let mut ebpf = Ebpf::load(OBJETO).expect("no se pudo cargar el objeto BPF");
+
+    // El ring buffer del mapa en vivo (M1): se saca del Ebpf antes de adjuntar,
+    // igual que hace el daemon, para drenar los eventos que emiten los connect.
+    let mut eventos: RingBuf<MapData> =
+        RingBuf::try_from(ebpf.take_map("EVENTS").expect("falta el mapa EVENTS"))
+            .expect("EVENTS no es un ring buffer");
 
     let programa: &mut CgroupSockAddr = ebpf
         .program_mut("connect4")
@@ -130,5 +139,37 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
         errno_de_connect(),
         libc::EPERM,
         "un pid desmarcado no debería seguir recibiendo EPERM"
+    );
+
+    // El mapa en vivo (M1): los connect de arriba —permitidos y bloqueado—
+    // tuvieron que dejar eventos en el ring. Se drena y se busca el del connect
+    // marcado: puerto 80, TCP, veredicto DENY, y el uid/pid de la prueba. El
+    // ringbuf es síncrono, así que ya están todos tras los connect.
+    let mut vio_bloqueado_al_80 = false;
+    let mut vio_algun_evento = false;
+    while let Some(item) = eventos.next() {
+        assert!(item.len() >= EVENTO_LEN, "evento más corto que el struct");
+        vio_algun_evento = true;
+        let ev_uid = u32::from_le_bytes(item[0..4].try_into().unwrap());
+        let ev_tgid = u32::from_le_bytes(item[4..8].try_into().unwrap());
+        let ip = [item[8], item[9], item[10], item[11]];
+        let ev_port = u16::from_le_bytes(item[24..26].try_into().unwrap());
+        let ev_family = item[26];
+        let ev_proto = item[27];
+        let ev_verdict = item[28];
+        if ev_verdict == DENY {
+            assert_eq!(ev_uid, uid, "el evento clava el uid real");
+            assert_eq!(ev_tgid, pid, "y el tgid del que conectó");
+            assert_eq!(ev_port, 80, "el puerto de destino en orden de host");
+            assert_eq!(ev_family, 2, "AF_INET para el connect4");
+            assert_eq!(ev_proto, 6, "IPPROTO_TCP");
+            assert_eq!(ip, [192, 0, 2, 1], "la IP de destino tal cual");
+            vio_bloqueado_al_80 = true;
+        }
+    }
+    assert!(vio_algun_evento, "no llegó ningún evento al ring buffer");
+    assert!(
+        vio_bloqueado_al_80,
+        "no se observó el connect bloqueado al 192.0.2.1:80 en el mapa en vivo"
     );
 }
