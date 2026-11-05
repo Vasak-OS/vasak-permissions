@@ -6,7 +6,7 @@
 //! grant itself whatever it likes. Here it belongs to root, one file per user,
 //! and the only way to change it is to come through the bus.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -83,6 +83,21 @@ impl UserPolicy {
         entry.asks = entry.asks || pregunto;
 
         entry.decisions.insert(resource_id.to_string(), decision);
+    }
+
+    /// Los ejecutables con el kill-switch de red **prendido**: decisión `Denied`
+    /// sobre `network`. Es lo que el cortafuegos tiene que enrolar para este
+    /// usuario —se usa al armar el conjunto de red cortada al arrancar—.
+    ///
+    /// Sólo `Denied` corta: `Allowed` y `Unknown` dejan pasar (M0 es
+    /// default-allow + opt-in). Las claves son rutas de ejecutable; una decisión
+    /// de red nunca se guarda contra una identidad del portal, que no tiene pid.
+    pub fn binaries_with_network_cut(&self) -> Vec<String> {
+        self.applications
+            .iter()
+            .filter(|(_, app)| app.decisions.get("network") == Some(&Decision::Denied))
+            .map(|(binary_path, _)| binary_path.clone())
+            .collect()
     }
 
     /// Forgets a program entirely, so the next request asks again.
@@ -208,6 +223,40 @@ impl PolicyStore {
                 path.display()
             )
         })
+    }
+
+    /// El conjunto de red cortada de todos los usuarios con política: para cada
+    /// archivo `<uid>.json` del directorio, los ejecutables con `network` en
+    /// `Denied`. Es lo que el cortafuegos enrola al arrancar, antes de empezar a
+    /// confiar en el conector de procesos.
+    ///
+    /// Un archivo ilegible o dañado se saltea —no se aborta el arranque por la
+    /// política de un usuario—: el barrido de `/proc` al reconciliar sólo marca
+    /// lo que este conjunto dice, así que un usuario que falte queda sin corte,
+    /// no con un corte equivocado.
+    pub fn red_cortada_inicial(&self) -> HashMap<u32, HashSet<String>> {
+        let mut red = HashMap::new();
+        let Ok(entradas) = std::fs::read_dir(&self.directory) else {
+            return red;
+        };
+        for entrada in entradas.flatten() {
+            let Some(uid) = entrada
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(policy) = self.load(uid) else {
+                continue;
+            };
+            let cortados = policy.binaries_with_network_cut();
+            if !cortados.is_empty() {
+                red.insert(uid, cortados.into_iter().collect());
+            }
+        }
+        red
     }
 
     pub fn save(&self, uid: u32, policy: &UserPolicy) -> Result<(), String> {
@@ -386,6 +435,42 @@ mod tests {
             politica.decision("/home/x/a.AppImage", "camera"),
             Decision::Denied
         );
+    }
+
+    /// Sólo los ejecutables con `network` en `Denied` salen como red cortada:
+    /// `Allowed` y `Unknown` dejan pasar, y otros recursos no cuentan.
+    #[test]
+    fn solo_los_de_red_denegada_cuentan_como_cortados() {
+        let mut policy = UserPolicy::default();
+        policy.record(
+            &application("/home/x/a.AppImage"),
+            "network",
+            Decision::Denied,
+            false,
+        );
+        policy.record(
+            &application("/home/x/b.AppImage"),
+            "network",
+            Decision::Allowed,
+            false,
+        );
+        // Una decisión de otro recurso del mismo binario no lo mete en la lista.
+        policy.record(
+            &application("/home/x/c.AppImage"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
+        // Y un binario con red permitida y algo más denegado tampoco.
+        policy.record(
+            &application("/home/x/b.AppImage"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
+
+        let cortados = policy.binaries_with_network_cut();
+        assert_eq!(cortados, vec!["/home/x/a.AppImage".to_string()]);
     }
 
     #[test]
@@ -597,6 +682,62 @@ mod tests {
 
         let store = PolicyStore::at(dir.path().to_path_buf());
         assert!(store.load(1000).is_err());
+    }
+
+    /// El conjunto inicial reúne la red cortada de cada usuario con política, por
+    /// uid, y saltea lo que no es un `<uid>.json`.
+    #[test]
+    fn el_conjunto_inicial_de_red_cortada_reune_a_cada_usuario() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+
+        let mut p1000 = UserPolicy::default();
+        p1000.record(
+            &application("/home/a/x.AppImage"),
+            "network",
+            Decision::Denied,
+            false,
+        );
+        p1000.record(
+            &application("/home/a/y.AppImage"),
+            "network",
+            Decision::Allowed,
+            false,
+        );
+        store.save(1000, &p1000).expect("save");
+
+        let mut p1001 = UserPolicy::default();
+        p1001.record(
+            &application("/home/b/z.AppImage"),
+            "network",
+            Decision::Denied,
+            false,
+        );
+        store.save(1001, &p1001).expect("save");
+
+        // Un usuario sin red cortada no aparece.
+        let mut p1002 = UserPolicy::default();
+        p1002.record(
+            &application("/home/c/w.AppImage"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
+        store.save(1002, &p1002).expect("save");
+
+        // Un archivo ajeno al patrón no rompe nada.
+        std::fs::write(dir.path().join("notas.txt"), "nada").expect("write");
+
+        let red = store.red_cortada_inicial();
+        assert_eq!(red.len(), 2, "sólo 1000 y 1001 tienen red cortada");
+        assert_eq!(
+            red.get(&1000),
+            Some(&HashSet::from(["/home/a/x.AppImage".to_string()]))
+        );
+        assert_eq!(
+            red.get(&1001),
+            Some(&HashSet::from(["/home/b/z.AppImage".to_string()]))
+        );
     }
 
     #[test]

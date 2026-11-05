@@ -15,12 +15,9 @@ mod agent;
 mod audit;
 mod auditnl;
 mod excepcion;
-// La infraestructura del cortafuegos por aplicación (M0 del #93): cargar el
-// programa BPF, adjuntarlo al cgroup raíz y marcar/desmarcar pids. Probada y
-// lista, pero todavía sin llamador en el binario —cablearla a la política es el
-// PR siguiente, que quita este `allow`—. Hasta entonces sus métodos no tienen
-// quién los invoque desde `main`.
-#[allow(dead_code)]
+// El cortafuegos por aplicación (M0 del #93): carga el programa BPF, lo adjunta
+// al cgroup raíz y marca/desmarca pids desde la política. La capa de política
+// (`firewall::enrolar`) lo cablea al conector de procesos y a `SetPermission`.
 mod firewall;
 mod identity;
 mod local;
@@ -73,6 +70,15 @@ struct PermissionService {
     /// decisiones sobre recursos con nombre, y esto es una lista de hechos —tal
     /// perfil no dejó abrir tal ruta— que existe hasta que alguien la resuelve.
     pendientes: crate::local::Pendientes,
+    /// El cortafuegos por aplicación, compartido con el conector de procesos.
+    /// `None` si no se pudo cargar (ya se avisó ruidoso al arrancar).
+    /// `SetPermission(network)` lo usa para resincronizar los pids vivos al
+    /// cambiar el switch.
+    enforcer: firewall::enrolar::EnforcerCompartido,
+    /// El conjunto de red cortada por uid, también compartido con el conector.
+    /// `SetPermission(network)` lo actualiza para que los `exec` futuros vean el
+    /// cambio sin releer el disco.
+    red: firewall::enrolar::RedCortada,
 }
 
 /// Rejects anything this service cannot honour.
@@ -466,6 +472,56 @@ impl PermissionService {
         }
         Ok(())
     }
+
+    /// Guarda la decisión de red de un ejecutable y la lleva al cortafuegos.
+    /// Separado de `set_permission` para poder probar la lógica sin un bus (el
+    /// resto de `set_permission` necesita identificar al llamante y pasar por
+    /// polkit). `allowed` es la posición del switch: `true` deja pasar,
+    /// `false` corta —`cortado = !allowed`—.
+    async fn guardar_red(
+        &self,
+        uid: u32,
+        binary_path: String,
+        allowed: bool,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut policy = self.store.load(uid).map_err(FdoError::Failed)?;
+            // Descrito por la ruta que se administra, no por el llamante: la
+            // pantalla edita la entrada de otro programa.
+            let application = identity::describe_path(&binary_path);
+            policy.record(
+                &application,
+                "network",
+                Decision::from_answer(allowed),
+                false,
+            );
+            self.store.save(uid, &policy).map_err(FdoError::Failed)?;
+        }
+        self.sincronizar_red(uid, binary_path, !allowed).await;
+        Ok(())
+    }
+
+    /// Lleva el cambio del switch de red al cortafuegos: actualiza el conjunto de
+    /// red cortada (para los `exec` futuros) y resincroniza los pids vivos de ese
+    /// ejecutable (los corta o los descorta según la política nueva), para que el
+    /// switch tenga efecto sin esperar a que la aplicación se reinicie.
+    ///
+    /// El barrido de `/proc` corre en `spawn_blocking`: lee cientos de entradas y
+    /// no debe bloquear el runtime. Si el cortafuegos no se cargó, `resincronizar`
+    /// no hace nada (el enforcer compartido está en `None`).
+    async fn sincronizar_red(&self, uid: u32, binary_path: String, cortado: bool) {
+        firewall::enrolar::fijar(&self.red, uid, &binary_path, cortado);
+        let ctx = firewall::enrolar::Contexto {
+            enforcer: Arc::clone(&self.enforcer),
+            red: Arc::clone(&self.red),
+        };
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || firewall::enrolar::resincronizar(&ctx)).await
+        {
+            tracing::error!("No se pudo resincronizar el cortafuegos: {e}");
+        }
+    }
 }
 
 #[interface(name = "ar.net.vasak.os.Permissions")]
@@ -663,6 +719,16 @@ impl PermissionService {
                 .store
                 .save(caller.uid, &policy)
                 .map_err(FdoError::Failed);
+        }
+
+        // La red la hace cumplir el cortafuegos eBPF, no un perfil de AppArmor:
+        // se guarda la política y se resincroniza el mapa con los pids vivos de
+        // ese ejecutable. Se suelta el candado de escritura antes, porque
+        // `guardar_red` lo vuelve a tomar. La lógica está aparte para poder
+        // probarla sin un bus.
+        if resource_id == "network" {
+            drop(_guard);
+            return self.guardar_red(caller.uid, binary_path, allowed).await;
         }
 
         // Lo que estaba concedido antes, para poder volver atrás si el guardado
@@ -1090,6 +1156,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pendientes = local::pendientes_nuevos();
 
+    // El cortafuegos por aplicación. Se carga **antes** de leer la política para
+    // tenerlo listo cuando se reconcilie, pero el conjunto de red cortada se arma
+    // de la política ya guardada. Falla cerrado y ruidoso: si no carga, se avisa
+    // fuerte y se sigue sin él —el resto del servicio (cámara, cuentas) no
+    // depende del cortafuegos—, pero nunca se cree que está activo cuando no lo
+    // está.
+    let enforcer: firewall::enrolar::EnforcerCompartido =
+        Arc::new(std::sync::Mutex::new(match firewall::Firewall::load() {
+            Ok(fw) => Some(firewall::Enforcer::nuevo(fw)),
+            Err(e) => {
+                tracing::error!(
+                    "No se pudo cargar el cortafuegos por aplicación: {e}. \
+                     El kill-switch de red NO está activo; el resto del servicio sí"
+                );
+                None
+            }
+        }));
+    let red: firewall::enrolar::RedCortada =
+        Arc::new(std::sync::Mutex::new(store.red_cortada_inicial()));
+
     let service = PermissionService {
         store,
         agents: Arc::clone(&agents),
@@ -1098,6 +1184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notices: Arc::new(Mutex::new(NoticeThrottle::default())),
         reask: Arc::new(Mutex::new(ReaskThrottle::default())),
         pendientes: Arc::clone(&pendientes),
+        enforcer: Arc::clone(&enforcer),
+        red: Arc::clone(&red),
     };
 
     let connection = service_bus()?
@@ -1118,7 +1206,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // apenas se le negó el acceso, que es el caso más común.
     let procesos = procesos::cache_nueva();
     let procesos_para_el_hilo = Arc::clone(&procesos);
-    std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo));
+    // El contexto del cortafuegos para el conector: enrola por exec/fork y limpia
+    // por exit. Si el cortafuegos no se cargó, el enforcer está en `None` y no
+    // hace nada.
+    let contexto = firewall::enrolar::Contexto {
+        enforcer: Arc::clone(&enforcer),
+        red: Arc::clone(&red),
+    };
+    // Barrido inicial de `/proc`: corta los pids vivos que la política ya marca,
+    // antes de empezar a confiar en el conector. En `spawn_blocking` para no
+    // bloquear el runtime con el recorrido de `/proc`.
+    let contexto_inicial = contexto.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || firewall::enrolar::resincronizar(&contexto_inicial))
+            .await;
+    std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo, Some(contexto)));
 
     tokio::spawn(audit::vigilar(
         connection.clone(),
@@ -1306,6 +1408,8 @@ mod tests_interfaz {
             notices: Arc::new(Mutex::new(NoticeThrottle::default())),
             reask: Arc::new(Mutex::new(ReaskThrottle::default())),
             pendientes: Default::default(),
+            enforcer: Arc::new(std::sync::Mutex::new(None)),
+            red: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -1515,6 +1619,8 @@ mod tests_reask {
             notices: Arc::new(Mutex::new(NoticeThrottle::default())),
             reask: Arc::new(Mutex::new(ReaskThrottle::default())),
             pendientes: Default::default(),
+            enforcer: Arc::new(std::sync::Mutex::new(None)),
+            red: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -1743,5 +1849,98 @@ mod tests_reask {
             .reask(1000, "/usr/bin/vasak-connect", "no-existe", Instant::now())
             .await;
         assert!(matches!(resultado, Err(FdoError::InvalidArgs(_))));
+    }
+
+    /// `guardar_red` guarda la decisión, actualiza el conjunto de red cortada y
+    /// resincroniza sin romperse cuando el cortafuegos no está cargado (el
+    /// servicio de prueba lo tiene en `None`). `allowed=false` corta; `true`
+    /// descorta. Es el cuerpo de la rama de red de `SetPermission`, sin el bus.
+    #[tokio::test]
+    async fn guardar_red_guarda_la_decision_y_mantiene_el_conjunto() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/home/x/a.AppImage";
+
+        // Cortar: la decisión queda `Denied` y el binario entra al conjunto.
+        service
+            .guardar_red(1000, binary.into(), false)
+            .await
+            .expect("cortar la red tiene que guardar y sincronizar");
+        assert_eq!(
+            service
+                .store
+                .load(1000)
+                .unwrap()
+                .decision(binary, "network"),
+            Decision::Denied
+        );
+        assert!(firewall::enrolar::esta_cortado(&service.red, 1000, binary));
+
+        // Descortar: `Allowed` y fuera del conjunto.
+        service
+            .guardar_red(1000, binary.into(), true)
+            .await
+            .expect("descortar tiene que guardar y sincronizar");
+        assert_eq!(
+            service
+                .store
+                .load(1000)
+                .unwrap()
+                .decision(binary, "network"),
+            Decision::Allowed
+        );
+        assert!(!firewall::enrolar::esta_cortado(&service.red, 1000, binary));
+    }
+
+    /// Y la red cortada guardada se relee al armar el conjunto inicial: es el
+    /// recorrido entero del lado del almacén (guardar → red_cortada_inicial).
+    #[tokio::test]
+    async fn lo_cortado_se_relee_en_el_conjunto_inicial() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        service
+            .guardar_red(1000, "/home/x/b.AppImage".into(), false)
+            .await
+            .expect("cortar");
+
+        let red = service.store.red_cortada_inicial();
+        assert!(red
+            .get(&1000)
+            .is_some_and(|s| s.contains("/home/x/b.AppImage")));
+    }
+
+    /// F4: en `SetPermission`, el corte de red sólo se aplica tras autorizar con
+    /// polkit, y `guardar_red` recibe el uid del llamante identificado, nunca un
+    /// pid ni un uid que venga del argumento D-Bus. Guarda estructural: no hay un
+    /// bus en las pruebas, así que se vigila el orden en la fuente.
+    #[test]
+    fn el_corte_de_red_se_aplica_solo_tras_autorizar() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        let inicio = fuente
+            .find("async fn set_permission(")
+            .expect("set_permission");
+        let cuerpo = &fuente[inicio..];
+        let fin = cuerpo
+            .find(
+                "
+    }
+",
+            )
+            .expect("fin de set_permission");
+        let cuerpo = &cuerpo[..fin];
+        let autorizar = cuerpo
+            .find("polkit::authorize(")
+            .expect("polkit en set_permission");
+        let llamada = cuerpo
+            .find("self.guardar_red(")
+            .expect("guardar_red en set_permission");
+        assert!(autorizar < llamada, "guardar_red corre antes de polkit");
+        assert!(
+            cuerpo.contains("self.guardar_red(caller.uid,"),
+            "el uid tiene que venir del llamante identificado"
+        );
+        // Ningún otro camino del servicio llega al cortafuegos sin pasar por acá.
+        assert_eq!(fuente.matches("self.guardar_red(").count(), 1);
     }
 }
