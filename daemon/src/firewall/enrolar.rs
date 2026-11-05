@@ -1,0 +1,256 @@
+//! La capa de política del cortafuegos: decide **qué pids enrolar** desde la
+//! política del usuario, y cablea el conector de procesos y la pantalla de
+//! Configuración al mapa BPF (M0 del #93, PR2).
+//!
+//! # Qué separa este módulo
+//!
+//! Lo testeable sin root vive en las funciones puras —[`decidir`], y la
+//! contabilidad de [`super::Enforcer`]— y se prueba con el motor de mentira. El
+//! I/O privilegiado —leer `/proc` para resolver el uid real y el ejecutable de
+//! un pid, tomar el candado del enforcer— queda como adapter fino acá. Por eso
+//! `decidir` no toca nada y `atender_evento` sólo la envuelve con la lectura.
+//!
+//! # F3 — se clava por uid **real**
+//!
+//! El programa BPF lee `bpf_get_current_uid_gid()`, que es el uid **real** del
+//! syscall. Así que al enrolar un pid se usa su uid real
+//! ([`crate::procesos::uid_real_de`], el primer campo de `Uid:` en
+//! `/proc/<pid>/status`), nunca el efectivo ni el dueño de `/proc/<pid>/exe`: un
+//! binario setuid o un proceso que cambió su uid real tiene que seguir cortado,
+//! y con la clave equivocada se escaparía sin que nada falle.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use super::Enforcer;
+
+/// Lo que el conector de procesos observó de un pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evento {
+    /// `exec`: el proceso cambió de ejecutable; se reevalúa de cero.
+    Exec,
+    /// `fork`: nació un hijo. Hereda el ejecutable del padre hasta que haga
+    /// `exec`, así que evaluar su propio `/proc/<pid>/exe` (== el del padre) es
+    /// la herencia de política por árbol que pide el diseño.
+    Fork,
+    /// `exit`: el proceso salió; su marca se limpia.
+    Exit,
+}
+
+/// Qué hacer con un pid ante un evento, según si su ejecutable está cortado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accion {
+    Bloquear,
+    Limpiar,
+    Nada,
+}
+
+/// La regla pura, sin tocar `/proc` ni el mapa: dado el evento y si el
+/// ejecutable del pid está cortado, qué corresponde.
+///
+/// - `exec`: reevaluar. Cortado → marcar; no cortado → limpiar, por si el pid
+///   venía marcado de un ejecutable anterior (re-exec del mismo número).
+/// - `fork`: cortado → marcar (herencia del árbol); no cortado → nada, un hijo
+///   recién nacido no tenía marca que limpiar.
+/// - `exit`: limpiar siempre, pase lo que pase con el ejecutable.
+pub fn decidir(evento: Evento, cortado: bool) -> Accion {
+    match evento {
+        Evento::Exec => {
+            if cortado {
+                Accion::Bloquear
+            } else {
+                Accion::Limpiar
+            }
+        }
+        Evento::Fork => {
+            if cortado {
+                Accion::Bloquear
+            } else {
+                Accion::Nada
+            }
+        }
+        Evento::Exit => Accion::Limpiar,
+    }
+}
+
+/// El cortafuegos cargado, compartido entre el conector de procesos (un hilo) y
+/// la pantalla de Configuración (el servicio async). `None` cuando no se pudo
+/// cargar: el daemon lo registró ruidoso al arrancar y acá no se hace nada.
+///
+/// `Mutex` de `std` y no de tokio porque `block`/`unblock` son syscalls cortas y
+/// sincrónicas; el candado nunca se sostiene a través de un `.await` (el barrido
+/// de `/proc` del servicio corre en `spawn_blocking`).
+pub type EnforcerCompartido = Arc<Mutex<Option<Enforcer>>>;
+
+/// `uid → {ejecutables con la red cortada}`. Es lo que el conector consulta por
+/// cada `exec`/`fork`: una búsqueda barata, sin leer la política del disco en el
+/// camino caliente. Lo arma el arranque y lo mantiene `SetPermission(network)`.
+pub type RedCortada = Arc<Mutex<HashMap<u32, HashSet<String>>>>;
+
+/// El cortafuegos y el conjunto de red cortada, juntos para pasarlos de una vez
+/// al conector y al servicio. Los dos son `Arc`, así que clonarlo comparte.
+#[derive(Clone)]
+pub struct Contexto {
+    pub enforcer: EnforcerCompartido,
+    pub red: RedCortada,
+}
+
+/// Si el ejecutable `binary` está cortado para `uid`.
+pub fn esta_cortado(red: &RedCortada, uid: u32, binary: &str) -> bool {
+    red.lock()
+        .map(|m| m.get(&uid).is_some_and(|s| s.contains(binary)))
+        .unwrap_or(false)
+}
+
+/// Prende o apaga el corte de un ejecutable para un uid en el conjunto. Lo llama
+/// `SetPermission(network)` tras guardar la política, para que los `exec`
+/// futuros ya vean el cambio sin releer el disco.
+pub fn fijar(red: &RedCortada, uid: u32, binary: &str, cortado: bool) {
+    let Ok(mut m) = red.lock() else { return };
+    if cortado {
+        m.entry(uid).or_default().insert(binary.to_string());
+    } else if let Some(set) = m.get_mut(&uid) {
+        set.remove(binary);
+        if set.is_empty() {
+            m.remove(&uid);
+        }
+    }
+}
+
+/// El uid real y el ejecutable canonicalizado de un pid vivo, o `None` si ya no
+/// está. El ejecutable se canonicaliza para que coincida con la ruta que guarda
+/// la política (que también la canonicaliza en `PinnedCaller`).
+fn identidad_de(pid: u32) -> Option<(u32, String)> {
+    let uid = crate::procesos::uid_real_de(pid)?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    Some((uid, exe.to_string_lossy().into_owned()))
+}
+
+/// Aplica una acción sobre el enforcer compartido, registrando ruidoso cualquier
+/// fallo (fail-closed: un corte que no se pudo aplicar no pasa en silencio).
+fn aplicar(ctx: &Contexto, accion: Accion, uid: u32, pid: u32) {
+    if accion == Accion::Nada {
+        return;
+    }
+    let Ok(mut guard) = ctx.enforcer.lock() else {
+        return;
+    };
+    let Some(enf) = guard.as_mut() else {
+        return; // el cortafuegos no se cargó; ya se avisó al arrancar
+    };
+    let resultado = match accion {
+        Accion::Bloquear => enf.bloquear(uid, pid),
+        Accion::Limpiar => enf.limpiar(pid),
+        Accion::Nada => return,
+    };
+    if let Err(e) = resultado {
+        tracing::error!("Cortafuegos: {e}");
+    }
+}
+
+/// Atiende un evento del conector: resuelve la identidad del pid (salvo en
+/// `exit`, donde ya no está y el uid sale de lo anotado) y aplica la acción.
+pub fn atender_evento(ctx: &Contexto, evento: Evento, pid: u32) {
+    if evento == Evento::Exit {
+        // No se lee `/proc`: el proceso ya no está. `limpiar` reconstruye la
+        // clave con el uid que anotó al marcarlo.
+        aplicar(ctx, Accion::Limpiar, 0, pid);
+        return;
+    }
+    let Some((uid, exe)) = identidad_de(pid) else {
+        return;
+    };
+    let cortado = esta_cortado(&ctx.red, uid, &exe);
+    aplicar(ctx, decidir(evento, cortado), uid, pid);
+}
+
+/// Barre `/proc` y devuelve `pid → uid` de los procesos vivos cuyo ejecutable
+/// está cortado para su uid. Es el **estado deseado** para
+/// [`super::Enforcer::reconciliar`]: el barrido inicial al arrancar y la
+/// resincronización cuando el usuario cambia el switch.
+pub fn barrer_proc(red: &RedCortada) -> HashMap<u32, u32> {
+    let mut deseados = HashMap::new();
+    let Ok(entradas) = std::fs::read_dir("/proc") else {
+        return deseados;
+    };
+    for entrada in entradas.flatten() {
+        let Ok(nombre) = entrada.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = nombre.parse::<u32>() else {
+            continue; // no es un pid: `/proc/self`, `/proc/stat`, …
+        };
+        if let Some((uid, exe)) = identidad_de(pid) {
+            if esta_cortado(red, uid, &exe) {
+                deseados.insert(pid, uid);
+            }
+        }
+    }
+    deseados
+}
+
+/// Barre `/proc` y reconcilia el enforcer contra lo que la política dice ahora.
+/// Al arrancar (nada marcado → marca los vivos cortados) y al cambiar el switch
+/// (marca lo que entró, limpia lo que salió). Pensada para correr fuera del
+/// runtime async (en `spawn_blocking` o en el arranque).
+pub fn resincronizar(ctx: &Contexto) {
+    let deseados = barrer_proc(&ctx.red);
+    let Ok(mut guard) = ctx.enforcer.lock() else {
+        return;
+    };
+    let Some(enf) = guard.as_mut() else {
+        return;
+    };
+    for e in enf.reconciliar(&deseados) {
+        tracing::error!("Cortafuegos (resincronización): {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La regla de enrolado por evento, que es el corazón de la sincronización.
+    /// `exec` reevalúa en los dos sentidos (marca si está cortado, limpia si
+    /// no); `fork` sólo marca (hereda), nunca limpia a un recién nacido; `exit`
+    /// limpia siempre.
+    #[test]
+    fn la_regla_de_enrolado_por_evento() {
+        assert_eq!(decidir(Evento::Exec, true), Accion::Bloquear);
+        assert_eq!(decidir(Evento::Exec, false), Accion::Limpiar);
+        assert_eq!(decidir(Evento::Fork, true), Accion::Bloquear);
+        assert_eq!(decidir(Evento::Fork, false), Accion::Nada);
+        assert_eq!(decidir(Evento::Exit, true), Accion::Limpiar);
+        assert_eq!(decidir(Evento::Exit, false), Accion::Limpiar);
+    }
+
+    fn red_vacia() -> RedCortada {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn fijar_prende_y_apaga_el_corte_por_uid() {
+        let red = red_vacia();
+        assert!(!esta_cortado(&red, 1000, "/home/x/a"));
+
+        fijar(&red, 1000, "/home/x/a", true);
+        assert!(esta_cortado(&red, 1000, "/home/x/a"));
+        // No contagia a otro uid ni a otro binario.
+        assert!(!esta_cortado(&red, 1001, "/home/x/a"));
+        assert!(!esta_cortado(&red, 1000, "/home/x/b"));
+
+        fijar(&red, 1000, "/home/x/a", false);
+        assert!(!esta_cortado(&red, 1000, "/home/x/a"));
+        // Al quedar sin binarios, el uid sale del mapa (no deja una entrada vacía).
+        assert!(red.lock().unwrap().get(&1000).is_none());
+    }
+
+    /// Apagar un corte que no estaba no rompe nada y no crea una entrada.
+    #[test]
+    fn apagar_lo_que_no_estaba_no_hace_nada() {
+        let red = red_vacia();
+        fijar(&red, 1000, "/home/x/a", false);
+        assert!(red.lock().unwrap().is_empty());
+    }
+}

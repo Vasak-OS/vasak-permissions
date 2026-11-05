@@ -52,6 +52,9 @@
 //! motor de mentira. El adapter sobre aya queda fino y sin más lógica que las
 //! propias syscalls.
 
+pub mod enrolar;
+
+use std::collections::HashMap;
 use std::io::ErrorKind;
 
 use aya::maps::{HashMap as BpfHashMap, MapError};
@@ -71,6 +74,12 @@ const MAPA_BLOQUEADOS: &str = "BLOCKED";
 /// con `DENY` del lado BPF; es un único byte para dejar lugar a más política sin
 /// cambiar la forma del mapa.
 const DENY: u8 = 1;
+
+/// El tope de entradas del mapa `BLOCKED`. **Tiene que coincidir** con el
+/// `with_max_entries` del programa BPF; una prueba lo ata a la fuente. Importa
+/// para el fail-closed: un `insert` sobre el mapa lleno falla, y un corte que no
+/// se aplica es un control de seguridad ausente, no un detalle.
+const CAPACIDAD_BLOCKED: usize = 4096;
 
 /// Los dos programas `cgroup/connect` que se adjuntan a la raíz, en orden.
 const PROGRAMAS: [&str; 2] = ["connect4", "connect6"];
@@ -131,10 +140,21 @@ impl<M: MotorBpf> Firewall<M> {
     /// `connect()`. Idempotente (reescribe la misma clave).
     pub fn block(&mut self, uid: u32, pid: u32) -> Result<(), String> {
         self.motor.insertar(clave(uid, pid), DENY).map_err(|e| {
-            format!(
+            let base = format!(
                 "no se pudo marcar el pid {pid} (uid {uid}): {}",
                 con_causas(&e)
-            )
+            );
+            // Fail-closed explícito ante el mapa lleno: se nombra la causa para
+            // que el llamador lo registre ruidoso en vez de creer que el corte
+            // quedó aplicado. Ver [`Enforcer::bloquear`].
+            if es_mapa_lleno(&e) {
+                format!(
+                    "{base}. El mapa BLOCKED está lleno (tope {CAPACIDAD_BLOCKED}): \
+                     el corte de red de ese proceso NO se está aplicando"
+                )
+            } else {
+                base
+            }
         })
     }
 
@@ -151,6 +171,96 @@ impl<M: MotorBpf> Firewall<M> {
                 con_causas(&e)
             )),
         }
+    }
+}
+
+/// El cortafuegos más la contabilidad de **qué pids tenemos marcados**, con qué
+/// uid. Es la capa que la política maneja; `Firewall` es sólo el mapa.
+///
+/// # Por qué hace falta recordar el uid de cada pid marcado
+///
+/// La clave del mapa es `(uid << 32 | pid)`, así que para desmarcar un pid hay
+/// que saber con qué uid se marcó. Cuando un proceso **sale**, su `/proc/<pid>`
+/// ya no está y el aviso de salida del conector no trae el uid: sin esta tabla
+/// no se podría limpiar su entrada, y un pid reciclado heredaría un corte que no
+/// le corresponde. Por eso `bloquear` anota `pid → uid` y `limpiar` lo usa.
+///
+/// # Fail-closed
+///
+/// `bloquear` **no** anota el pid como marcado si la escritura del mapa falla
+/// (mapa lleno, u otro): no se finge que el corte está aplicado cuando no lo
+/// está. El error se devuelve para que el llamador lo registre ruidoso.
+///
+/// Genérico sobre [`MotorBpf`] por lo mismo que `Firewall`: la contabilidad y la
+/// reconciliación se prueban sin root con el motor de mentira.
+pub struct Enforcer<M: MotorBpf = MotorAya> {
+    firewall: Firewall<M>,
+    /// `pid → uid` de los que tenemos marcados ahora mismo.
+    marcados: HashMap<u32, u32>,
+}
+
+impl<M: MotorBpf> Enforcer<M> {
+    pub fn nuevo(firewall: Firewall<M>) -> Self {
+        Self {
+            firewall,
+            marcados: HashMap::new(),
+        }
+    }
+
+    /// Marca `(uid, pid)` y lo anota como vivo. Idempotente. Fail-closed: si la
+    /// escritura del mapa falla, **no** lo anota —no fingimos que está cortado— y
+    /// devuelve el error.
+    pub fn bloquear(&mut self, uid: u32, pid: u32) -> Result<(), String> {
+        self.firewall.block(uid, pid)?;
+        self.marcados.insert(pid, uid);
+        Ok(())
+    }
+
+    /// Quita la marca de un pid **que nosotros marcamos** —al salir el proceso o
+    /// al apagar el switch—. No hace nada si no lo teníamos marcado. Usa el uid
+    /// anotado, que es la única forma de reconstruir la clave una vez que el
+    /// proceso ya no está.
+    pub fn limpiar(&mut self, pid: u32) -> Result<(), String> {
+        if let Some(uid) = self.marcados.remove(&pid) {
+            self.firewall.unblock(uid, pid)?;
+        }
+        Ok(())
+    }
+
+    /// Lleva lo marcado a coincidir con `deseados` (`pid → uid` que deberían
+    /// estar cortados): marca los que faltan y limpia los que sobran. Es el
+    /// barrido inicial de `/proc` al arrancar (nada marcado aún → marca todos) y
+    /// la resincronización cuando el usuario cambia el switch de una app.
+    ///
+    /// Devuelve los errores que hubo, sin cortar: un pid que no se pudo marcar no
+    /// debe impedir marcar los demás. El llamador los registra ruidoso.
+    pub fn reconciliar(&mut self, deseados: &HashMap<u32, u32>) -> Vec<String> {
+        let mut errores = Vec::new();
+        for (&pid, &uid) in deseados {
+            if !self.marcados.contains_key(&pid) {
+                if let Err(e) = self.bloquear(uid, pid) {
+                    errores.push(e);
+                }
+            }
+        }
+        let sobrantes: Vec<u32> = self
+            .marcados
+            .keys()
+            .copied()
+            .filter(|pid| !deseados.contains_key(pid))
+            .collect();
+        for pid in sobrantes {
+            if let Err(e) = self.limpiar(pid) {
+                errores.push(e);
+            }
+        }
+        errores
+    }
+
+    /// Cuántos pids hay marcados ahora mismo. Para las pruebas y el diagnóstico.
+    #[cfg(test)]
+    pub fn marcados(&self) -> usize {
+        self.marcados.len()
     }
 }
 
@@ -177,6 +287,25 @@ fn es_clave_ausente(error: &MapError) -> bool {
         MapError::KeyNotFound => true,
         MapError::SyscallError(SyscallError { io_error, .. }) => {
             io_error.kind() == ErrorKind::NotFound
+        }
+        _ => false,
+    }
+}
+
+/// Si un error de `insertar` es «el mapa está lleno» —el caso que obliga el
+/// fail-closed de `block`—.
+///
+/// Un `BPF_MAP_TYPE_HASH` lleno hace que `bpf_map_update_elem` conteste `E2BIG`
+/// (y algunos kernels `ENOSPC`), que aya envuelve en
+/// `MapError::SyscallError { io_error }`. Se reconocen las dos para no tratar un
+/// mapa lleno como un error cualquiera: cuando lo es, el corte no se aplicó.
+fn es_mapa_lleno(error: &MapError) -> bool {
+    match error {
+        MapError::SyscallError(SyscallError { io_error, .. }) => {
+            matches!(
+                io_error.raw_os_error(),
+                Some(libc::E2BIG) | Some(libc::ENOSPC)
+            )
         }
         _ => false,
     }
@@ -356,6 +485,14 @@ mod tests {
         })
     }
 
+    /// El `MapError` de un mapa lleno: `bpf_map_update_elem` falla con `E2BIG`.
+    fn error_mapa_lleno() -> MapError {
+        MapError::SyscallError(SyscallError {
+            call: "bpf_map_update_elem",
+            io_error: IoError::from_raw_os_error(libc::E2BIG),
+        })
+    }
+
     // ── Funciones puras ──────────────────────────────────────────────────────
 
     /// La clave tiene que ser exactamente la que calcula el programa BPF:
@@ -405,6 +542,40 @@ mod tests {
         assert!(!es_clave_ausente(&MapError::InvalidName {
             name: "BLOCKED".to_string()
         }));
+    }
+
+    /// Un mapa lleno (`E2BIG`/`ENOSPC`) se reconoce como tal y ninguna otra cosa:
+    /// de eso depende que el fail-closed se registre ruidoso en vez de pasar como
+    /// un error cualquiera.
+    #[test]
+    fn reconoce_el_mapa_lleno_y_no_otros_errores() {
+        assert!(es_mapa_lleno(&error_mapa_lleno()));
+        assert!(es_mapa_lleno(&MapError::SyscallError(SyscallError {
+            call: "bpf_map_update_elem",
+            io_error: IoError::from_raw_os_error(libc::ENOSPC),
+        })));
+        // Un error que no es «lleno» (p. ej. EPERM) no cuenta.
+        assert!(!es_mapa_lleno(&MapError::SyscallError(SyscallError {
+            call: "bpf_map_update_elem",
+            io_error: IoError::from_raw_os_error(libc::EPERM),
+        })));
+        assert!(!es_mapa_lleno(&error_clave_ausente()));
+    }
+
+    /// `block` sobre el mapa lleno da un error que nombra el tope y dice que el
+    /// corte NO se aplicó: el llamador necesita eso para registrarlo ruidoso.
+    #[test]
+    fn block_con_el_mapa_lleno_lo_dice_claro() {
+        let motor = MotorFalso {
+            falla_al_insertar: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut fw = Firewall::con_motor(motor).unwrap();
+        let err = fw
+            .block(1000, 42)
+            .expect_err("el mapa lleno tiene que dar Err");
+        assert!(err.contains(&CAPACIDAD_BLOCKED.to_string()), "{err}");
+        assert!(err.contains("NO se está aplicando"), "{err}");
     }
 
     /// El mensaje de un fallo de carga nombra la syscall `bpf` de la unidad y las
@@ -520,6 +691,95 @@ mod tests {
         assert!(err.contains("99") && err.contains("uid 7"));
     }
 
+    // ── Enforcer: contabilidad de pids marcados y reconciliación ──────────────
+
+    /// `bloquear` escribe el mapa y anota el pid como marcado; `limpiar` lo
+    /// desmarca usando el uid anotado —que es lo único que queda cuando el
+    /// proceso ya salió—.
+    #[test]
+    fn el_enforcer_marca_y_limpia_recordando_el_uid() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.bloquear(1000, 42).expect("marcar");
+        assert_eq!(e.marcados(), 1);
+        assert_eq!(e.firewall.motor.insertados, vec![(clave(1000, 42), DENY)]);
+
+        // Limpiar sin pasar el uid: lo reconstruye de lo anotado.
+        e.limpiar(42).expect("limpiar");
+        assert_eq!(e.marcados(), 0);
+        assert_eq!(e.firewall.motor.quitados, vec![clave(1000, 42)]);
+    }
+
+    /// Limpiar un pid que no teníamos marcado no hace nada (ni toca el mapa): un
+    /// `exit` de un proceso que nunca cortamos no es un error.
+    #[test]
+    fn limpiar_lo_no_marcado_no_hace_nada() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.limpiar(42).expect("no es error");
+        assert!(e.firewall.motor.quitados.is_empty());
+    }
+
+    /// Fail-closed: si la escritura del mapa falla, el pid **no** queda anotado
+    /// como marcado —no se finge que el corte está aplicado— y el error sube.
+    #[test]
+    fn el_enforcer_no_anota_lo_que_no_pudo_marcar() {
+        let motor = MotorFalso {
+            falla_al_insertar: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut e = Enforcer::nuevo(Firewall::con_motor(motor).unwrap());
+        assert!(e.bloquear(1000, 42).is_err());
+        assert_eq!(
+            e.marcados(),
+            0,
+            "un pid que no se pudo cortar no puede figurar como cortado"
+        );
+    }
+
+    /// `reconciliar` marca los que faltan y limpia los que sobran, llevando lo
+    /// marcado a coincidir con lo deseado. Es el barrido inicial y la
+    /// resincronización al cambiar el switch.
+    #[test]
+    fn reconciliar_marca_los_que_faltan_y_limpia_los_que_sobran() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+
+        // Barrido inicial: nada marcado, se piden dos.
+        let mut deseados = HashMap::new();
+        deseados.insert(42u32, 1000u32);
+        deseados.insert(43u32, 1000u32);
+        assert!(e.reconciliar(&deseados).is_empty());
+        assert_eq!(e.marcados(), 2);
+
+        // Ahora se quita el switch de uno y aparece otro: 42 se limpia, 44 entra.
+        let mut deseados2 = HashMap::new();
+        deseados2.insert(43u32, 1000u32);
+        deseados2.insert(44u32, 1001u32);
+        assert!(e.reconciliar(&deseados2).is_empty());
+        assert_eq!(e.marcados(), 2);
+        assert_eq!(
+            e.firewall.motor.quitados,
+            vec![clave(1000, 42)],
+            "sólo el que salió del conjunto se limpia"
+        );
+    }
+
+    /// Un pid que no se pudo marcar en la reconciliación no corta la operación:
+    /// se junta el error y se siguen marcando los demás.
+    #[test]
+    fn reconciliar_junta_errores_y_no_corta() {
+        let motor = MotorFalso {
+            falla_al_insertar: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut e = Enforcer::nuevo(Firewall::con_motor(motor).unwrap());
+        let mut deseados = HashMap::new();
+        deseados.insert(42u32, 1000u32);
+        deseados.insert(43u32, 1000u32);
+        let errores = e.reconciliar(&deseados);
+        // El primer insert falla (MotorFalso falla una vez), el segundo entra.
+        assert_eq!(errores.len(), 1);
+        assert_eq!(e.marcados(), 1);
+    }
+
     /// Los dos lados se desincronizan sin aviso si alguien toca uno solo. Esta
     /// prueba lee la fuente del programa BPF (siempre disponible, a diferencia del
     /// toolchain BPF que necesita la correspondencia del objeto) y exige que la
@@ -538,6 +798,11 @@ mod tests {
         assert!(
             fuente.contains(&format!("static {MAPA_BLOQUEADOS}: HashMap<u64, u8>")),
             "el mapa del programa BPF ya no se llama «{MAPA_BLOQUEADOS}» o cambió de tipo"
+        );
+        assert!(
+            fuente.contains(&format!("with_max_entries({CAPACIDAD_BLOCKED},")),
+            "el tope del mapa BPF y CAPACIDAD_BLOCKED discrepan; el fail-closed \
+             del mapa lleno dejaría de corresponder al tope real"
         );
     }
 

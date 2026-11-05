@@ -89,6 +89,31 @@ fn arranque_de(pid: u32) -> Option<Duration> {
     Some(btime()? + Duration::new(tics / hz, ((tics % hz) * 1_000_000_000 / hz) as u32))
 }
 
+/// El uid **real** de un pid: el primer valor de la línea `Uid:` de
+/// `/proc/<pid>/status`.
+///
+/// Lo pide el cortafuegos (F3 del #93): el programa BPF clava por uid real
+/// (`bpf_get_current_uid_gid()`), así que el daemon tiene que enrolar con el
+/// mismo uid. **No** el efectivo, ni el dueño de `/proc/<pid>` (que es el
+/// efectivo) ni el de `/proc/<pid>/exe`: un binario setuid o un proceso que
+/// cambió su uid real tiene que seguir cortado, y con otra clave se escaparía
+/// sin que nada falle.
+pub fn uid_real_de(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    uid_real_de_status(&status)
+}
+
+/// La parte pura de [`uid_real_de`]: saca el uid real del texto de
+/// `/proc/<pid>/status`. Separada para probar el parseo sin un proceso.
+///
+/// La línea es `Uid:\t<real>\t<efectivo>\t<guardado>\t<fs>`; el primero es el
+/// real. Tomar cualquier otro campo dejaría el corte clavado con un uid que el
+/// programa BPF no consulta.
+fn uid_real_de_status(status: &str) -> Option<u32> {
+    let linea = status.lines().find(|l| l.starts_with("Uid:"))?;
+    linea.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Cuándo se encendió la máquina, según `/proc/stat`. No cambia mientras
 /// corre, así que se lee una sola vez.
 fn btime() -> Option<Duration> {
@@ -176,27 +201,51 @@ const NETLINK_CONNECTOR: i32 = 11;
 const CN_IDX_PROC: u32 = 1;
 const CN_VAL_PROC: u32 = 1;
 const PROC_CN_MCAST_LISTEN: u32 = 1;
+const PROC_EVENT_FORK: u32 = 0x0000_0001;
 const PROC_EVENT_EXEC: u32 = 0x0000_0002;
+const PROC_EVENT_EXIT: u32 = 0x8000_0000;
 const NLMSG_DONE: u16 = 3;
+
+use crate::firewall::enrolar::Evento;
 
 /// Dónde empieza el evento dentro de lo que llega por el socket.
 ///
 /// Son tres encabezados pegados: `nlmsghdr` (16), `cn_msg` (20) y después el
 /// `proc_event`, cuyos primeros 16 bytes son el tipo, la CPU y la marca de
-/// tiempo. El pid del `exec` viene justo después.
+/// tiempo. Los datos del evento vienen justo después, en `OFFSET_DATOS`.
 const OFFSET_QUE: usize = 16 + 20;
-const OFFSET_PID: usize = OFFSET_QUE + 16;
+const OFFSET_DATOS: usize = OFFSET_QUE + 16;
 
-/// Saca el pid de un mensaje del conector, si es un `exec` nuestro.
+/// Dónde está el **tgid** dentro de los datos de cada evento, en bytes.
+///
+/// El tgid —no el pid de hilo— es lo que ve userspace y lo que lee el programa
+/// BPF (`bpf_get_current_pid_tgid() >> 32`), así que se toma ese. Según el tipo:
+///
+/// - `exec` (`exec_proc_event { process_pid, process_tgid }`): `process_tgid` a
+///   los 4 bytes.
+/// - `exit` (`exit_proc_event { process_pid, process_tgid, … }`): ídem, a los 4.
+/// - `fork` (`fork_proc_event { parent_pid, parent_tgid, child_pid, child_tgid }`):
+///   el **hijo** es el proceso nuevo, `child_tgid`, a los 12 bytes.
+fn desplazamiento_del_tgid(que: u32) -> Option<(Evento, usize)> {
+    match que {
+        PROC_EVENT_EXEC => Some((Evento::Exec, 4)),
+        PROC_EVENT_EXIT => Some((Evento::Exit, 4)),
+        PROC_EVENT_FORK => Some((Evento::Fork, 12)),
+        _ => None,
+    }
+}
+
+/// Saca el evento y el tgid de un mensaje del conector, si es un `exec`, `fork`
+/// o `exit` nuestro.
 ///
 /// Separado del socket para poder comprobarlo sin privilegios ni kernel: es
 /// aritmética de desplazamientos, que es justo donde uno se equivoca.
 ///
 /// Comprueba también el identificador del conector. Sin eso, cualquier mensaje
-/// con los bytes en la posición correcta pasaría por un `exec`, incluidos los
+/// con los bytes en la posición correcta pasaría por un evento, incluidos los
 /// de otro subsistema que comparta el socket.
-pub fn pid_de_exec(mensaje: &[u8]) -> Option<u32> {
-    if mensaje.len() < OFFSET_PID + 4 {
+pub fn evento_de(mensaje: &[u8]) -> Option<(Evento, u32)> {
+    if mensaje.len() < OFFSET_QUE + 4 {
         return None;
     }
     // El `cn_msg` empieza después del `nlmsghdr` y arranca con su `cb_id`.
@@ -206,11 +255,13 @@ pub fn pid_de_exec(mensaje: &[u8]) -> Option<u32> {
         return None;
     }
     let que = u32::from_ne_bytes(mensaje[OFFSET_QUE..OFFSET_QUE + 4].try_into().ok()?);
-    if que != PROC_EVENT_EXEC {
+    let (evento, desp) = desplazamiento_del_tgid(que)?;
+    let inicio = OFFSET_DATOS + desp;
+    if mensaje.len() < inicio + 4 {
         return None;
     }
-    let pid = i32::from_ne_bytes(mensaje[OFFSET_PID..OFFSET_PID + 4].try_into().ok()?);
-    u32::try_from(pid).ok()
+    let tgid = i32::from_ne_bytes(mensaje[inicio..inicio + 4].try_into().ok()?);
+    u32::try_from(tgid).ok().map(|pid| (evento, pid))
 }
 
 /// El mensaje que le pide al kernel que empiece a avisar.
@@ -240,7 +291,7 @@ fn suscripcion(pid_propio: u32) -> Vec<u8> {
 /// disponible se registra y se sale: sin caché el vigilante sigue funcionando,
 /// sólo que pierde a los procesos que mueren rápido — que es exactamente como
 /// estaba antes.
-pub fn escuchar(cache: Cache) {
+pub fn escuchar(cache: Cache, contexto: Option<crate::firewall::enrolar::Contexto>) {
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -343,8 +394,16 @@ pub fn escuchar(cache: Cache) {
             unsafe { libc::close(fd) };
             return;
         }
-        if let Some(pid) = pid_de_exec(&buffer[..leidos as usize]) {
-            anotar(&cache, pid);
+        if let Some((evento, pid)) = evento_de(&buffer[..leidos as usize]) {
+            // La caché de rutas sólo necesita los `exec`: es para nombrar a un
+            // programa por su ejecutable cuando ya se cerró.
+            if evento == Evento::Exec {
+                anotar(&cache, pid);
+            }
+            // El cortafuegos enrola por exec/fork y limpia por exit.
+            if let Some(ctx) = &contexto {
+                crate::firewall::enrolar::atender_evento(ctx, evento, pid);
+            }
         }
     }
 }
@@ -353,15 +412,43 @@ pub fn escuchar(cache: Cache) {
 mod tests {
     use super::*;
 
-    /// Arma un mensaje como el que manda el kernel.
-    fn mensaje(que: u32, pid: i32) -> Vec<u8> {
-        let mut m = vec![0u8; OFFSET_PID + 4];
+    /// Arma un mensaje como el que manda el kernel, con el `tgid` en el
+    /// desplazamiento que le corresponde al tipo de evento.
+    fn mensaje(que: u32, tgid: i32) -> Vec<u8> {
+        let desp = desplazamiento_del_tgid(que).map(|(_, d)| d).unwrap_or(4);
+        let inicio = OFFSET_DATOS + desp;
+        let mut m = vec![0u8; inicio + 4];
         // El identificador del conector, que ahora también se comprueba.
         m[16..20].copy_from_slice(&CN_IDX_PROC.to_ne_bytes());
         m[20..24].copy_from_slice(&CN_VAL_PROC.to_ne_bytes());
         m[OFFSET_QUE..OFFSET_QUE + 4].copy_from_slice(&que.to_ne_bytes());
-        m[OFFSET_PID..OFFSET_PID + 4].copy_from_slice(&pid.to_ne_bytes());
+        m[inicio..inicio + 4].copy_from_slice(&tgid.to_ne_bytes());
         m
+    }
+
+    /// El uid real sale del primer campo de `Uid:`, no del efectivo ni de los
+    /// otros. Si tomara otro, el cortafuegos clavaría con una clave que el
+    /// programa BPF no consulta y el corte no haría nada (F3).
+    #[test]
+    fn el_uid_real_es_el_primer_campo_de_uid() {
+        let status = "Name:\tbash\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t6\t7\t8\n";
+        assert_eq!(uid_real_de_status(status), Some(1000));
+    }
+
+    /// Un `status` raro —sin `Uid:`, o con la línea truncada— no adivina un uid:
+    /// mejor no enrolar que enrolar con el uid equivocado.
+    #[test]
+    fn un_status_sin_uid_no_devuelve_nada() {
+        assert_eq!(uid_real_de_status(""), None);
+        assert_eq!(uid_real_de_status("Name:\tbash\n"), None);
+        assert_eq!(uid_real_de_status("Uid:\n"), None);
+    }
+
+    /// Y contra el propio proceso: su uid real es el que corre la prueba.
+    #[test]
+    fn el_uid_real_del_proceso_propio_coincide() {
+        let propio = unsafe { libc::getuid() };
+        assert_eq!(uid_real_de(std::process::id()), Some(propio));
     }
 
     /// La hora que se guarda tiene que ser la del `exec`, no la de la lectura.
@@ -410,40 +497,52 @@ mod tests {
     }
 
     #[test]
-    fn de_un_exec_sale_el_pid() {
-        assert_eq!(pid_de_exec(&mensaje(PROC_EVENT_EXEC, 4242)), Some(4242));
+    fn de_un_exec_sale_el_tgid() {
+        assert_eq!(
+            evento_de(&mensaje(PROC_EVENT_EXEC, 4242)),
+            Some((Evento::Exec, 4242))
+        );
     }
 
-    /// Un mensaje de otro subsistema del conector no es un arranque de proceso,
+    /// El cortafuegos necesita el `fork` (para enrolar a los hijos del árbol) y
+    /// el `exit` (para limpiar la marca). El del fork es el **hijo**, no el
+    /// padre.
+    #[test]
+    fn el_fork_da_el_hijo_y_el_exit_el_que_sale() {
+        assert_eq!(
+            evento_de(&mensaje(PROC_EVENT_FORK, 777)),
+            Some((Evento::Fork, 777))
+        );
+        assert_eq!(
+            evento_de(&mensaje(PROC_EVENT_EXIT, 888)),
+            Some((Evento::Exit, 888))
+        );
+    }
+
+    /// Un mensaje de otro subsistema del conector no es un evento de proceso,
     /// aunque tenga los bytes en la posición correcta.
     #[test]
     fn un_mensaje_de_otro_subsistema_se_ignora() {
         let mut m = mensaje(PROC_EVENT_EXEC, 4242);
         m[16..20].copy_from_slice(&99u32.to_ne_bytes());
-        assert_eq!(pid_de_exec(&m), None);
+        assert_eq!(evento_de(&m), None);
     }
 
-    /// Por el conector pasan también forks, salidas y cambios de uid. Tomar el
-    /// pid de cualquiera de ellos llenaría la caché de basura.
+    /// Por el conector pasan más eventos (cambios de uid, de gid, de nombre).
+    /// Tomar el pid de cualquiera de ellos sería tratarlo como lo que no es.
     #[test]
-    fn los_otros_eventos_se_ignoran() {
-        for que in [0x0000_0001, 0x0000_0004, 0x8000_0000] {
-            assert_eq!(
-                pid_de_exec(&mensaje(que, 4242)),
-                None,
-                "aceptó el evento {que:#x}"
-            );
+    fn los_eventos_que_no_interesan_se_ignoran() {
+        for que in [0x0000_0004, 0x0000_0040, 0x0000_0100] {
+            assert_eq!(evento_de(&mensaje(que, 4242)), None, "aceptó {que:#x}");
         }
     }
 
     #[test]
     fn un_mensaje_corto_no_lee_de_mas() {
-        assert_eq!(pid_de_exec(&[]), None);
-        assert_eq!(pid_de_exec(&[0u8; 40]), None);
-        assert_eq!(
-            pid_de_exec(&mensaje(PROC_EVENT_EXEC, 1)[..OFFSET_PID + 3]),
-            None
-        );
+        assert_eq!(evento_de(&[]), None);
+        assert_eq!(evento_de(&[0u8; 40]), None);
+        let fork = mensaje(PROC_EVENT_FORK, 1);
+        assert_eq!(evento_de(&fork[..fork.len() - 1]), None);
     }
 
     #[test]
