@@ -5,7 +5,10 @@
 # dos fechas distintas pueden dar un objeto BPF distinto desde la misma fuente, y
 # la prueba de correspondencia (`daemon/tests/firewall_objeto.rs`) compara byte a
 # byte. Al subir la fecha hay que regenerar el objeto con `build.sh` en el mismo PR.
+# El target `bpfel-unknown-none` NO va en `targets`: no existe un `rust-std`
+# distribuible para él (por eso se compila `core` con build-std), y listarlo acá
+# hace que rustup intente descargarlo y falle al preparar el toolchain —incluso
+# para `cargo fmt`, que no compila—. El target lo fija `.cargo/config.toml`.
 [toolchain]
 channel = "nightly-2026-11-04"
 components = ["rust-src"]
-targets = ["bpfel-unknown-none"]
