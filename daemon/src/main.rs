@@ -1908,4 +1908,39 @@ mod tests_reask {
             .get(&1000)
             .is_some_and(|s| s.contains("/home/x/b.AppImage")));
     }
+
+    /// F4: en `SetPermission`, el corte de red sólo se aplica tras autorizar con
+    /// polkit, y `guardar_red` recibe el uid del llamante identificado, nunca un
+    /// pid ni un uid que venga del argumento D-Bus. Guarda estructural: no hay un
+    /// bus en las pruebas, así que se vigila el orden en la fuente.
+    #[test]
+    fn el_corte_de_red_se_aplica_solo_tras_autorizar() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        let inicio = fuente
+            .find("async fn set_permission(")
+            .expect("set_permission");
+        let cuerpo = &fuente[inicio..];
+        let fin = cuerpo
+            .find(
+                "
+    }
+",
+            )
+            .expect("fin de set_permission");
+        let cuerpo = &cuerpo[..fin];
+        let autorizar = cuerpo
+            .find("polkit::authorize(")
+            .expect("polkit en set_permission");
+        let llamada = cuerpo
+            .find("self.guardar_red(")
+            .expect("guardar_red en set_permission");
+        assert!(autorizar < llamada, "guardar_red corre antes de polkit");
+        assert!(
+            cuerpo.contains("self.guardar_red(caller.uid,"),
+            "el uid tiene que venir del llamante identificado"
+        );
+        // Ningún otro camino del servicio llega al cortafuegos sin pasar por acá.
+        assert_eq!(fuente.matches("self.guardar_red(").count(), 1);
+    }
 }

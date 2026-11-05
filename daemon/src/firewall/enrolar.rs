@@ -379,4 +379,114 @@ mod tests {
         atender_evento(&ctx, Evento::Exit, std::process::id());
         resincronizar(&ctx);
     }
+
+    /// Un `fork` de un ejecutable cortado marca al hijo: hereda el corte del
+    /// árbol sin esperar a un `exec`.
+    #[test]
+    fn un_fork_de_un_ejecutable_cortado_hereda_el_corte() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx = ctx_con_falso(red);
+        atender_evento(&ctx, Evento::Fork, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 1);
+    }
+
+    /// Un `fork` de un ejecutable que no está cortado no marca nada.
+    #[test]
+    fn un_fork_de_un_ejecutable_no_cortado_no_marca() {
+        let ctx = ctx_con_falso(red_vacia());
+        atender_evento(&ctx, Evento::Fork, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 0);
+    }
+
+    /// Un `exec` a un ejecutable ya no cortado limpia la marca que el pid traía
+    /// (el mismo número de pid que cambia de programa no arrastra el corte).
+    #[test]
+    fn un_exec_a_un_ejecutable_no_cortado_limpia_la_marca_vieja() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx = ctx_con_falso(red.clone());
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 1);
+
+        fijar(&red, mi_uid(), &mi_exe(), false);
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 0);
+    }
+
+    /// Un `exit` de un pid que nunca se marcó no es error ni toca el mapa.
+    #[test]
+    fn un_exit_de_un_pid_no_marcado_no_toca_el_mapa() {
+        let ctx = ctx_con_falso(red_vacia());
+        atender_evento(&ctx, Evento::Exit, 4_000_000);
+        let guard = ctx.enforcer.lock().unwrap();
+        assert!(guard.as_ref().unwrap().motor().quitados.is_empty());
+    }
+
+    /// F3/F4: el uid de la clave sale del `/proc` del pid (real), no de la
+    /// política: el corte guardado para otro uid no alcanza a este proceso, y el
+    /// que sí le corresponde escribe la clave `(uid real << 32 | pid)`.
+    #[test]
+    fn el_uid_de_la_clave_sale_del_proceso_y_no_de_la_politica() {
+        let ajeno = mi_uid().wrapping_add(1);
+        let red = red_vacia();
+        fijar(&red, ajeno, &mi_exe(), true);
+        let ctx = ctx_con_falso(red);
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        assert_eq!(
+            ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(),
+            0,
+            "el corte de otro uid no puede alcanzar a este proceso"
+        );
+        assert!(!barrer_proc(&ctx.red).contains_key(&std::process::id()));
+
+        fijar(&ctx.red, mi_uid(), &mi_exe(), true);
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        let guard = ctx.enforcer.lock().unwrap();
+        let esperada = (u64::from(mi_uid()) << 32) | u64::from(std::process::id());
+        assert_eq!(
+            guard.as_ref().unwrap().motor().insertados,
+            vec![(esperada, 1)]
+        );
+    }
+
+    /// Fail-closed en el adapter: si el mapa está lleno el pid no figura como
+    /// marcado (no se finge un corte que no está) y el evento no rompe nada.
+    #[test]
+    fn con_el_mapa_lleno_el_pid_no_figura_como_cortado() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let motor = crate::firewall::MotorFalso {
+            falla_al_insertar: Some(aya::maps::MapError::SyscallError(aya::sys::SyscallError {
+                call: "bpf_map_update_elem",
+                io_error: std::io::Error::from_raw_os_error(libc::E2BIG),
+            })),
+            ..Default::default()
+        };
+        let enf = Enforcer::nuevo(crate::firewall::Firewall::con_motor(motor).unwrap());
+        let ctx = Contexto {
+            enforcer: Arc::new(Mutex::new(Some(enf))),
+            red,
+        };
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 0);
+    }
+
+    /// Al apagar el switch, `resincronizar` limpia lo que quedó marcado.
+    #[test]
+    fn resincronizar_limpia_lo_que_dejo_de_estar_cortado() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx = ctx_con_falso(red.clone());
+        resincronizar(&ctx);
+        assert!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados() >= 1);
+
+        fijar(&red, mi_uid(), &mi_exe(), false);
+        resincronizar(&ctx);
+        let guard = ctx.enforcer.lock().unwrap();
+        let enf = guard.as_ref().unwrap();
+        assert_eq!(enf.marcados(), 0);
+        let clave = (u64::from(mi_uid()) << 32) | u64::from(std::process::id());
+        assert!(enf.motor().quitados.contains(&clave));
+    }
 }

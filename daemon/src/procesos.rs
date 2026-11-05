@@ -435,6 +435,19 @@ mod tests {
         assert_eq!(uid_real_de_status(status), Some(1000));
     }
 
+    /// Un proceso setuid-root (real 1000, efectivo 0) sigue cayendo en la clave
+    /// del uid real: el BPF consulta `bpf_get_current_uid_gid()` (F3).
+    #[test]
+    fn un_proceso_setuid_se_enrola_con_su_uid_real() {
+        let status = "Name:\tsudo\nUid:\t1000\t0\t0\t0\nGid:\t1000\t0\t0\t0\n";
+        assert_eq!(uid_real_de_status(status), Some(1000));
+        // Y no se deja engañar por una línea que sólo contiene «Uid:» más abajo.
+        assert_eq!(
+            uid_real_de_status("Name:\tx\nNgid:\t0\nUid:\t7\t0\t0\t0\n"),
+            Some(7)
+        );
+    }
+
     /// Un `status` raro —sin `Uid:`, o con la línea truncada— no adivina un uid:
     /// mejor no enrolar que enrolar con el uid equivocado.
     #[test]
