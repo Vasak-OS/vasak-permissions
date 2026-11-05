@@ -195,4 +195,43 @@ mod tests {
     fn el_valor_de_denegar_es_uno() {
         assert_eq!(DENY, 1);
     }
+
+    /// Los dos lados se desincronizan sin aviso si alguien toca uno solo. Esta
+    /// prueba lee la fuente del programa BPF (siempre disponible, a diferencia del
+    /// toolchain BPF que necesita la correspondencia del objeto) y exige que la
+    /// derivación de la clave y el valor `DENY` sean los de este módulo.
+    #[test]
+    fn la_fuente_bpf_deriva_la_misma_clave_y_el_mismo_deny() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        assert!(
+            fuente.contains("let key = ((uid as u64) << 32) | (tgid as u64);"),
+            "el programa BPF cambió la derivación de la clave: ya no es (uid << 32 | tgid)"
+        );
+        assert!(
+            fuente.contains(&format!("const DENY: u8 = {DENY};")),
+            "el programa BPF y el daemon discrepan en el valor de DENY"
+        );
+        assert!(
+            fuente.contains(&format!("static {MAPA_BLOQUEADOS}: HashMap<u64, u8>")),
+            "el mapa del programa BPF ya no se llama «{MAPA_BLOQUEADOS}» o cambió de tipo"
+        );
+    }
+
+    /// Sin privilegios la carga no puede salir bien, y tiene que decirlo con un
+    /// `Err` accionable en vez de dar un cortafuegos que no filtra nada. Con root
+    /// la carga sí puede salir, y eso lo cubre la prueba de integración.
+    #[test]
+    fn sin_privilegios_la_carga_falla_cerrada_y_con_motivo() {
+        // SAFETY: `geteuid` no tiene precondiciones y no falla.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let Err(motivo) = Firewall::load() else {
+            panic!("la carga salió bien sin privilegios: el cortafuegos no puede estar activo");
+        };
+        assert!(
+            motivo.contains("CAP_NET_ADMIN"),
+            "el error no es accionable (no nombra la capacidad que falta): {motivo}"
+        );
+    }
 }
