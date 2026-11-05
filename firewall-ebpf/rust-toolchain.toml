@@ -11,4 +11,7 @@
 # para `cargo fmt`, que no compila—. El target lo fija `.cargo/config.toml`.
 [toolchain]
 channel = "nightly-2026-11-04"
-components = ["rust-src"]
+# `rust-src` para build-std; `rustfmt` porque el CI corre en perfil mínimo y el
+# paso de formato de `app / revisar` entra a este crate con el nightly fijado: sin
+# listarlo, `cargo fmt` falla con «cargo-fmt is not installed for the toolchain».
+components = ["rust-src", "rustfmt"]
