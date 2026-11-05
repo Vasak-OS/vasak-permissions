@@ -22,8 +22,10 @@ use aya::Ebpf;
 const CGROUP_RAIZ: &str = "/sys/fs/cgroup";
 const DENY: u8 = 1;
 
-/// El objeto commiteado, el mismo que embebe el daemon.
-const OBJETO: &[u8] = include_bytes!("../src/firewall/vasak-firewall.bpf.o");
+/// El objeto commiteado, el mismo que embebe el daemon. `include_bytes_aligned!`
+/// (no `include_bytes!`): el parser de aya exige el ELF alineado, y los bytes de
+/// un `include_bytes!` a secas pueden quedar desalineados y hacer fallar la carga.
+static OBJETO: &[u8] = aya::include_bytes_aligned!("../src/firewall/vasak-firewall.bpf.o");
 
 fn es_root() -> bool {
     // SAFETY: `geteuid` no tiene precondiciones y no falla.
@@ -80,8 +82,10 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
         .expect("connect4 no es cgroup/connect");
     programa.load().expect("no se pudo cargar connect4");
     let cgroup = std::fs::File::open(CGROUP_RAIZ).expect("no se pudo abrir el cgroup raíz");
+    // `AllowMultiple`, no `Single`: el gancho connect de la raíz lo comparten
+    // otros adjuntos, y `Single` falla si ya hay uno; `AllowMultiple` coopera.
     programa
-        .attach(cgroup, CgroupAttachMode::Single)
+        .attach(cgroup, CgroupAttachMode::AllowMultiple)
         .expect("no se pudo adjuntar connect4 al cgroup raíz");
 
     let uid = unsafe { libc::geteuid() };
