@@ -1,13 +1,18 @@
 //! La unidad del daemon deja pasar `bpf()` sin aflojar el resto.
 //!
 //! El cortafuegos por aplicación (issue #93) carga un programa eBPF, y para eso
-//! llama `bpf()`. El filtro `@system-service` **no** incluye esa syscall, así que
-//! sin `SystemCallFilter=bpf` la carga falla con EPERM en silencio: el daemon
-//! arranca, el cortafuegos no, y nada lo delata salvo una línea en el diario.
+//! llama `bpf()`, que el filtro `@system-service` **no** incluye. La
+//! infraestructura está en M0 pero todavía **sin llamador en el binario** —el
+//! cableado con la política es el PR siguiente—, así que el daemon no la carga al
+//! arrancar por ahora. La directiva `SystemCallFilter=bpf` se pre-provisiona
+//! igual: cuando ese cableado la encienda, sin ella la carga fallaría con EPERM
+//! en silencio —el daemon arranca, el cortafuegos no, y nada lo delata salvo una
+//! línea en el diario—, y se deja lista ahora para no tener que tocar el
+//! endurecimiento en aquel PR.
 //!
-//! Esta prueba es roja sin el fix (la línea no estaba) y cuida que al abrirle la
-//! puerta a `bpf()` no se haya aflojado el endurecimiento que el diseño dice que
-//! se conserva.
+//! Esta prueba cuida que la directiva esté y que, al abrirle la puerta a
+//! `bpf()`, no se haya aflojado el endurecimiento que el diseño dice que se
+//! conserva.
 
 const UNIDAD: &str = include_str!("../../packaging/vasak-permissions.service");
 
@@ -34,8 +39,9 @@ fn la_unidad_permite_bpf_sobre_system_service() {
     );
     assert!(
         d.contains(&"SystemCallFilter=bpf"),
-        "a la unidad le falta «SystemCallFilter=bpf»: la carga del programa eBPF del \
-         cortafuegos falla con EPERM y el kill-switch de red no se activa"
+        "a la unidad le falta «SystemCallFilter=bpf»: cuando el PR siguiente cablee el \
+         cortafuegos, la carga del programa eBPF fallaría con EPERM y el corte de egreso \
+         por connect() no se activaría"
     );
 }
 
