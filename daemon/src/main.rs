@@ -15,6 +15,13 @@ mod agent;
 mod audit;
 mod auditnl;
 mod excepcion;
+// La infraestructura del cortafuegos por aplicación (M0 del #93): cargar el
+// programa BPF, adjuntarlo al cgroup raíz y marcar/desmarcar pids. Probada y
+// lista, pero todavía sin llamador en el binario —cablearla a la política es el
+// PR siguiente, que quita este `allow`—. Hasta entonces sus métodos no tienen
+// quién los invoque desde `main`.
+#[allow(dead_code)]
+mod firewall;
 mod identity;
 mod local;
 mod policy;

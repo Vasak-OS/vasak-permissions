@@ -28,3 +28,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# El target del crate BPF, que es su propio workspace fuera del de arriba.
+/firewall-ebpf/target

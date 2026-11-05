@@ -18,6 +18,17 @@ zbus.workspace = true
 zbus_macros = { version = "5", features = ["default"] }
 tokio.workspace = true
 libc = "0.2"
+# El lado userspace de eBPF: carga el objeto BPF commiteado del cortafuegos por
+# aplicación y mantiene su mapa. Es Rust puro y compila en estable; el lado BPF
+# (`aya-ebpf`) vive en el crate aparte `firewall-ebpf`, que no entra en este
+# build.
+#
+# Fijado a ~0.14: aya 0.15 y 0.16 declaran `rust-version = 1.98`, por encima del
+# estable del equipo (1.97.1); 0.14 es la última sin esa barrera. Subir cuando el
+# toolchain base pase de 1.98. El objeto BPF embebido es independiente de esta
+# versión (sólo comparten el formato ELF), así que el pin del cargador no ata al
+# crate `firewall-ebpf`.
+aya = "~0.14.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
