@@ -1,7 +1,11 @@
 # `aya-ebpf` exige nightly y el target BPF necesita compilar `core` desde la
 # fuente (`build-std`), que sólo nightly permite. El build del daemon NO usa este
 # toolchain: este archivo sólo rige dentro de este crate.
+# Nightly FIJADO a una fecha: el codegen de LLVM cambia entre nightlies, así que
+# dos fechas distintas pueden dar un objeto BPF distinto desde la misma fuente, y
+# la prueba de correspondencia (`daemon/tests/firewall_objeto.rs`) compara byte a
+# byte. Al subir la fecha hay que regenerar el objeto con `build.sh` en el mismo PR.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-11-04"
 components = ["rust-src"]
 targets = ["bpfel-unknown-none"]

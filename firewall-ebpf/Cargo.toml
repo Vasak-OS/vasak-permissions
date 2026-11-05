@@ -19,8 +19,12 @@ name = "vasak-firewall"
 path = "src/main.rs"
 
 [dependencies]
-# El lado BPF de aya. El lado userspace (`aya`) vive en el daemon.
-aya-ebpf = "0.3"
+# El lado BPF de aya. El lado userspace (`aya`) vive en el daemon. Versión
+# EXACTA, no un rango: los bytes del objeto commiteado sólo son reproducibles
+# contra una versión fija de aya-ebpf (y del nightly, ver rust-toolchain.toml), y
+# la prueba de correspondencia compara byte a byte. Un minor nuevo podría cambiar
+# el codegen y dar un ELF distinto sin que la fuente cambie.
+aya-ebpf = "=0.3.0"
 
 # Sólo-veredicto y diminuto: sin información de depuración, para que el objeto
 # commiteado sea estable y chico, y para que el verificador no tropiece con BTF
