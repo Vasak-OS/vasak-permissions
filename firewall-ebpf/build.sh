@@ -18,7 +18,12 @@ cd "$(dirname "$0")"
 OBJETO_FUENTE="target/bpfel-unknown-none/release/vasak-firewall"
 OBJETO_DESTINO="../daemon/src/firewall/vasak-firewall.bpf.o"
 
-cargo +nightly build --release
+# `cargo` pelado (sin `+nightly`): dentro de este directorio rustup lee el canal
+# del `rust-toolchain.toml` —el nightly FIJADO por fecha—, no «cualquier
+# nightly». Es lo que hace que el objeto sea reproducible byte a byte; con
+# `+nightly` se usaría el nightly por omisión del equipo, que puede ser otra
+# fecha y dar un ELF distinto desde la misma fuente.
+cargo build --release
 
 cp "$OBJETO_FUENTE" "$OBJETO_DESTINO"
 echo "Objeto BPF regenerado en $OBJETO_DESTINO"

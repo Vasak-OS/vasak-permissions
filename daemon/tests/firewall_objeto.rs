@@ -36,21 +36,38 @@ fn objeto_recompilado() -> PathBuf {
     crate_ebpf().join("target/bpfel-unknown-none/release/vasak-firewall")
 }
 
-/// `bpf-linker` en el PATH: es el enlazador del target BPF.
-fn hay_bpf_linker() -> bool {
+/// El canal fijado en el `rust-toolchain.toml` del crate BPF (p. ej.
+/// `nightly-2026-11-04`). La correspondencia es byte a byte y el codegen de LLVM
+/// cambia entre nightlies, así que la recompilación tiene que usar **ese**
+/// nightly, no «cualquier nightly»; se lee del toml para no fijar la fecha en dos
+/// lugares.
+fn canal_fijado() -> Option<String> {
+    let toml = std::fs::read_to_string(crate_ebpf().join("rust-toolchain.toml")).ok()?;
+    toml.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("channel"))
+        .and_then(|rest| rest.split('"').nth(1))
+        .map(str::to_string)
+}
+
+/// `bpf-linker` 0.13.0 en el PATH: es el enlazador del target BPF, y la versión
+/// cuenta porque otra puede dar un ELF distinto desde la misma fuente y romper la
+/// correspondencia byte a byte.
+fn hay_bpf_linker_fijado() -> bool {
     Command::new("bpf-linker")
         .arg("--version")
         .output()
-        .is_ok_and(|s| s.status.success())
+        .is_ok_and(|s| s.status.success() && String::from_utf8_lossy(&s.stdout).contains("0.13.0"))
 }
 
-/// Nightly instalado y con `rust-src`: el target BPF compila `core` desde la
-/// fuente, que sólo nightly con ese componente permite.
-fn hay_nightly_con_rust_src() -> bool {
+/// El nightly fijado, instalado y con `rust-src`: el target BPF compila `core`
+/// desde la fuente, que sólo nightly con ese componente permite.
+fn hay_nightly_fijado_con_rust_src(canal: &str) -> bool {
     let Ok(salida) = Command::new("rustc")
-        .args(["+nightly", "--print", "sysroot"])
+        .arg(format!("+{canal}"))
+        .args(["--print", "sysroot"])
         // `cargo test` corre con `RUSTUP_TOOLCHAIN` fijado al toolchain de la
-        // suite (estable); hay que soltarlo para que `+nightly` mande.
+        // suite (estable); hay que soltarlo para que el `+<canal>` mande.
         .env_remove("RUSTUP_TOOLCHAIN")
         .output()
     else {
@@ -67,19 +84,26 @@ fn hay_nightly_con_rust_src() -> bool {
 
 #[test]
 fn el_objeto_commiteado_corresponde_a_la_fuente() {
-    if !hay_bpf_linker() || !hay_nightly_con_rust_src() {
+    let Some(canal) = canal_fijado() else {
         eprintln!(
-            "falta el toolchain BPF (nightly con rust-src y/o bpf-linker); \
+            "no se pudo leer el canal del rust-toolchain.toml del crate BPF; \
+             se salta la correspondencia del objeto"
+        );
+        return;
+    };
+    if !hay_bpf_linker_fijado() || !hay_nightly_fijado_con_rust_src(&canal) {
+        eprintln!(
+            "falta el toolchain BPF fijado ({canal} con rust-src y/o bpf-linker 0.13.0); \
              se salta la correspondencia del objeto"
         );
         return;
     }
 
-    // `cargo test` deja `RUSTUP_TOOLCHAIN` fijado al estable de la suite, que
-    // pisaría el `rust-toolchain.toml` del crate BPF; se suelta y se pide
-    // `+nightly` explícito para que el target BPF compile.
+    // `cargo` pelado desde el dir del crate: rustup lee el pin del
+    // `rust-toolchain.toml` (el mismo nightly que usa `build.sh`), no «cualquier
+    // nightly». Se suelta `RUSTUP_TOOLCHAIN`, que `cargo test` deja fijado al
+    // estable de la suite y que, si queda, pisaría el pin del toml.
     let estado = Command::new("cargo")
-        .arg("+nightly")
         .arg("build")
         .arg("--release")
         .current_dir(crate_ebpf())
