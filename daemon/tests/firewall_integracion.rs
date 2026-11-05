@@ -82,10 +82,12 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
         .expect("connect4 no es cgroup/connect");
     programa.load().expect("no se pudo cargar connect4");
     let cgroup = std::fs::File::open(CGROUP_RAIZ).expect("no se pudo abrir el cgroup raíz");
-    // `AllowMultiple`, no `Single`: el gancho connect de la raíz lo comparten
-    // otros adjuntos, y `Single` falla si ya hay uno; `AllowMultiple` coopera.
+    // `Single`, no `AllowMultiple`: con `AllowMultiple` aya adjunta por link
+    // (`bpf_link_create`), que este kernel (CachyOS 7.3.1) rechaza para
+    // `cgroup/connect` con EINVAL. `Single` usa el `BPF_PROG_ATTACH` legacy, que
+    // el kernel sí acepta —verificado como root—.
     programa
-        .attach(cgroup, CgroupAttachMode::AllowMultiple)
+        .attach(cgroup, CgroupAttachMode::Single)
         .expect("no se pudo adjuntar connect4 al cgroup raíz");
 
     let uid = unsafe { libc::geteuid() };

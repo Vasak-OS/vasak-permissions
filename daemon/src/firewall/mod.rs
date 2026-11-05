@@ -270,12 +270,15 @@ impl MotorBpf for MotorAya {
         let cgroup = std::fs::File::open(CGROUP_RAIZ)
             .map_err(|e| format!("no se pudo abrir {CGROUP_RAIZ} para adjuntar «{nombre}»: {e}"))?;
 
-        // `AllowMultiple`, no `Single`: el gancho connect de la raíz lo comparten
-        // otros (systemd, contenedores, otra herramienta de red). `Single`
-        // monopoliza el punto y falla si ya hay alguien; `AllowMultiple` coopera
-        // —el kernel evalúa todos los adjuntos y basta que uno niegue—.
+        // `Single`, no `AllowMultiple`, por una razón empírica: con `AllowMultiple`
+        // aya adjunta por link (`bpf_link_create`), y este kernel (CachyOS 7.3.1)
+        // lo rechaza para `cgroup/connect` con EINVAL —verificado como root, la
+        // prueba de integración falla ahí—. `Single` usa el `BPF_PROG_ATTACH`
+        // legacy, que el kernel sí acepta. El riesgo de co-inquilinos (que otro
+        // adjunto quiera el gancho connect de la raíz y `Single` lo rechace) queda
+        // como investigación futura si aparece; que ande el kill-switch manda.
         programa
-            .attach(cgroup, CgroupAttachMode::AllowMultiple)
+            .attach(cgroup, CgroupAttachMode::Single)
             .map_err(|e| describir_adjunto(nombre, "adjuntar", &con_causas(&e)))?;
 
         Ok(())
