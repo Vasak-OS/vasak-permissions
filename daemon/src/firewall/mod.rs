@@ -132,7 +132,7 @@ impl<M: MotorBpf> Firewall<M> {
     pub fn block(&mut self, uid: u32, pid: u32) -> Result<(), String> {
         self.motor
             .insertar(clave(uid, pid), DENY)
-            .map_err(|e| format!("no se pudo marcar el pid {pid} (uid {uid}): {e}"))
+            .map_err(|e| format!("no se pudo marcar el pid {pid} (uid {uid}): {}", con_causas(&e)))
     }
 
     /// Desmarca un pid: sus `connect()` vuelven a pasar. No es error desmarcar uno
@@ -144,7 +144,8 @@ impl<M: MotorBpf> Firewall<M> {
             // llegar al mismo estado deseado. Ver [`es_clave_ausente`].
             Err(e) if es_clave_ausente(&e) => Ok(()),
             Err(e) => Err(format!(
-                "no se pudo desmarcar el pid {pid} (uid {uid}): {e}"
+                "no se pudo desmarcar el pid {pid} (uid {uid}): {}",
+                con_causas(&e)
             )),
         }
     }
@@ -184,6 +185,19 @@ fn es_clave_ausente(error: &MapError) -> bool {
 /// instala `SystemCallFilter=@system-service`, que **no** incluye `bpf`, así que
 /// sin sumar `SystemCallFilter=bpf` la carga falla acá. Se nombra el síntoma
 /// para que no se diagnostique como «kernel sin BPF».
+/// La cadena de causas de un error, no sólo su `Display`. Aya oculta el errno en
+/// el `Display` de `SyscallError`, y al diagnosticar por qué no cargó o no
+/// escribió el cortafuegos el errno (EPERM, ENOENT…) es justo lo que hace falta.
+fn con_causas(error: &dyn std::error::Error) -> String {
+    let mut texto = error.to_string();
+    let mut causa = error.source();
+    while let Some(c) = causa {
+        texto.push_str(&format!(": {c}"));
+        causa = c.source();
+    }
+    texto
+}
+
 fn describir_carga(error: &str) -> String {
     format!(
         "no se pudo cargar el programa BPF del cortafuegos: {error}. \
@@ -218,7 +232,7 @@ impl MotorAya {
         // `include_bytes_aligned!` garantiza el alineamiento que el cargador de
         // aya exige; `include_bytes!` a secas puede quedar desalineado y fallar.
         let objeto = aya::include_bytes_aligned!("vasak-firewall.bpf.o");
-        let ebpf = Ebpf::load(objeto).map_err(|e| describir_carga(&e.to_string()))?;
+        let ebpf = Ebpf::load(objeto).map_err(|e| describir_carga(&con_causas(&e)))?;
         Ok(Self { ebpf })
     }
 
@@ -247,7 +261,7 @@ impl MotorBpf for MotorAya {
 
         programa
             .load()
-            .map_err(|e| describir_adjunto(nombre, "cargar", &e.to_string()))?;
+            .map_err(|e| describir_adjunto(nombre, "cargar", &con_causas(&e)))?;
 
         // El cgroup raíz se abre como archivo; aya adjunta por su descriptor.
         let cgroup = std::fs::File::open(CGROUP_RAIZ)
@@ -259,7 +273,7 @@ impl MotorBpf for MotorAya {
         // —el kernel evalúa todos los adjuntos y basta que uno niegue—.
         programa
             .attach(cgroup, CgroupAttachMode::AllowMultiple)
-            .map_err(|e| describir_adjunto(nombre, "adjuntar", &e.to_string()))?;
+            .map_err(|e| describir_adjunto(nombre, "adjuntar", &con_causas(&e)))?;
 
         Ok(())
     }

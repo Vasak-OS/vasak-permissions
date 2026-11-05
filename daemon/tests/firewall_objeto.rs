@@ -107,7 +107,16 @@ fn el_objeto_commiteado_corresponde_a_la_fuente() {
         .arg("build")
         .arg("--release")
         .current_dir(crate_ebpf())
+        // Se sueltan las variables que cambiarían el build y romperían la
+        // comparación byte a byte aunque fuente y objeto coincidan:
+        // `RUSTUP_TOOLCHAIN` (lo fija `cargo test`, pisaría el pin), `RUSTFLAGS`/
+        // `CARGO_ENCODED_RUSTFLAGS` (reemplazan los rustflags del
+        // `.cargo/config.toml` y perderían `-C link-arg=--btf`), y
+        // `CARGO_TARGET_DIR` (movería la salida que después se lee).
         .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR")
         .status()
         .expect("no se pudo lanzar cargo para recompilar firewall-ebpf");
     assert!(
