@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use super::Enforcer;
+use super::{Enforcer, MotorAya, MotorBpf};
 
 /// Lo que el conector de procesos observó de un pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,10 +89,24 @@ pub type RedCortada = Arc<Mutex<HashMap<u32, HashSet<String>>>>;
 
 /// El cortafuegos y el conjunto de red cortada, juntos para pasarlos de una vez
 /// al conector y al servicio. Los dos son `Arc`, así que clonarlo comparte.
-#[derive(Clone)]
-pub struct Contexto {
-    pub enforcer: EnforcerCompartido,
+///
+/// Genérico sobre [`MotorBpf`] —con `MotorAya` por omisión, que es lo que usa el
+/// daemon— para que los adapters que lo reciben (`atender_evento`,
+/// `resincronizar`) se puedan probar con el cortafuegos de mentira.
+pub struct Contexto<M: MotorBpf = MotorAya> {
+    pub enforcer: Arc<Mutex<Option<Enforcer<M>>>>,
     pub red: RedCortada,
+}
+
+// `Clone` a mano: `#[derive(Clone)]` exigiría `M: Clone`, y el enforcer no lo es
+// —vive detrás de un `Arc`, que sí se clona—.
+impl<M: MotorBpf> Clone for Contexto<M> {
+    fn clone(&self) -> Self {
+        Self {
+            enforcer: Arc::clone(&self.enforcer),
+            red: Arc::clone(&self.red),
+        }
+    }
 }
 
 /// Si el ejecutable `binary` está cortado para `uid`.
@@ -129,7 +143,7 @@ fn identidad_de(pid: u32) -> Option<(u32, String)> {
 
 /// Aplica una acción sobre el enforcer compartido, registrando ruidoso cualquier
 /// fallo (fail-closed: un corte que no se pudo aplicar no pasa en silencio).
-fn aplicar(ctx: &Contexto, accion: Accion, uid: u32, pid: u32) {
+fn aplicar<M: MotorBpf>(ctx: &Contexto<M>, accion: Accion, uid: u32, pid: u32) {
     if accion == Accion::Nada {
         return;
     }
@@ -151,7 +165,7 @@ fn aplicar(ctx: &Contexto, accion: Accion, uid: u32, pid: u32) {
 
 /// Atiende un evento del conector: resuelve la identidad del pid (salvo en
 /// `exit`, donde ya no está y el uid sale de lo anotado) y aplica la acción.
-pub fn atender_evento(ctx: &Contexto, evento: Evento, pid: u32) {
+pub fn atender_evento<M: MotorBpf>(ctx: &Contexto<M>, evento: Evento, pid: u32) {
     if evento == Evento::Exit {
         // No se lee `/proc`: el proceso ya no está. `limpiar` reconstruye la
         // clave con el uid que anotó al marcarlo.
@@ -194,7 +208,7 @@ pub fn barrer_proc(red: &RedCortada) -> HashMap<u32, u32> {
 /// Al arrancar (nada marcado → marca los vivos cortados) y al cambiar el switch
 /// (marca lo que entró, limpia lo que salió). Pensada para correr fuera del
 /// runtime async (en `spawn_blocking` o en el arranque).
-pub fn resincronizar(ctx: &Contexto) {
+pub fn resincronizar<M: MotorBpf>(ctx: &Contexto<M>) {
     let deseados = barrer_proc(&ctx.red);
     let Ok(mut guard) = ctx.enforcer.lock() else {
         return;
@@ -252,5 +266,117 @@ mod tests {
         let red = red_vacia();
         fijar(&red, 1000, "/home/x/a", false);
         assert!(red.lock().unwrap().is_empty());
+    }
+
+    // ── Adapters contra el `/proc` vivo del propio proceso de la prueba ────────
+
+    fn mi_uid() -> u32 {
+        // SAFETY: `getuid` no tiene precondiciones y no falla.
+        unsafe { libc::getuid() }
+    }
+
+    fn mi_exe() -> String {
+        let exe = std::fs::read_link("/proc/self/exe").expect("ejecutable propio");
+        std::fs::canonicalize(&exe)
+            .unwrap_or(exe)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn ctx_con_falso(red: RedCortada) -> Contexto<crate::firewall::MotorFalso> {
+        Contexto {
+            enforcer: Arc::new(Mutex::new(Some(crate::firewall::enforcer_falso()))),
+            red,
+        }
+    }
+
+    /// `barrer_proc` encuentra el proceso de la prueba si su ejecutable está
+    /// cortado para su uid: ejercita la resolución de identidad y el recorrido de
+    /// `/proc` sin root.
+    #[test]
+    fn barrer_proc_encuentra_el_proceso_propio_cortado() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let deseados = barrer_proc(&red);
+        assert_eq!(
+            deseados.get(&std::process::id()),
+            Some(&mi_uid()),
+            "el proceso de la prueba tenía que aparecer como cortado"
+        );
+    }
+
+    /// Y con el conjunto vacío, nadie aparece —ni el proceso propio—.
+    #[test]
+    fn barrer_proc_no_incluye_lo_no_cortado() {
+        assert!(!barrer_proc(&red_vacia()).contains_key(&std::process::id()));
+    }
+
+    /// Un `exec` cortado marca el pid en el cortafuegos; el `exit` lo limpia. Es
+    /// el camino entero —resolver identidad, decidir, aplicar— contra un
+    /// cortafuegos de mentira.
+    #[test]
+    fn atender_un_exec_cortado_marca_el_pid_y_el_exit_lo_limpia() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx = ctx_con_falso(red);
+        let pid = std::process::id();
+
+        atender_evento(&ctx, Evento::Exec, pid);
+        assert_eq!(
+            ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(),
+            1,
+            "el exec de un ejecutable cortado marca el pid"
+        );
+
+        atender_evento(&ctx, Evento::Exit, pid);
+        assert_eq!(
+            ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(),
+            0,
+            "el exit limpia la marca"
+        );
+    }
+
+    /// Un `exec` de un ejecutable **no** cortado no marca nada.
+    #[test]
+    fn atender_un_exec_no_cortado_no_marca() {
+        let ctx = ctx_con_falso(red_vacia());
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 0);
+    }
+
+    /// `resincronizar` marca los vivos cortados: barre `/proc`, encuentra el
+    /// proceso propio y lo corta en el mapa del cortafuegos de mentira.
+    #[test]
+    fn resincronizar_marca_los_vivos_cortados() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx = ctx_con_falso(red);
+        resincronizar(&ctx);
+
+        let guard = ctx.enforcer.lock().unwrap();
+        let enf = guard.as_ref().unwrap();
+        assert!(
+            enf.marcados() >= 1,
+            "tenía que marcar al menos el proceso de la prueba"
+        );
+        assert!(
+            !enf.motor().insertados.is_empty(),
+            "y de verdad escribió el mapa del cortafuegos"
+        );
+    }
+
+    /// Sin cortafuegos cargado (enforcer en `None`) los adapters recorren su
+    /// camino pero no tocan nada: el daemon degrada sin romperse.
+    #[test]
+    fn sin_cortafuegos_los_adapters_no_rompen() {
+        let red = red_vacia();
+        fijar(&red, mi_uid(), &mi_exe(), true);
+        let ctx: Contexto = Contexto {
+            enforcer: Arc::new(Mutex::new(None)),
+            red,
+        };
+        atender_evento(&ctx, Evento::Exec, std::process::id());
+        atender_evento(&ctx, Evento::Exit, std::process::id());
+        resincronizar(&ctx);
     }
 }

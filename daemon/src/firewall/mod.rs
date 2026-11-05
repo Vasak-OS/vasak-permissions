@@ -422,58 +422,79 @@ impl MotorBpf for MotorAya {
     }
 }
 
+/// Un motor de mentira para ejercitar la lógica de `Firewall` y de `Enforcer`
+/// sin ser root ni cargar un programa BPF. Anota lo que se le pide y devuelve lo
+/// que se le programó.
+///
+/// Vive a nivel de módulo (no dentro de `mod tests`) para que el submódulo
+/// `enrolar` también pueda probar sus adapters con un cortafuegos de mentira.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MotorFalso {
+    /// Programas que se le pidió adjuntar, en orden.
+    pub(crate) adjuntados: Vec<String>,
+    /// Si está, el programa con ese nombre falla al adjuntar con ese mensaje.
+    pub(crate) falla_al_adjuntar: Option<(String, String)>,
+    /// Lo escrito: `(clave, valor)` de cada `insertar`.
+    pub(crate) insertados: Vec<(u64, u8)>,
+    /// Lo quitado: cada `clave` de `quitar`.
+    pub(crate) quitados: Vec<u64>,
+    /// Si está, `insertar` falla con este error.
+    pub(crate) falla_al_insertar: Option<MapError>,
+    /// Si está, `quitar` falla con este error.
+    pub(crate) falla_al_quitar: Option<MapError>,
+}
+
+#[cfg(test)]
+impl MotorBpf for MotorFalso {
+    fn adjuntar(&mut self, nombre: &str) -> Result<(), String> {
+        if let Some((cual, motivo)) = &self.falla_al_adjuntar {
+            if cual == nombre {
+                return Err(motivo.clone());
+            }
+        }
+        self.adjuntados.push(nombre.to_string());
+        Ok(())
+    }
+
+    fn insertar(&mut self, clave: u64, valor: u8) -> Result<(), MapError> {
+        if let Some(e) = self.falla_al_insertar.take() {
+            return Err(e);
+        }
+        self.insertados.push((clave, valor));
+        Ok(())
+    }
+
+    fn quitar(&mut self, clave: u64) -> Result<(), MapError> {
+        if let Some(e) = self.falla_al_quitar.take() {
+            return Err(e);
+        }
+        self.quitados.push(clave);
+        Ok(())
+    }
+}
+
+/// El cortafuegos de mentira listo para `Enforcer`, para las pruebas de los dos
+/// módulos.
+#[cfg(test)]
+pub(crate) fn enforcer_falso() -> Enforcer<MotorFalso> {
+    Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).expect("adjuntar con el falso"))
+}
+
+#[cfg(test)]
+impl<M: MotorBpf> Enforcer<M> {
+    /// El motor de mentira por dentro, para que las pruebas lean lo que se le
+    /// pidió marcar o quitar.
+    pub(crate) fn motor(&self) -> &M {
+        &self.firewall.motor
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::io::Error as IoError;
-
-    /// Un motor de mentira para ejercitar la lógica de `Firewall` sin ser root ni
-    /// cargar un programa BPF. Anota lo que se le pide y devuelve lo que se le
-    /// programó.
-    #[derive(Default)]
-    struct MotorFalso {
-        /// Programas que se le pidió adjuntar, en orden.
-        adjuntados: Vec<String>,
-        /// Si está, el programa con ese nombre falla al adjuntar con ese mensaje.
-        falla_al_adjuntar: Option<(String, String)>,
-        /// Lo escrito: `(clave, valor)` de cada `insertar`.
-        insertados: Vec<(u64, u8)>,
-        /// Lo quitado: cada `clave` de `quitar`.
-        quitados: Vec<u64>,
-        /// Si está, `insertar` falla con este error.
-        falla_al_insertar: Option<MapError>,
-        /// Si está, `quitar` falla con este error.
-        falla_al_quitar: Option<MapError>,
-    }
-
-    impl MotorBpf for MotorFalso {
-        fn adjuntar(&mut self, nombre: &str) -> Result<(), String> {
-            if let Some((cual, motivo)) = &self.falla_al_adjuntar {
-                if cual == nombre {
-                    return Err(motivo.clone());
-                }
-            }
-            self.adjuntados.push(nombre.to_string());
-            Ok(())
-        }
-
-        fn insertar(&mut self, clave: u64, valor: u8) -> Result<(), MapError> {
-            if let Some(e) = self.falla_al_insertar.take() {
-                return Err(e);
-            }
-            self.insertados.push((clave, valor));
-            Ok(())
-        }
-
-        fn quitar(&mut self, clave: u64) -> Result<(), MapError> {
-            if let Some(e) = self.falla_al_quitar.take() {
-                return Err(e);
-            }
-            self.quitados.push(clave);
-            Ok(())
-        }
-    }
 
     /// El `MapError` que aya 0.14 produce de verdad al quitar una clave ausente:
     /// `bpf_map_delete_elem` falla con `ENOENT`, que llega como `SyscallError`

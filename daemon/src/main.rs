@@ -473,6 +473,35 @@ impl PermissionService {
         Ok(())
     }
 
+    /// Guarda la decisión de red de un ejecutable y la lleva al cortafuegos.
+    /// Separado de `set_permission` para poder probar la lógica sin un bus (el
+    /// resto de `set_permission` necesita identificar al llamante y pasar por
+    /// polkit). `allowed` es la posición del switch: `true` deja pasar,
+    /// `false` corta —`cortado = !allowed`—.
+    async fn guardar_red(
+        &self,
+        uid: u32,
+        binary_path: String,
+        allowed: bool,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut policy = self.store.load(uid).map_err(FdoError::Failed)?;
+            // Descrito por la ruta que se administra, no por el llamante: la
+            // pantalla edita la entrada de otro programa.
+            let application = identity::describe_path(&binary_path);
+            policy.record(
+                &application,
+                "network",
+                Decision::from_answer(allowed),
+                false,
+            );
+            self.store.save(uid, &policy).map_err(FdoError::Failed)?;
+        }
+        self.sincronizar_red(uid, binary_path, !allowed).await;
+        Ok(())
+    }
+
     /// Lleva el cambio del switch de red al cortafuegos: actualiza el conjunto de
     /// red cortada (para los `exec` futuros) y resincroniza los pids vivos de ese
     /// ejecutable (los corta o los descorta según la política nueva), para que el
@@ -694,22 +723,12 @@ impl PermissionService {
 
         // La red la hace cumplir el cortafuegos eBPF, no un perfil de AppArmor:
         // se guarda la política y se resincroniza el mapa con los pids vivos de
-        // ese ejecutable. `cortado` = corte prendido = `Denied` = `!allowed`, y
-        // el barrido de `/proc` corre fuera del candado de escritura.
+        // ese ejecutable. Se suelta el candado de escritura antes, porque
+        // `guardar_red` lo vuelve a tomar. La lógica está aparte para poder
+        // probarla sin un bus.
         if resource_id == "network" {
-            policy.record(
-                &application,
-                &resource_id,
-                Decision::from_answer(allowed),
-                false,
-            );
-            self.store
-                .save(caller.uid, &policy)
-                .map_err(FdoError::Failed)?;
             drop(_guard);
-            self.sincronizar_red(caller.uid, binary_path, !allowed)
-                .await;
-            return Ok(());
+            return self.guardar_red(caller.uid, binary_path, allowed).await;
         }
 
         // Lo que estaba concedido antes, para poder volver atrás si el guardado
@@ -1830,5 +1849,63 @@ mod tests_reask {
             .reask(1000, "/usr/bin/vasak-connect", "no-existe", Instant::now())
             .await;
         assert!(matches!(resultado, Err(FdoError::InvalidArgs(_))));
+    }
+
+    /// `guardar_red` guarda la decisión, actualiza el conjunto de red cortada y
+    /// resincroniza sin romperse cuando el cortafuegos no está cargado (el
+    /// servicio de prueba lo tiene en `None`). `allowed=false` corta; `true`
+    /// descorta. Es el cuerpo de la rama de red de `SetPermission`, sin el bus.
+    #[tokio::test]
+    async fn guardar_red_guarda_la_decision_y_mantiene_el_conjunto() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/home/x/a.AppImage";
+
+        // Cortar: la decisión queda `Denied` y el binario entra al conjunto.
+        service
+            .guardar_red(1000, binary.into(), false)
+            .await
+            .expect("cortar la red tiene que guardar y sincronizar");
+        assert_eq!(
+            service
+                .store
+                .load(1000)
+                .unwrap()
+                .decision(binary, "network"),
+            Decision::Denied
+        );
+        assert!(firewall::enrolar::esta_cortado(&service.red, 1000, binary));
+
+        // Descortar: `Allowed` y fuera del conjunto.
+        service
+            .guardar_red(1000, binary.into(), true)
+            .await
+            .expect("descortar tiene que guardar y sincronizar");
+        assert_eq!(
+            service
+                .store
+                .load(1000)
+                .unwrap()
+                .decision(binary, "network"),
+            Decision::Allowed
+        );
+        assert!(!firewall::enrolar::esta_cortado(&service.red, 1000, binary));
+    }
+
+    /// Y la red cortada guardada se relee al armar el conjunto inicial: es el
+    /// recorrido entero del lado del almacén (guardar → red_cortada_inicial).
+    #[tokio::test]
+    async fn lo_cortado_se_relee_en_el_conjunto_inicial() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        service
+            .guardar_red(1000, "/home/x/b.AppImage".into(), false)
+            .await
+            .expect("cortar");
+
+        let red = service.store.red_cortada_inicial();
+        assert!(red
+            .get(&1000)
+            .is_some_and(|s| s.contains("/home/x/b.AppImage")));
     }
 }
