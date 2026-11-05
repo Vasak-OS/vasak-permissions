@@ -293,6 +293,15 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
 ///
 /// Verdadero para todo lo que no esté en la lista: ver arriba por qué.
 pub fn may_request(binary_path: &str, resource_id: &str) -> bool {
+    // El kill-switch de red queda fuera del acotado por alcance: no es una
+    // capacidad que la aplicación declare (como `account.*`/`store.*`), sino una
+    // decisión del usuario sobre cualquier ejecutable. Sin esta excepción, una
+    // app acotada —correo, calendario— no podría volver a habilitar su red una
+    // vez cortada, porque `SetPermission(allowed=true)` lo rechazaría por
+    // fuera de alcance.
+    if resource_id == "network" {
+        return true;
+    }
     match scope_of(binary_path) {
         Some(scope) => scope.contains(&resource_id),
         None => true,
@@ -431,6 +440,19 @@ pub enum Resource {
     Location,
     /// Reading the keyboard globally: keyloggers and global shortcuts alike.
     InputCapture,
+    /// El egreso de red por `connect()` de una aplicación.
+    ///
+    /// A diferencia del resto, no es una capacidad que la aplicación **pida**:
+    /// es un kill-switch que decide el usuario —«este ejecutable, para este
+    /// usuario, no habla a la red»— y que el cortafuegos eBPF por aplicación (M0
+    /// del #93) hace cumplir cortando los `connect()` de los pids de ese
+    /// ejecutable. Negarlo (`Decision::Denied`) prende el corte; permitirlo o no
+    /// decidirlo lo deja pasar (M0 es default-allow + opt-in por app).
+    ///
+    /// Por eso queda **fuera** del acotado por alcance de [`may_request`]: no se
+    /// declara por binario como `account.*`/`store.*`, se puede marcar sobre
+    /// cualquier ejecutable.
+    Network,
     /// Reading the files that prove who you are: SSH and GPG keys, the
     /// keyring's database, the tokens under `~/.config` that log you into
     /// things.
@@ -545,7 +567,10 @@ impl Resource {
     /// al archivo. El permiso es consentimiento y visibilidad, no una frontera,
     /// y decir otra cosa acá sería prometer lo que no se cumple.
     pub fn is_enforceable(&self) -> bool {
-        matches!(self, Resource::Account(_))
+        // La red sí: el cortafuegos eBPF por aplicación corta el `connect()` en
+        // el kernel, así que un rechazo se puede confiar (dentro del alcance de
+        // `connect()`; UDP no conectado queda para un hito posterior).
+        matches!(self, Resource::Account(_) | Resource::Network)
     }
 
     /// Whether deciding this changes anything at all.
@@ -572,6 +597,7 @@ impl Resource {
                 | Resource::Camera
                 | Resource::Microphone
                 | Resource::Credentials
+                | Resource::Network
         )
     }
 
@@ -611,6 +637,7 @@ impl Resource {
             Resource::Location => "location".into(),
             Resource::InputCapture => "input-capture".into(),
             Resource::Credentials => "credentials".into(),
+            Resource::Network => "network".into(),
             Resource::Account(capability) => format!("account.{}", capability.as_id()),
             Resource::Store(area) => format!("store.{}", area.as_id()),
         }
@@ -631,6 +658,7 @@ impl Resource {
             "location" => Some(Resource::Location),
             "input-capture" => Some(Resource::InputCapture),
             "credentials" => Some(Resource::Credentials),
+            "network" => Some(Resource::Network),
             _ => None,
         }
     }
@@ -838,6 +866,7 @@ mod tests {
             Resource::ScreenCapture,
             Resource::Location,
             Resource::InputCapture,
+            Resource::Network,
             Resource::Account(AccountResource::Email),
             Resource::Account(AccountResource::Calendar),
             Resource::Account(AccountResource::Contacts),
@@ -1000,6 +1029,21 @@ mod enforcement_tests {
         assert!(!Resource::InputCapture.decision_has_effect());
     }
 
+    /// La red se hace cumplir: el cortafuegos eBPF corta el `connect()` en el
+    /// kernel. Decidirla cambia algo contra la ruta de un ejecutable (hay un pid
+    /// que enrolar) y no contra una identidad del portal (no hay proceso).
+    #[test]
+    fn deciding_the_network_is_enforced_for_an_executable() {
+        assert!(Resource::Network.is_enforceable());
+        assert!(Resource::Network.decision_has_effect());
+        assert!(Resource::Network.decision_has_effect_for("/usr/bin/vasak-mail"));
+        let key = portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(
+            !Resource::Network.decision_has_effect_for(&key),
+            "el kill-switch de red es por pid, no por identidad del portal"
+        );
+    }
+
     #[test]
     fn only_online_accounts_are_enforced_today() {
         assert!(Resource::Account(AccountResource::Email).is_enforceable());
@@ -1092,6 +1136,27 @@ mod scope_tests {
             assert!(
                 !may_request(gestor, prohibido),
                 "el gestor de archivos no tenía que poder pedir '{prohibido}'"
+            );
+        }
+    }
+
+    /// El kill-switch de red queda fuera del acotado por alcance: cualquier
+    /// ejecutable se puede marcar, incluidas las apps acotadas. Sin esto, una
+    /// app con alcance declarado que no incluye `network` —todas— no podría
+    /// volver a habilitar su red una vez cortada, porque `SetPermission` con
+    /// `allowed=true` se rechaza por fuera de alcance.
+    #[test]
+    fn el_kill_switch_de_red_lo_puede_pedir_cualquier_ejecutable() {
+        for binary in [
+            "/usr/bin/vasak-mail",         // acotado a store.email
+            "/usr/bin/vasak-settings",     // acotado a nada
+            "/usr/bin/vasak-file-manager", // acotado a account.drive
+            "/home/x/navegador.AppImage",  // sin alcance
+            "",
+        ] {
+            assert!(
+                may_request(binary, "network"),
+                "{binary} tenía que poder marcarse con el kill-switch de red"
             );
         }
     }
