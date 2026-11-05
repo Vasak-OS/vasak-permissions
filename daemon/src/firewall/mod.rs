@@ -52,7 +52,9 @@
 //! motor de mentira. El adapter sobre aya queda fino y sin más lógica que las
 //! propias syscalls.
 
+pub mod conexiones;
 pub mod enrolar;
+pub mod mapa;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -117,6 +119,17 @@ impl Firewall<MotorAya> {
     /// el build estable no necesita nightly ni `bpf-linker` para producirlo.
     pub fn load() -> Result<Self, String> {
         Self::con_motor(MotorAya::cargar()?)
+    }
+
+    /// Toma el ring buffer `EVENTS` del cortafuegos para el mapa en vivo (M1).
+    ///
+    /// Se extrae del `Ebpf` (deja de estar en él), así que se llama **una vez**,
+    /// justo después de cargar, antes de envolver el cortafuegos en el `Enforcer`.
+    /// El mapa `BLOCKED` sigue en el `Ebpf` para las escrituras del enforcement;
+    /// el ring buffer es independiente y se lo lleva el lector. `None` si el objeto
+    /// no trae el ring (no debería: lo declara el mismo programa).
+    pub fn tomar_eventos(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        self.motor.tomar_eventos()
     }
 }
 
@@ -379,6 +392,15 @@ impl MotorAya {
                 name: MAPA_BLOQUEADOS.to_string(),
             })?;
         BpfHashMap::try_from(mapa)
+    }
+
+    /// Extrae el ring buffer `EVENTS` del objeto cargado. Sale del `Ebpf` con
+    /// `take_map`: el mapa en vivo lo lee un task aparte y no vuelve a tocar este
+    /// `Ebpf`, así que llevárselo evita compartir el `Ebpf` entre el enforcement y
+    /// el lector.
+    fn tomar_eventos(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let mapa = self.ebpf.take_map(crate::firewall::mapa::MAPA_EVENTOS)?;
+        aya::maps::RingBuf::try_from(mapa).ok()
     }
 }
 
