@@ -1489,6 +1489,28 @@ mod tests_interfaz {
         xml
     }
 
+    /// El mapa en vivo se llama como la pantalla cree, no recibe nada y contesta
+    /// un JSON (`s`); y la señal lleva **sólo el uid** (`u`): la señal va al bus
+    /// del sistema, y si llevara el destino lo vería cualquiera.
+    #[test]
+    fn el_mapa_en_vivo_expone_list_connections_y_una_senal_que_solo_lleva_el_uid() {
+        let xml = introspeccion();
+        let metodo = bloque_del_metodo(&xml, "ListConnections");
+        assert!(entradas(&metodo).is_empty(), "{metodo}");
+        assert_eq!(salidas(&metodo), vec!["s"], "{metodo}");
+
+        let inicio = xml
+            .find(r#"<signal name="ConnectionObserved">"#)
+            .unwrap_or_else(|| panic!("falta la señal ConnectionObserved en:\n{xml}"));
+        let senal = &xml[inicio..inicio + xml[inicio..].find("</signal>").unwrap()];
+        assert_eq!(
+            senal.matches("<arg").count(),
+            1,
+            "la señal lleva un solo argumento: {senal}"
+        );
+        assert!(senal.contains(r#"type="u""#), "{senal}");
+    }
+
     /// La interfaz exporta los nombres que el agente llama.
     ///
     /// El agente los manda como cadenas; acá los genera zbus a partir del

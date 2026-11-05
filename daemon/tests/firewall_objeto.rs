@@ -135,3 +135,19 @@ fn el_objeto_commiteado_corresponde_a_la_fuente() {
          Regeneralo con `firewall-ebpf/build.sh` y commiteá el resultado"
     );
 }
+
+/// El objeto commiteado trae el mapa `EVENTS` (ring buffer del mapa en vivo, M1)
+/// además de `BLOCKED` y los dos programas. Corre sin toolchain BPF, a diferencia
+/// de la correspondencia byte a byte: si alguien deja un objeto viejo (1664 B, sin
+/// ring) el daemon fallaría al tomar `EVENTS` en silencio y el mapa quedaría vacío.
+#[test]
+fn el_objeto_commiteado_trae_el_ring_buffer_de_eventos() {
+    let objeto = std::fs::read(objeto_commiteado()).expect("no se pudo leer el objeto");
+    let contiene = |n: &str| objeto.windows(n.len()).any(|w| w == n.as_bytes());
+    for nombre in ["EVENTS", "BLOCKED", "connect4", "connect6"] {
+        assert!(
+            contiene(nombre),
+            "el objeto BPF commiteado no trae «{nombre}»"
+        );
+    }
+}

@@ -319,6 +319,117 @@ mod tests {
         assert!(pos("proto: u8,") < pos("verdict: u8,"));
     }
 
+    /// Los desplazamientos que `parsear` supone salen de la **fuente** del struct
+    /// del BPF calculados como `repr(C)` (tamaño y alineación por campo), no de
+    /// una lista de textos: si alguien cambia un tipo (`port: u32`) o inserta un
+    /// campo, los offsets cambian y esto lo delata aunque la fuente siga
+    /// «teniendo» cada nombre.
+    #[test]
+    fn el_layout_repr_c_de_la_fuente_bpf_coincide_con_los_desplazamientos_del_parser() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        let cuerpo = fuente
+            .split("struct ConnectionEvent {")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("no se encontró struct ConnectionEvent");
+        let mut offset = 0usize;
+        let mut maxalign = 1usize;
+        let mut offsets = Vec::new();
+        for linea in cuerpo.lines().map(str::trim) {
+            if linea.starts_with("//") || linea.is_empty() {
+                continue;
+            }
+            let (nombre, tipo) = linea.trim_end_matches(',').split_once(": ").unwrap();
+            let (tam, alin) = match tipo {
+                "u8" => (1, 1),
+                "u16" => (2, 2),
+                "u32" => (4, 4),
+                "[u8; 16]" => (16, 1),
+                "[u8; 3]" => (3, 1),
+                otro => panic!("tipo sin tamaño conocido en el evento: {otro}"),
+            };
+            offset = offset.next_multiple_of(alin);
+            offsets.push((nombre.to_string(), offset));
+            offset += tam;
+            maxalign = maxalign.max(alin);
+        }
+        let total = offset.next_multiple_of(maxalign);
+        assert_eq!(
+            total, EVENTO_LEN,
+            "el struct del BPF ya no mide {EVENTO_LEN}"
+        );
+        let esperado = [
+            ("uid", 0),
+            ("tgid", 4),
+            ("dst", 8),
+            ("port", 24),
+            ("family", 26),
+            ("proto", 27),
+            ("verdict", 28),
+            ("_pad", 29),
+        ];
+        let obtenido: Vec<(&str, usize)> = offsets.iter().map(|(n, o)| (n.as_str(), *o)).collect();
+        assert_eq!(
+            obtenido, esperado,
+            "los offsets de parsear() quedaron viejos"
+        );
+    }
+
+    /// El programa BPF no cambia el veredicto al emitir: `emit` no devuelve nada
+    /// y el valor de retorno de `handle` sale sólo de `bloqueado`, que se calcula
+    /// **antes** de emitir. No se puede cargar BPF sin root, así que se ata la
+    /// forma de la fuente (la prueba root `firewall_integracion` ejerce el resto).
+    #[test]
+    fn la_emision_bpf_no_puede_alterar_el_veredicto() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        let firma = fuente
+            .split("fn emit(")
+            .nth(1)
+            .and_then(|r| r.split('{').next())
+            .expect("falta fn emit");
+        assert!(!firma.contains("->"), "emit no debe devolver nada: {firma}");
+        let handle = fuente.split("fn handle(").nth(1).expect("falta fn handle");
+        let pos_calculo = handle.find("let bloqueado").expect("falta el cálculo");
+        let pos_emit = handle.find("emit(ctx").expect("handle no emite");
+        let pos_ret = handle.find("if bloqueado").expect("falta el retorno");
+        assert!(pos_calculo < pos_emit && pos_emit < pos_ret);
+        assert!(
+            !handle[pos_emit..].contains("bloqueado ="),
+            "el veredicto no se puede reescribir tras emitir"
+        );
+    }
+
+    /// Para IPv4 sólo valen los primeros 4 bytes de `dst`: la basura del resto
+    /// no puede colarse en la IP. Y sólo `verdict == 1` es bloqueo.
+    #[test]
+    fn ipv4_ignora_el_resto_de_dst_y_solo_el_veredicto_uno_bloquea() {
+        let dst = [203, 0, 113, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+        let ev = parsear(&bytes_evento(5, 6, dst, 8080, 2, 6, 2)).unwrap();
+        assert_eq!(ev.ip, "203.0.113.7");
+        assert_eq!((ev.uid, ev.tgid, ev.port), (5, 6, 8080));
+        assert!(!ev.bloqueado);
+    }
+
+    /// Un uid y un tgid distintos en IPv6 salen de sus desplazamientos: no se
+    /// confunden entre sí ni con el puerto.
+    #[test]
+    fn ipv6_separa_uid_tgid_y_puerto() {
+        let ev = parsear(&bytes_evento(
+            0x0102_0304,
+            0x0a0b_0c0d,
+            [1; 16],
+            0xabcd,
+            10,
+            6,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(ev.uid, 0x0102_0304);
+        assert_eq!(ev.tgid, 0x0a0b_0c0d);
+        assert_eq!(ev.port, 0xabcd);
+        assert_eq!(ev.proto, "tcp");
+    }
+
     // ── El modelo acotado ─────────────────────────────────────────────────────
 
     fn evento(
@@ -475,5 +586,55 @@ mod tests {
             "se desalojó el visto hace más tiempo"
         );
         assert!(foto.iter().any(|c| c.ip == "203.0.113.1"), "entró el nuevo");
+    }
+    /// Repetir un destino que ya está **no desaloja** a nadie aunque el modelo
+    /// esté en el techo, y refresca su recencia: el desalojo siguiente se lleva
+    /// al que ahora es el más viejo, no al que se acaba de volver a ver.
+    #[test]
+    fn repetir_un_destino_en_el_techo_no_desaloja_y_lo_rejuvenece() {
+        let mut m = ModeloConexiones::nuevo();
+        for i in 0..MAXIMO {
+            let ip = format!("10.0.{}.{}", i / 256, i % 256);
+            m.observar("/a".into(), &evento(1000, &ip, 1, "tcp", false), i as u64);
+        }
+        // El más viejo (10.0.0.0, t=0) se vuelve a ver: sigue habiendo MAXIMO.
+        assert!(!m.observar(
+            "/a".into(),
+            &evento(1000, "10.0.0.0", 1, "tcp", false),
+            5000
+        ));
+        assert_eq!(m.instantanea(1000).len(), MAXIMO);
+        // Uno nuevo desaloja ahora a 10.0.0.1 (t=1), no a 10.0.0.0.
+        assert!(m.observar(
+            "/a".into(),
+            &evento(1000, "203.0.113.1", 1, "tcp", false),
+            6000
+        ));
+        let foto = m.instantanea(1000);
+        assert_eq!(foto.len(), MAXIMO);
+        assert!(
+            foto.iter().any(|c| c.ip == "10.0.0.0"),
+            "el rejuvenecido sobrevive"
+        );
+        assert!(
+            !foto.iter().any(|c| c.ip == "10.0.0.1"),
+            "se fue el más viejo real"
+        );
+    }
+
+    /// El techo es de todo el modelo, no por uid, y el filtro de uid sigue
+    /// valiendo tras desalojar: un uid nunca ve filas de otro.
+    #[test]
+    fn el_techo_es_global_y_el_aislamiento_por_uid_se_mantiene() {
+        let mut m = ModeloConexiones::nuevo();
+        for i in 0..(MAXIMO + 10) {
+            let uid = 1000 + (i % 2) as u32;
+            let ip = format!("10.1.{}.{}", i / 256, i % 256);
+            m.observar("/a".into(), &evento(uid, &ip, 1, "tcp", false), i as u64);
+        }
+        let (a, b) = (m.instantanea(1000), m.instantanea(1001));
+        assert_eq!(a.len() + b.len(), MAXIMO);
+        assert!(a.iter().all(|c| c.uid == 1000));
+        assert!(b.iter().all(|c| c.uid == 1001));
     }
 }
