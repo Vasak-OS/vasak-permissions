@@ -892,6 +892,21 @@ pub struct ObservedConnection {
     /// Cuándo se vio por última vez, en segundos desde el epoch. Sólo en
     /// memoria, para ordenar «lo más reciente primero» en la pantalla.
     pub last_seen_secs: u64,
+    /// El dominio que la aplicación resolvió para llegar a esta IP, cuando el
+    /// snoop de DNS (M2 del #93) lo vio pasar y todavía no venció su TTL.
+    ///
+    /// Es **observacional y aproximado**: sale de atribuir la última respuesta
+    /// DNS `(uid, IP) → dominio` que el daemon registró por NFLOG, nunca de
+    /// resolver nada (el daemon no abre sockets de red). `None` cuando no hay una
+    /// respuesta reciente que ate esta IP a un nombre —una IP literal sin lookup,
+    /// una app con su propio DoH/DoT, o una entrada ya vencida—: ahí la pantalla
+    /// muestra la IP. Si dos dominios comparten la IP se muestra el que coincidió,
+    /// límite inherente de atar por IP.
+    ///
+    /// Con `default` para que un cliente viejo y un servicio nuevo se sigan
+    /// entendiendo: el campo llega ausente y la fila se muestra por IP, como en M1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 #[cfg(test)]
@@ -912,10 +927,39 @@ mod tests {
             allowed: false,
             count: 3,
             last_seen_secs: 1_788_000_000,
+            domain: Some("example.com".into()),
         };
         let json = serde_json::to_string(&conn).expect("serializa");
         let vuelta: ObservedConnection = serde_json::from_str(&json).expect("deserializa");
         assert_eq!(conn, vuelta);
+    }
+
+    /// Un registro sin dominio no serializa el campo —queda compacto— y un JSON
+    /// de M1 (sin `domain`) sigue deserializando: el campo es opcional y con
+    /// `default`, así que el mapa en vivo no rompe a un cliente viejo ni al revés.
+    #[test]
+    fn el_dominio_es_opcional_y_compatible_con_m1() {
+        let sin_dominio = ObservedConnection {
+            uid: 1000,
+            binary_path: "/home/x/app".into(),
+            ip: "192.0.2.1".into(),
+            port: 443,
+            proto: "tcp".into(),
+            allowed: true,
+            count: 1,
+            last_seen_secs: 1,
+            domain: None,
+        };
+        let json = serde_json::to_string(&sin_dominio).expect("serializa");
+        assert!(
+            !json.contains("domain"),
+            "sin dominio no debe emitir el campo"
+        );
+
+        // Un JSON de M1, anterior a este campo, deserializa con `domain: None`.
+        let m1 = r#"{"uid":1000,"binary_path":"/home/x/app","ip":"192.0.2.1","port":443,"proto":"tcp","allowed":true,"count":1,"last_seen_secs":1}"#;
+        let vuelta: ObservedConnection = serde_json::from_str(m1).expect("deserializa M1");
+        assert_eq!(vuelta, sin_dominio);
     }
 
     /// These strings are written to disk. If a rename ever changes one, every

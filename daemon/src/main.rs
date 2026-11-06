@@ -1277,16 +1277,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo, Some(contexto)));
 
-    // El lector del mapa en vivo (M1): lee el ring buffer `EVENTS`, enriquece con
-    // el ejecutable del pid (la misma caché) y vuelca al modelo. Sólo si el
-    // cortafuegos cargó y entregó el ring; si no, el enforcement sigue y el mapa en
-    // vivo queda vacío. Degrada ruidoso sin tumbar el servicio.
+    // El lector del mapa en vivo (M1/M2): lee el ring buffer `EVENTS`, enriquece
+    // con el ejecutable del pid (la misma caché) y con el dominio del snoop de DNS,
+    // y vuelca al modelo. Sólo si el cortafuegos cargó y entregó el ring; si no, el
+    // enforcement sigue y el mapa en vivo queda vacío. Degrada ruidoso sin tumbar el
+    // servicio.
     if let Some(ring) = ring_eventos {
+        // El snoop de DNS (M2): un modelo `(uid, IP) → dominio` que puebla un hilo
+        // leyendo las respuestas DNS por NFLOG, y que el lector del ring consulta
+        // para enriquecer cada conexión. Observacional y sólo en memoria. El hilo
+        // degrada ruidoso si no puede instalar la regla (sin `nft`/CAP_NET_ADMIN):
+        // el mapa sigue andando, sin dominios. Se lanza junto al lector porque sin
+        // él nada consume el modelo del snoop.
+        let dns = firewall::dns::modelo_dns_nuevo();
+        let dns_para_el_hilo = Arc::clone(&dns);
+        std::thread::spawn(move || firewall::dns::escuchar(dns_para_el_hilo));
         tokio::spawn(firewall::mapa::escuchar(
             ring,
             connection.clone(),
             Arc::clone(&modelo),
             Arc::clone(&procesos),
+            dns,
         ));
     }
 

@@ -127,7 +127,20 @@ impl ModeloConexiones {
     ///
     /// `ahora` son segundos desde el epoch, inyectado para poder probar el orden y
     /// el desalojo sin depender del reloj.
-    pub fn observar(&mut self, binary_path: String, evento: &EventoConexion, ahora: u64) -> bool {
+    ///
+    /// `domain` es el nombre que el snoop de DNS (M2) ató a la IP de destino, o
+    /// `None` si no hay uno reciente —una IP literal, una app con su propio DoH, o
+    /// una respuesta ya vencida—: ahí la fila se muestra por IP. El dominio no es
+    /// parte de la identidad de la fila (la clave sigue siendo
+    /// `(uid, exe, ip, puerto, proto)`): es un dato que se enriquece y que puede
+    /// llegar a conocerse recién después de la primera conexión.
+    pub fn observar(
+        &mut self,
+        binary_path: String,
+        evento: &EventoConexion,
+        domain: Option<String>,
+        ahora: u64,
+    ) -> bool {
         let clave = (
             evento.uid,
             binary_path.clone(),
@@ -142,6 +155,13 @@ impl ModeloConexiones {
             // El veredicto puede cambiar entre dos conexiones al mismo destino —el
             // usuario cortó o restauró la red—: vale el último visto.
             registro.allowed = !evento.bloqueado;
+            // El dominio puede conocerse recién ahora (la respuesta DNS llegó
+            // después de la primera conexión), así que se completa si apareció; una
+            // respuesta nueva que lo cambie también gana. No se borra con `None`:
+            // una entrada vencida no debe tapar el nombre que ya se mostraba.
+            if domain.is_some() {
+                registro.domain = domain;
+            }
             return false;
         }
 
@@ -160,6 +180,7 @@ impl ModeloConexiones {
                 allowed: !evento.bloqueado,
                 count: 1,
                 last_seen_secs: ahora,
+                domain,
             },
         );
         true
@@ -457,11 +478,11 @@ mod tests {
         let ev = evento(1000, "192.0.2.1", 443, "tcp", false);
 
         assert!(
-            m.observar("/home/x/app".into(), &ev, 10),
+            m.observar("/home/x/app".into(), &ev, None, 10),
             "la primera es nueva"
         );
         assert!(
-            !m.observar("/home/x/app".into(), &ev, 11),
+            !m.observar("/home/x/app".into(), &ev, None, 11),
             "la segunda al mismo destino no es nueva"
         );
 
@@ -481,21 +502,25 @@ mod tests {
         assert!(m.observar(
             "/home/x/app".into(),
             &evento(1000, "192.0.2.1", 443, "tcp", false),
+            None,
             1
         ));
         assert!(m.observar(
             "/home/x/app".into(),
             &evento(1000, "192.0.2.1", 80, "tcp", false),
+            None,
             1
         ));
         assert!(m.observar(
             "/home/x/app".into(),
             &evento(1000, "192.0.2.1", 443, "udp", false),
+            None,
             1
         ));
         assert!(m.observar(
             "/home/x/app".into(),
             &evento(1000, "198.51.100.9", 443, "tcp", false),
+            None,
             1
         ));
         assert_eq!(m.instantanea(1000).len(), 4);
@@ -509,16 +534,19 @@ mod tests {
         m.observar(
             "/home/a/app".into(),
             &evento(1000, "192.0.2.1", 1, "tcp", false),
+            None,
             5,
         );
         m.observar(
             "/home/a/app".into(),
             &evento(1000, "192.0.2.2", 2, "tcp", false),
+            None,
             9,
         );
         m.observar(
             "/home/b/app".into(),
             &evento(1001, "203.0.113.5", 3, "tcp", false),
+            None,
             7,
         );
 
@@ -543,17 +571,64 @@ mod tests {
         m.observar(
             "/home/x/app".into(),
             &evento(1000, "192.0.2.1", 443, "tcp", false),
+            None,
             1,
         );
         assert!(m.instantanea(1000)[0].allowed);
         m.observar(
             "/home/x/app".into(),
             &evento(1000, "192.0.2.1", 443, "tcp", true),
+            None,
             2,
         );
         assert!(
             !m.instantanea(1000)[0].allowed,
             "el corte posterior se refleja"
+        );
+    }
+
+    /// El dominio del snoop de DNS se guarda en la fila al observar, y se muestra
+    /// junto a la IP. La clave de la fila no cambia por el dominio.
+    #[test]
+    fn el_dominio_se_guarda_en_la_fila() {
+        let mut m = ModeloConexiones::nuevo();
+        m.observar(
+            "/home/x/app".into(),
+            &evento(1000, "93.184.216.34", 443, "tcp", false),
+            Some("example.com".into()),
+            1,
+        );
+        let foto = m.instantanea(1000);
+        assert_eq!(foto.len(), 1);
+        assert_eq!(foto[0].domain.as_deref(), Some("example.com"));
+        assert_eq!(
+            foto[0].ip, "93.184.216.34",
+            "la IP se conserva junto al dominio"
+        );
+    }
+
+    /// El dominio puede conocerse recién tras la primera conexión (la respuesta
+    /// DNS llegó después): la repetición lo completa, y un `None` posterior —una
+    /// entrada vencida— no borra el nombre ya mostrado.
+    #[test]
+    fn el_dominio_se_completa_despues_y_no_se_borra_con_none() {
+        let mut m = ModeloConexiones::nuevo();
+        let ev = evento(1000, "93.184.216.34", 443, "tcp", false);
+        // Primera conexión sin dominio conocido todavía.
+        m.observar("/home/x/app".into(), &ev, None, 1);
+        assert_eq!(m.instantanea(1000)[0].domain, None);
+        // La respuesta DNS se vio después: la próxima conexión al mismo destino
+        // completa el dominio.
+        m.observar("/home/x/app".into(), &ev, Some("example.com".into()), 2);
+        assert_eq!(
+            m.instantanea(1000)[0].domain.as_deref(),
+            Some("example.com")
+        );
+        // Una conexión posterior sin dominio (la entrada DNS venció) no lo borra.
+        m.observar("/home/x/app".into(), &ev, None, 3);
+        assert_eq!(
+            m.instantanea(1000)[0].domain.as_deref(),
+            Some("example.com")
         );
     }
 
@@ -568,6 +643,7 @@ mod tests {
             m.observar(
                 "/home/x/app".into(),
                 &evento(1000, &ip, 443, "tcp", false),
+                None,
                 i as u64,
             );
         }
@@ -577,6 +653,7 @@ mod tests {
         m.observar(
             "/home/x/app".into(),
             &evento(1000, "203.0.113.1", 443, "tcp", false),
+            None,
             999_999,
         );
         let foto = m.instantanea(1000);
@@ -595,12 +672,18 @@ mod tests {
         let mut m = ModeloConexiones::nuevo();
         for i in 0..MAXIMO {
             let ip = format!("10.0.{}.{}", i / 256, i % 256);
-            m.observar("/a".into(), &evento(1000, &ip, 1, "tcp", false), i as u64);
+            m.observar(
+                "/a".into(),
+                &evento(1000, &ip, 1, "tcp", false),
+                None,
+                i as u64,
+            );
         }
         // El más viejo (10.0.0.0, t=0) se vuelve a ver: sigue habiendo MAXIMO.
         assert!(!m.observar(
             "/a".into(),
             &evento(1000, "10.0.0.0", 1, "tcp", false),
+            None,
             5000
         ));
         assert_eq!(m.instantanea(1000).len(), MAXIMO);
@@ -608,6 +691,7 @@ mod tests {
         assert!(m.observar(
             "/a".into(),
             &evento(1000, "203.0.113.1", 1, "tcp", false),
+            None,
             6000
         ));
         let foto = m.instantanea(1000);
@@ -630,7 +714,12 @@ mod tests {
         for i in 0..(MAXIMO + 10) {
             let uid = 1000 + (i % 2) as u32;
             let ip = format!("10.1.{}.{}", i / 256, i % 256);
-            m.observar("/a".into(), &evento(uid, &ip, 1, "tcp", false), i as u64);
+            m.observar(
+                "/a".into(),
+                &evento(uid, &ip, 1, "tcp", false),
+                None,
+                i as u64,
+            );
         }
         let (a, b) = (m.instantanea(1000), m.instantanea(1001));
         assert_eq!(a.len() + b.len(), MAXIMO);
