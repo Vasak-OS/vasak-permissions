@@ -284,6 +284,29 @@ mod tests {
         assert_eq!(modelo.lock().unwrap().instantanea(mi_uid())[0].domain, None);
     }
 
+    /// Una conexión cuya IP no casa con ninguna entrada del snoop (aunque el uid
+    /// tenga otras) queda por IP, sin dominio.
+    #[test]
+    fn una_ip_sin_entrada_del_snoop_queda_por_ip() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let respuesta = parsear_respuesta(&respuesta_dns(&["otro", "com"], [192, 0, 2, 99]))
+            .expect("respuesta válida");
+        dns.lock().unwrap().observar(mi_uid(), &respuesta, 100);
+
+        procesar_evento(
+            &bytes_evento(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            150,
+        );
+        let foto = modelo.lock().unwrap().instantanea(mi_uid());
+        assert_eq!(foto[0].ip, "192.0.2.1");
+        assert_eq!(foto[0].domain, None);
+    }
+
     /// Arma una respuesta DNS con una A de `ip` para `dominio`, para sembrar el
     /// snoop en las pruebas del lector.
     fn respuesta_dns(dominio: &[&str], ip: [u8; 4]) -> Vec<u8> {

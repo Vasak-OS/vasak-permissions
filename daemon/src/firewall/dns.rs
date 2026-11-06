@@ -899,6 +899,170 @@ mod tests {
         assert_eq!(m.dominio_de(1, "10.1.0.0", 1), Some("larga.com".into()));
     }
 
+    // ── Pruebas de QA: bordes del parser, techo y garantías de solo-observar ───
+
+    /// Un truncado en CUALQUIER punto de una respuesta con un único registro la
+    /// invalida entera: no se devuelve un registro a medias.
+    #[test]
+    fn todo_truncado_de_una_respuesta_valida_da_none() {
+        let completo = respuesta(&["example", "com"], &[(TIPO_A, 300, vec![1, 2, 3, 4])]);
+        for corte in 0..completo.len() {
+            assert_eq!(parsear_respuesta(&completo[..corte]), None, "corte {corte}");
+        }
+        assert!(parsear_respuesta(&completo).is_some());
+    }
+
+    /// Dos punteros que se apuntan entre sí (A → B → A) en el NAME de un registro
+    /// no cuelgan ni rompen: el parser termina y descarta el mensaje.
+    #[test]
+    fn punteros_de_compresion_en_ciclo_de_dos_no_cuelgan() {
+        let mut m = respuesta(&["example", "com"], &[(TIPO_A, 300, vec![1, 2, 3, 4])]);
+        // El NAME del registro empieza tras el QNAME: 12 + (1+7+1+3+1) + 4 = 29.
+        let ini = 29;
+        assert_eq!(&m[ini..ini + 2], &[0xC0, ENCABEZADO_DNS as u8]);
+        // Se agregan al final dos punteros cruzados y el NAME apunta al primero.
+        let a = m.len();
+        m.extend_from_slice(&[0xC0, (a + 2) as u8]);
+        m.extend_from_slice(&[0xC0, a as u8]);
+        m[ini + 1] = a as u8;
+        assert_eq!(parsear_respuesta(&m), None);
+    }
+
+    /// Un registro A con RDLENGTH distinto de 4 (o AAAA distinto de 16) no se
+    /// interpreta como dirección: no se inventa una IP de bytes ajenos.
+    #[test]
+    fn un_rdlength_inconsistente_con_el_tipo_no_da_ip() {
+        let a_corta = respuesta(&["x", "com"], &[(TIPO_A, 300, vec![1, 2, 3])]);
+        assert_eq!(parsear_respuesta(&a_corta), None);
+        let a_larga = respuesta(&["x", "com"], &[(TIPO_A, 300, vec![1, 2, 3, 4, 5])]);
+        assert_eq!(parsear_respuesta(&a_larga), None);
+        let aaaa_corta = respuesta(&["x", "com"], &[(TIPO_AAAA, 300, vec![0; 4])]);
+        assert_eq!(parsear_respuesta(&aaaa_corta), None);
+    }
+
+    /// El modelo nunca pasa el techo, por muchas IPs distintas que se observen.
+    #[test]
+    fn el_modelo_nunca_pasa_el_techo() {
+        let mut m = ModeloDns::nuevo();
+        for i in 0..(MAXIMO + 50) {
+            let ip = format!("10.2.{}.{}", i / 256, i % 256);
+            m.observar(1, &resp("a.com", &ip, 300), i as u64);
+        }
+        assert_eq!(m.registros.len(), MAXIMO);
+    }
+
+    /// Refrescar una clave que ya está, con el modelo lleno, NO desaloja a otra:
+    /// solo una clave nueva hace lugar.
+    #[test]
+    fn refrescar_una_clave_existente_con_el_modelo_lleno_no_desaloja() {
+        let mut m = ModeloDns::nuevo();
+        for i in 0..MAXIMO {
+            let ip = format!("10.3.{}.{}", i / 256, i % 256);
+            m.observar(1, &resp("a.com", &ip, 300), 0);
+        }
+        m.observar(1, &resp("b.com", "10.3.0.0", 300), 10);
+        assert_eq!(m.registros.len(), MAXIMO);
+        assert_eq!(m.dominio_de(1, "10.3.0.0", 11), Some("b.com".into()));
+        assert_eq!(m.dominio_de(1, "10.3.0.1", 11), Some("a.com".into()));
+    }
+
+    /// El techo es por modelo, no por uid, pero el desalojo respeta la
+    /// atribución: la entrada que cae no hace aparecer el dominio en otro uid.
+    #[test]
+    fn el_desalojo_no_cambia_a_quien_pertenece_lo_que_queda() {
+        let mut m = ModeloDns::nuevo();
+        m.observar(7, &resp("siete.com", "192.0.2.7", 0), 0); // vence primero
+        for i in 0..MAXIMO {
+            let ip = format!("10.4.{}.{}", i / 256, i % 256);
+            m.observar(8, &resp("ocho.com", &ip, 3600), 0);
+        }
+        assert_eq!(m.dominio_de(7, "192.0.2.7", 1), None);
+        assert_eq!(m.dominio_de(8, "192.0.2.7", 1), None);
+        assert_eq!(m.dominio_de(8, "10.4.0.0", 1), Some("ocho.com".into()));
+    }
+
+    /// IPv4 con IHL menor a 5 (encabezado inválido) no se destripa.
+    #[test]
+    fn un_ihl_invalido_no_se_destripa() {
+        let mut p = ipv4_udp(&[0u8; 12]);
+        p[0] = 0x44; // IHL 4 → 16 bytes, menor al mínimo de 20
+        assert_eq!(dns_de_l3(&p), None);
+    }
+
+    /// Un atributo con `nla_len` que miente (menor a 4 o más allá del mensaje)
+    /// corta la lectura sin leer de más ni romper.
+    #[test]
+    fn un_atributo_nflog_con_largo_mentiroso_no_rompe() {
+        for mentira in [0u16, 3, 9999] {
+            let mut m = vec![0u8; 16 + 4];
+            m.extend_from_slice(&mentira.to_ne_bytes());
+            m.extend_from_slice(&NFULA_PAYLOAD.to_ne_bytes());
+            m.extend_from_slice(&[0u8; 8]);
+            assert_eq!(dns_de_nflog(&m), None, "nla_len {mentira}");
+        }
+    }
+
+    /// Una tanda con dos mensajes de uids distintos atribuye cada IP a su uid; uno
+    /// con otro tipo de mensaje o con largo mentiroso se ignora sin romper.
+    #[test]
+    fn una_tanda_atribuye_por_uid_e_ignora_lo_ajeno() {
+        let modelo = modelo_dns_nuevo();
+        let d1 = respuesta(&["uno", "com"], &[(TIPO_A, 300, vec![192, 0, 2, 1])]);
+        let d2 = respuesta(&["dos", "com"], &[(TIPO_A, 300, vec![192, 0, 2, 1])]);
+        let d3 = respuesta(&["tres", "com"], &[(TIPO_A, 300, vec![192, 0, 2, 3])]);
+        let mut ajeno = nflog(Some(1000), &ipv4_udp(&d3));
+        ajeno[4..6].copy_from_slice(&((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG).to_ne_bytes());
+
+        let mut tanda = nflog(Some(1000), &ipv4_udp(&d1));
+        tanda.extend(nflog(Some(1001), &ipv4_udp(&d2)));
+        tanda.extend(ajeno);
+        // Un encabezado final con largo que se sale del buffer: corta sin romper.
+        let mut roto = vec![0u8; 16];
+        roto[0..4].copy_from_slice(&9999u32.to_ne_bytes());
+        tanda.extend(roto);
+        procesar_tanda(&tanda, &modelo, 100);
+
+        let m = modelo.lock().unwrap();
+        assert_eq!(m.dominio_de(1000, "192.0.2.1", 101), Some("uno.com".into()));
+        assert_eq!(m.dominio_de(1001, "192.0.2.1", 101), Some("dos.com".into()));
+        assert_eq!(
+            m.dominio_de(1000, "192.0.2.3", 101),
+            None,
+            "tipo ajeno ignorado"
+        );
+    }
+
+    /// Solo observa: el código de producción del snoop no abre ningún socket
+    /// AF_INET/AF_INET6 (ni TCP ni UDP de std) y su único `socket()` es netlink.
+    /// Se verifica sobre la fuente: ejercer NFLOG real pide root.
+    #[test]
+    fn el_snoop_no_abre_sockets_inet() {
+        let fuente = include_str!("dns.rs");
+        let (produccion, _) = fuente
+            .split_once("#[cfg(test)]")
+            .expect("hay módulo de pruebas");
+        // Sin comentarios: el módulo explica en prosa que no abre AF_INET.
+        let produccion: String = produccion
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for prohibido in [
+            "AF_INET",
+            "UdpSocket",
+            "TcpStream",
+            "TcpListener",
+            "SOCK_DGRAM",
+        ] {
+            assert!(
+                !produccion.contains(prohibido),
+                "el snoop no debe usar {prohibido}"
+            );
+        }
+        assert_eq!(produccion.matches("libc::socket(").count(), 1);
+        assert!(produccion.contains("libc::AF_NETLINK"));
+    }
+
     // ── El destripado NFLOG → IP/UDP → DNS ────────────────────────────────────
 
     /// Envuelve `dns` en un datagrama UDP sobre IPv4 (sport 53), como lo trae
