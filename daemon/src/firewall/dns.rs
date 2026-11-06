@@ -278,6 +278,368 @@ pub fn modelo_dns_nuevo() -> ModeloDnsCompartido {
     std::sync::Arc::new(std::sync::Mutex::new(ModeloDns::nuevo()))
 }
 
+// ── El lector NFLOG: el adapter privilegiado ──────────────────────────────────
+//
+// Instala la regla nftables que registra el tráfico DNS a un grupo NFLOG y lee
+// los mensajes por `AF_NETLINK`. Como `escuchar` en `procesos.rs`, es I/O
+// privilegiado que el CI no corre: pide `CAP_NET_ADMIN` y un `nft` presente. Lo
+// probable que **sí** se cubre es el destripado del mensaje —[`dns_de_nflog`],
+// [`dns_de_l3`]— y el texto de la regla, que es donde está la aritmética de
+// desplazamientos propensa a error; el socket en sí lo ejercita el uso real.
+
+/// La familia del socket netlink de netfilter, por la que llega NFLOG.
+const NETLINK_NETFILTER: i32 = 12;
+/// El subsistema nfnetlink del log (nfnetlink_log) y sus dos tipos de mensaje.
+const NFNL_SUBSYS_ULOG: u16 = 5;
+const NFULNL_MSG_PACKET: u16 = 0;
+const NFULNL_MSG_CONFIG: u16 = 1;
+/// Los comandos y modos de configuración que se le mandan al grupo.
+const NFULNL_CFG_CMD_BIND: u8 = 1;
+const NFULNL_COPY_PACKET: u8 = 2;
+/// Los atributos de la configuración y del paquete que leemos.
+const NFULA_CFG_CMD: u16 = 1;
+const NFULA_CFG_MODE: u16 = 2;
+const NFULA_PAYLOAD: u16 = 9;
+const NFULA_UID: u16 = 11;
+const NLM_F_REQUEST: u16 = 1;
+const IPPROTO_UDP: u8 = 17;
+
+/// El grupo NFLOG al que la regla manda el tráfico DNS. Un número propio y alto
+/// para no pisar a otro usuario de NFLOG del sistema.
+const GRUPO_NFLOG: u16 = 0x5653;
+
+/// El nombre de la tabla nftables que el daemon instala y destruye.
+const TABLA_NFT: &str = "vasak_dns_snoop";
+
+/// El puerto del DNS.
+const PUERTO_DNS: u16 = 53;
+
+/// La regla nftables que registra las **respuestas** DNS al grupo NFLOG.
+///
+/// Sólo **registra** (`log group`), nunca descarta: el veredicto de M0/M1 queda
+/// idéntico, esto no bloquea ni permite nada. Engancha en `input` y filtra
+/// `sport 53` para quedarse con las respuestas que llegan a un socket local —con
+/// systemd-resolved, el stub en `127.0.0.53` hace que la respuesta a la app sea
+/// tráfico de loopback que también entra por `input`—. NFLOG adjunta el uid del
+/// socket que la recibe (la app), que es por donde se atribuye.
+///
+/// `destroy` antes de `table` la vuelve idempotente al reiniciar el daemon (no
+/// falla si la tabla no existe, nft ≥ 1.0.2).
+///
+/// shortcut: sólo UDP; el DNS sobre TCP no se destripa (ver [`dns_de_l3`]). Subir
+/// a TCP cuando aparezca un resolvedor que lo use por defecto.
+fn regla_nft(grupo: u16) -> String {
+    format!(
+        "destroy table inet {TABLA_NFT}\n\
+         table inet {TABLA_NFT} {{\n\
+         \tchain input {{\n\
+         \t\ttype filter hook input priority 0; policy accept;\n\
+         \t\tudp sport {PUERTO_DNS} log group {grupo}\n\
+         \t}}\n\
+         }}\n"
+    )
+}
+
+/// Instala la regla con `nft -f -`. Degrada ruidoso: si `nft` falta o la regla no
+/// aplica (sin `CAP_NET_ADMIN`, kernel sin nftables), se registra y se devuelve
+/// `false` —el mapa en vivo sigue andando, sin dominios—.
+fn instalar_regla() -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut hijo = match Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(hijo) => hijo,
+        Err(e) => {
+            tracing::warn!(
+                "No se pudo ejecutar «nft» para el snoop de DNS ({e}); \
+                 el mapa en vivo no va a mostrar dominios"
+            );
+            return false;
+        }
+    };
+
+    if let Some(mut stdin) = hijo.stdin.take() {
+        if let Err(e) = stdin.write_all(regla_nft(GRUPO_NFLOG).as_bytes()) {
+            tracing::warn!("No se pudo escribir la regla de DNS a «nft» ({e})");
+            return false;
+        }
+    }
+
+    match hijo.wait_with_output() {
+        Ok(salida) if salida.status.success() => true,
+        Ok(salida) => {
+            tracing::warn!(
+                "«nft» rechazó la regla del snoop de DNS ({}); el mapa en vivo \
+                 no va a mostrar dominios: {}",
+                salida.status,
+                String::from_utf8_lossy(&salida.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("«nft» no terminó al instalar la regla de DNS ({e})");
+            false
+        }
+    }
+}
+
+/// Saca el uid del socket y los bytes del DNS de un mensaje NFLOG.
+///
+/// Un mensaje NFLOG es `nlmsghdr`(16) + `nfgenmsg`(4) + una tira de atributos TLV
+/// (`nlattr`: `len`+`tipo` de 2 bytes cada uno, valor, alineado a 4). Interesan
+/// dos: `NFULA_UID` (el uid del socket local, en orden de red) y `NFULA_PAYLOAD`
+/// (el paquete desde la capa de red). Separado del socket para poder probar esta
+/// aritmética sin privilegios, igual que `evento_de` en `procesos.rs`.
+///
+/// `None` si falta el payload o si está malformado; nunca lee de más.
+fn dns_de_nflog(msg: &[u8]) -> Option<(Option<u32>, &[u8])> {
+    const CABECERA: usize = 16 + 4; // nlmsghdr + nfgenmsg
+    if msg.len() < CABECERA {
+        return None;
+    }
+    let mut uid = None;
+    let mut payload: Option<&[u8]> = None;
+    let mut pos = CABECERA;
+    while pos + 4 <= msg.len() {
+        let nla_len = u16::from_ne_bytes([msg[pos], msg[pos + 1]]) as usize;
+        // Los dos bits altos del tipo son banderas (nested / byteorder); se enmascaran.
+        let nla_type = u16::from_ne_bytes([msg[pos + 2], msg[pos + 3]]) & 0x3FFF;
+        if nla_len < 4 || pos + nla_len > msg.len() {
+            break;
+        }
+        let valor = &msg[pos + 4..pos + nla_len];
+        match nla_type {
+            NFULA_UID if valor.len() >= 4 => {
+                uid = Some(u32::from_be_bytes([valor[0], valor[1], valor[2], valor[3]]));
+            }
+            NFULA_PAYLOAD => payload = Some(valor),
+            _ => {}
+        }
+        pos = (pos + nla_len).next_multiple_of(4);
+    }
+    let dns = dns_de_l3(payload?)?;
+    Some((uid, dns))
+}
+
+/// Destripa un paquete desde la capa de red (lo que trae `NFULA_PAYLOAD`) hasta
+/// los bytes del DNS: salta el encabezado IP y el UDP.
+///
+/// `None` si no es IPv4/IPv6 sobre UDP o si está truncado. shortcut: sólo UDP, y
+/// en IPv6 sin encabezados de extensión —DNS casi siempre es UDP sin ellos—; un
+/// resolvedor que use TCP por defecto pediría manejar el prefijo de largo de 2
+/// bytes y el encabezado TCP.
+fn dns_de_l3(l3: &[u8]) -> Option<&[u8]> {
+    let version = l3.first()? >> 4;
+    let (proto, l4_ini) = match version {
+        4 => {
+            let ihl = (l3[0] & 0x0F) as usize * 4;
+            if ihl < 20 {
+                return None;
+            }
+            (*l3.get(9)?, ihl)
+        }
+        6 => (*l3.get(6)?, 40usize),
+        _ => return None,
+    };
+    if proto != IPPROTO_UDP {
+        return None;
+    }
+    let udp = l3.get(l4_ini..)?;
+    if udp.len() < 8 {
+        return None;
+    }
+    // Tras los 8 bytes del encabezado UDP viene el DNS. El puerto no se re-chequea:
+    // la regla ya filtró el 53, y `parsear_respuesta` descarta lo que no sea una
+    // respuesta con A/AAAA (una consulta trae ANCOUNT=0).
+    l3.get(l4_ini + 8..)
+}
+
+/// Un mensaje de configuración del grupo NFLOG: `nlmsghdr` + `nfgenmsg` + un
+/// atributo. El `res_id` del `nfgenmsg` lleva el grupo en orden de red.
+fn mensaje_config(grupo: u16, tipo_attr: u16, valor: &[u8]) -> Vec<u8> {
+    let mut m = Vec::new();
+    // nlmsghdr; el largo se rellena al final.
+    m.extend_from_slice(&0u32.to_ne_bytes());
+    m.extend_from_slice(&((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG).to_ne_bytes());
+    m.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes()); // seq
+    m.extend_from_slice(&0u32.to_ne_bytes()); // pid
+                                              // nfgenmsg
+    m.push(0); // nfgen_family = AF_UNSPEC
+    m.push(0); // version
+    m.extend_from_slice(&grupo.to_be_bytes()); // res_id (orden de red)
+                                               // nlattr
+    let nla_len = 4 + valor.len();
+    m.extend_from_slice(&(nla_len as u16).to_ne_bytes());
+    m.extend_from_slice(&tipo_attr.to_ne_bytes());
+    m.extend_from_slice(valor);
+    while !m.len().is_multiple_of(4) {
+        m.push(0);
+    }
+    let len = m.len() as u32;
+    m[0..4].copy_from_slice(&len.to_ne_bytes());
+    m
+}
+
+/// Instala la regla y lee las respuestas DNS por NFLOG para siempre, poblando el
+/// modelo. Se lanza en un hilo propio (bloqueante, como el conector de
+/// `procesos.rs`). Degrada ruidoso: si la regla no se instala o el socket no abre,
+/// se registra y se sale —el mapa en vivo sigue, sin dominios—.
+pub fn escuchar(modelo: ModeloDnsCompartido) {
+    if !instalar_regla() {
+        return;
+    }
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            NETLINK_NETFILTER,
+        )
+    };
+    if fd < 0 {
+        tracing::warn!(
+            "No se pudo abrir el socket NFLOG para el snoop de DNS ({}); \
+             el mapa en vivo no va a mostrar dominios",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let mut direccion: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    direccion.nl_family = libc::AF_NETLINK as u16;
+    let enlazado = unsafe {
+        libc::bind(
+            fd,
+            &direccion as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
+    };
+    if enlazado < 0 {
+        tracing::warn!(
+            "No se pudo enlazar el socket NFLOG ({})",
+            std::io::Error::last_os_error()
+        );
+        unsafe { libc::close(fd) };
+        return;
+    }
+
+    // Ligar el grupo y pedir que copie el paquete entero.
+    let bind = mensaje_config(GRUPO_NFLOG, NFULA_CFG_CMD, &[NFULNL_CFG_CMD_BIND]);
+    let mut modo_val = Vec::with_capacity(6);
+    modo_val.extend_from_slice(&0xffff_u32.to_be_bytes()); // copy_range
+    modo_val.push(NFULNL_COPY_PACKET); // copy_mode
+    modo_val.push(0); // _pad
+    let modo = mensaje_config(GRUPO_NFLOG, NFULA_CFG_MODE, &modo_val);
+    for mensaje in [bind, modo] {
+        let enviado = unsafe {
+            libc::send(
+                fd,
+                mensaje.as_ptr() as *const libc::c_void,
+                mensaje.len(),
+                0,
+            )
+        };
+        if enviado < 0 {
+            tracing::warn!(
+                "No se pudo configurar el grupo NFLOG ({})",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::close(fd) };
+            return;
+        }
+    }
+
+    tracing::info!("Snoop de DNS activo (NFLOG grupo {GRUPO_NFLOG})");
+    // Los paquetes NFLOG pueden traer el datagrama entero (copy_range 0xffff).
+    let mut buffer = vec![0u8; 65536];
+    loop {
+        // `recvmsg` para quedarse con el remitente: igual que el conector, un
+        // socket netlink también recibe de otros procesos del usuario, así que se
+        // descarta todo lo que no venga del kernel (`nl_pid == 0`).
+        let mut remitente: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buffer.len(),
+        };
+        let mut cabecera: libc::msghdr = unsafe { std::mem::zeroed() };
+        cabecera.msg_name = &mut remitente as *mut _ as *mut libc::c_void;
+        cabecera.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+        cabecera.msg_iov = &mut iov;
+        cabecera.msg_iovlen = 1;
+
+        let leidos = unsafe { libc::recvmsg(fd, &mut cabecera, 0) };
+        if leidos > 0 {
+            if cabecera.msg_flags & libc::MSG_TRUNC != 0 {
+                continue; // truncado: no se procesa a medias
+            }
+            if remitente.nl_pid != 0 {
+                continue; // no vino del kernel
+            }
+            procesar_tanda(&buffer[..leidos as usize], &modelo, ahora_epoch());
+            continue;
+        }
+        if leidos < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        tracing::warn!("El socket NFLOG se cerró; el mapa en vivo deja de mostrar dominios");
+        unsafe { libc::close(fd) };
+        return;
+    }
+}
+
+/// Recorre los mensajes netlink de una lectura y vuelca al modelo las respuestas
+/// DNS de los que son paquetes NFLOG. Separado para no repetir la aritmética de
+/// `nlmsg_len` y para poder probar el volcado sin socket.
+fn procesar_tanda(buffer: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
+    let mut off = 0;
+    while off + 16 <= buffer.len() {
+        let len = u32::from_ne_bytes([
+            buffer[off],
+            buffer[off + 1],
+            buffer[off + 2],
+            buffer[off + 3],
+        ]) as usize;
+        if len < 16 || off + len > buffer.len() {
+            break;
+        }
+        let tipo = u16::from_ne_bytes([buffer[off + 4], buffer[off + 5]]);
+        if (tipo >> 8) == NFNL_SUBSYS_ULOG && (tipo & 0xFF) == NFULNL_MSG_PACKET {
+            volcar_mensaje(&buffer[off..off + len], modelo, ahora);
+        }
+        off += (len + 3) & !3; // NLMSG_ALIGN
+    }
+}
+
+/// Destripa un mensaje NFLOG, parsea su respuesta DNS y la anota en el modelo,
+/// atribuida al uid del socket. Se descarta lo que no se pueda atribuir a un uid
+/// local: sin él no hay clave `(uid, IP)` que una app vaya a consultar.
+fn volcar_mensaje(nlmsg: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
+    let Some((Some(uid), dns)) = dns_de_nflog(nlmsg) else {
+        return;
+    };
+    let Some(respuesta) = parsear_respuesta(dns) else {
+        return;
+    };
+    if let Ok(mut m) = modelo.lock() {
+        m.observar(uid, &respuesta, ahora);
+    }
+}
+
+fn ahora_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +897,205 @@ mod tests {
         );
         // Y una de las largas sigue.
         assert_eq!(m.dominio_de(1, "10.1.0.0", 1), Some("larga.com".into()));
+    }
+
+    // ── El destripado NFLOG → IP/UDP → DNS ────────────────────────────────────
+
+    /// Envuelve `dns` en un datagrama UDP sobre IPv4 (sport 53), como lo trae
+    /// `NFULA_PAYLOAD`. El encabezado IP es mínimo (IHL=5) y sólo lleva lo que el
+    /// destripado mira: versión, IHL y el protocolo.
+    fn ipv4_udp(dns: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 20]; // encabezado IPv4 de 20 bytes
+        p[0] = 0x45; // versión 4, IHL 5
+        p[9] = IPPROTO_UDP;
+        // UDP: sport 53, dport efímero, largo, checksum 0.
+        p.extend_from_slice(&PUERTO_DNS.to_be_bytes());
+        p.extend_from_slice(&40000u16.to_be_bytes());
+        p.extend_from_slice(&((8 + dns.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(dns);
+        p
+    }
+
+    /// Envuelve un payload L3 en un mensaje NFLOG completo: `nlmsghdr`+`nfgenmsg`
+    /// y los atributos `NFULA_UID` (si `uid`) y `NFULA_PAYLOAD`.
+    fn nflog(uid: Option<u32>, l3: &[u8]) -> Vec<u8> {
+        let mut m = vec![0u8; 16 + 4]; // nlmsghdr + nfgenmsg, no leídos por el parser
+        if let Some(uid) = uid {
+            // NFULA_UID: be32, nla_len = 8.
+            m.extend_from_slice(&8u16.to_ne_bytes());
+            m.extend_from_slice(&NFULA_UID.to_ne_bytes());
+            m.extend_from_slice(&uid.to_be_bytes());
+        }
+        // NFULA_PAYLOAD.
+        let nla_len = 4 + l3.len();
+        m.extend_from_slice(&(nla_len as u16).to_ne_bytes());
+        m.extend_from_slice(&NFULA_PAYLOAD.to_ne_bytes());
+        m.extend_from_slice(l3);
+        while !m.len().is_multiple_of(4) {
+            m.push(0);
+        }
+        // Completa el `nlmsghdr` para que `procesar_tanda` reconozca el mensaje:
+        // el largo total y el tipo «paquete» del subsistema del log.
+        let len = m.len() as u32;
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m[4..6].copy_from_slice(&((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_PACKET).to_ne_bytes());
+        m
+    }
+
+    #[test]
+    fn destripa_el_uid_y_el_dns_de_un_mensaje_nflog() {
+        let dns = respuesta(
+            &["example", "com"],
+            &[(TIPO_A, 300, vec![93, 184, 216, 34])],
+        );
+        let msg = nflog(Some(1000), &ipv4_udp(&dns));
+        let (uid, bytes) = dns_de_nflog(&msg).expect("destripa");
+        assert_eq!(uid, Some(1000));
+        let r = parsear_respuesta(bytes).expect("parsea el DNS extraído");
+        assert_eq!(r.dominio, "example.com");
+        assert_eq!(r.registros[0].ip, "93.184.216.34");
+    }
+
+    /// Sin `NFULA_UID` (un paquete que el kernel no pudo atribuir a un socket) se
+    /// devuelve el DNS con uid `None`: `volcar_mensaje` después lo descarta.
+    #[test]
+    fn un_mensaje_sin_uid_da_none_de_uid() {
+        let dns = respuesta(&["x", "y"], &[(TIPO_A, 60, vec![1, 2, 3, 4])]);
+        let (uid, _) = dns_de_nflog(&nflog(None, &ipv4_udp(&dns))).expect("destripa");
+        assert_eq!(uid, None);
+    }
+
+    /// Un L3 que no es UDP, o truncado, no da DNS. Y un mensaje NFLOG sin payload
+    /// tampoco.
+    #[test]
+    fn nflog_malformado_no_rompe() {
+        // IPv4 con protocolo TCP (6): no se destripa.
+        let mut tcp = ipv4_udp(&[0u8; 12]);
+        tcp[9] = 6;
+        assert_eq!(dns_de_l3(&tcp), None);
+        // Un L3 vacío o demasiado corto.
+        assert_eq!(dns_de_l3(&[]), None);
+        assert_eq!(dns_de_l3(&[0x45]), None);
+        // Un NFLOG sin atributo de payload.
+        let mut sin_payload = vec![0u8; 16 + 4];
+        sin_payload.extend_from_slice(&8u16.to_ne_bytes());
+        sin_payload.extend_from_slice(&NFULA_UID.to_ne_bytes());
+        sin_payload.extend_from_slice(&7u32.to_be_bytes());
+        assert_eq!(dns_de_nflog(&sin_payload), None);
+        // Un NFLOG más corto que sus cabeceras.
+        assert_eq!(dns_de_nflog(&[0u8; 8]), None);
+    }
+
+    /// IPv6/UDP también se destripa: el encabezado fijo son 40 bytes y el next
+    /// header a los 6.
+    #[test]
+    fn destripa_ipv6_udp() {
+        let dns = respuesta(&["v6", "com"], &[(TIPO_AAAA, 60, vec![0; 16])]);
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60; // versión 6
+        p[6] = IPPROTO_UDP; // next header
+        p.extend_from_slice(&PUERTO_DNS.to_be_bytes());
+        p.extend_from_slice(&40000u16.to_be_bytes());
+        p.extend_from_slice(&((8 + dns.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(&dns);
+        let bytes = dns_de_l3(&p).expect("destripa v6");
+        assert_eq!(parsear_respuesta(bytes).unwrap().dominio, "v6.com");
+    }
+
+    /// El camino entero del lector, sin el socket: una tanda con un mensaje NFLOG
+    /// de una respuesta DNS deja el dominio en el modelo, atribuido al uid, y
+    /// consultable por `(uid, IP)` como lo hará el enriquecimiento del mapa.
+    #[test]
+    fn una_tanda_nflog_puebla_el_modelo_y_se_consulta_por_uid_e_ip() {
+        let modelo = modelo_dns_nuevo();
+        let dns = respuesta(
+            &["www", "example", "com"],
+            &[(TIPO_A, 300, vec![93, 184, 216, 34])],
+        );
+        procesar_tanda(&nflog(Some(1000), &ipv4_udp(&dns)), &modelo, 100);
+
+        let dominio = modelo
+            .lock()
+            .unwrap()
+            .dominio_de(1000, "93.184.216.34", 200);
+        assert_eq!(dominio, Some("www.example.com".into()));
+        // Otro uid no hereda la atribución.
+        assert_eq!(
+            modelo
+                .lock()
+                .unwrap()
+                .dominio_de(1001, "93.184.216.34", 200),
+            None
+        );
+    }
+
+    /// Una respuesta sin uid no entra al modelo: no se puede atribuir a una app.
+    #[test]
+    fn una_respuesta_sin_uid_no_entra_al_modelo() {
+        let modelo = modelo_dns_nuevo();
+        let dns = respuesta(&["x", "com"], &[(TIPO_A, 300, vec![1, 2, 3, 4])]);
+        procesar_tanda(&nflog(None, &ipv4_udp(&dns)), &modelo, 100);
+        assert_eq!(modelo.lock().unwrap().dominio_de(0, "1.2.3.4", 101), None);
+    }
+
+    /// La regla sólo registra las respuestas DNS (sport 53) al grupo pedido, y
+    /// nunca descarta: no hay `drop` ni cambio de política, el veredicto queda
+    /// idéntico. Es idempotente (`destroy` antes de `table`).
+    #[test]
+    fn la_regla_solo_registra_y_no_bloquea() {
+        let r = regla_nft(GRUPO_NFLOG);
+        assert!(r.contains(&format!("log group {GRUPO_NFLOG}")));
+        assert!(r.contains("sport 53"));
+        assert!(r.contains(&format!("destroy table inet {TABLA_NFT}")));
+        assert!(
+            !r.contains("drop") && !r.contains("reject"),
+            "la regla del snoop no debe bloquear nada: {r}"
+        );
+    }
+
+    /// El mensaje de bind al grupo tiene la forma que el kernel espera: el largo
+    /// coincide con el buffer, el tipo es CONFIG del subsistema del log, el grupo
+    /// va en orden de red en el `res_id`, y el atributo lleva el comando BIND.
+    #[test]
+    fn el_mensaje_de_bind_tiene_la_forma_esperada() {
+        let m = mensaje_config(GRUPO_NFLOG, NFULA_CFG_CMD, &[NFULNL_CFG_CMD_BIND]);
+        assert_eq!(
+            u32::from_ne_bytes(m[0..4].try_into().unwrap()),
+            m.len() as u32
+        );
+        assert_eq!(
+            u16::from_ne_bytes(m[4..6].try_into().unwrap()),
+            (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG
+        );
+        // res_id = grupo en orden de red, tras el nlmsghdr (16) + family/version (2).
+        assert_eq!(u16::from_be_bytes([m[18], m[19]]), GRUPO_NFLOG);
+        // El atributo: nla_len=5, tipo CFG_CMD, valor BIND.
+        assert_eq!(u16::from_ne_bytes([m[20], m[21]]), 5);
+        assert_eq!(u16::from_ne_bytes([m[22], m[23]]), NFULA_CFG_CMD);
+        assert_eq!(m[24], NFULNL_CFG_CMD_BIND);
+    }
+
+    /// El mensaje de modo pide copiar el paquete entero. Su atributo mide 10
+    /// bytes (4 de cabecera + 6 de valor) y el mensaje queda alineado a 4: ejercita
+    /// el relleno del atributo.
+    #[test]
+    fn el_mensaje_de_modo_pide_copiar_el_paquete_entero() {
+        let mut valor = Vec::with_capacity(6);
+        valor.extend_from_slice(&0xffff_u32.to_be_bytes()); // copy_range
+        valor.push(NFULNL_COPY_PACKET); // copy_mode
+        valor.push(0); // _pad
+        let m = mensaje_config(GRUPO_NFLOG, NFULA_CFG_MODE, &valor);
+        // Largo del nlmsghdr coherente y alineado a 4.
+        assert_eq!(
+            u32::from_ne_bytes(m[0..4].try_into().unwrap()),
+            m.len() as u32
+        );
+        assert!(m.len().is_multiple_of(4), "el mensaje queda alineado");
+        // nla_len=10, tipo MODE, copy_mode = COPY_PACKET en el 5º byte del valor.
+        assert_eq!(u16::from_ne_bytes([m[20], m[21]]), 10);
+        assert_eq!(u16::from_ne_bytes([m[22], m[23]]), NFULA_CFG_MODE);
+        assert_eq!(m[28], NFULNL_COPY_PACKET);
     }
 }
