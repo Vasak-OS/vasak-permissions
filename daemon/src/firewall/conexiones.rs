@@ -160,6 +160,7 @@ impl ModeloConexiones {
                 allowed: !evento.bloqueado,
                 count: 1,
                 last_seen_secs: ahora,
+                domain: None,
             },
         );
         true
