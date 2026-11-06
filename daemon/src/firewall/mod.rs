@@ -53,6 +53,7 @@
 //! propias syscalls.
 
 pub mod conexiones;
+pub mod dns;
 pub mod enrolar;
 pub mod mapa;
 
