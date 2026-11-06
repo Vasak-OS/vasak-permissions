@@ -810,6 +810,43 @@ mod tests {
         assert_eq!(parsear_respuesta(&m), None);
     }
 
+    /// Bomba de descompresión: un QNAME que, al seguir punteros de compresión
+    /// alineados a bordes de etiqueta, se expande a muchísimo más de los 255 bytes
+    /// que permite el RFC 1035 §3.1. Cada tramo mide poco (el paquete es chico),
+    /// pero la cadena de punteros lo relee entero: sin la cota de largo el parser
+    /// construía el nombre gigante y devolvía `Some`.
+    #[test]
+    fn un_qname_que_descomprime_a_mas_de_255_bytes_se_descarta() {
+        const TRAMOS: usize = 20;
+        const ETIQUETAS: usize = 20; // 20 x "\x01a" = 40 bytes por tramo
+        let mut m = vec![0u8; ENCABEZADO_DNS];
+        m[5] = 1; // QDCOUNT=1
+        m[7] = 1; // ANCOUNT=1
+        for i in 0..TRAMOS {
+            for _ in 0..ETIQUETAS {
+                m.extend_from_slice(&[1, b'a']);
+            }
+            if i + 1 < TRAMOS {
+                // Puntero al inicio del tramo siguiente (alineado a etiqueta).
+                let destino = m.len() + 2;
+                m.extend_from_slice(&[0xC0 | (destino >> 8) as u8, destino as u8]);
+            } else {
+                m.push(0);
+            }
+        }
+        m.extend_from_slice(&TIPO_A.to_be_bytes());
+        m.extend_from_slice(&1u16.to_be_bytes());
+        // Un A que apunta al QNAME: aunque lo demás sea válido, no se acepta.
+        m.extend_from_slice(&[0xC0, ENCABEZADO_DNS as u8]);
+        m.extend_from_slice(&TIPO_A.to_be_bytes());
+        m.extend_from_slice(&1u16.to_be_bytes());
+        m.extend_from_slice(&60u32.to_be_bytes());
+        m.extend_from_slice(&4u16.to_be_bytes());
+        m.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(leer_nombre(&m, ENCABEZADO_DNS), None);
+        assert_eq!(parsear_respuesta(&m), None);
+    }
+
     // ── El modelo acotado y el TTL ────────────────────────────────────────────
 
     fn resp(dominio: &str, ip: &str, ttl: u32) -> RespuestaDns {
