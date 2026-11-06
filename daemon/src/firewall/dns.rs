@@ -83,6 +83,11 @@ fn leer_nombre(msg: &[u8], inicio: usize) -> Option<(String, usize)> {
     let mut pos = inicio;
     let mut fin: Option<usize> = None;
     let mut saltos = 0u32;
+    // Un nombre DNS mide ≤255 bytes (RFC 1035 §3.1). Sin esta cota, el tope de
+    // saltos corta el bucle pero recién tras construir el nombre: un puntero que
+    // relee un campo denso de etiquetas amplifica ~126x (8 MB por paquete de 64
+    // KB) antes de devolver None — DoS de recursos contra un daemon root.
+    let mut largo_total = 0usize;
 
     loop {
         let largo = *msg.get(pos)? as usize;
@@ -100,6 +105,10 @@ fn leer_nombre(msg: &[u8], inicio: usize) -> Option<(String, usize)> {
             fin.get_or_insert(pos + 1);
             break;
         } else {
+            largo_total += largo + 1;
+            if largo_total > 255 {
+                return None;
+            }
             pos += 1;
             let etiqueta = msg.get(pos..pos + largo)?;
             etiquetas.push(String::from_utf8_lossy(etiqueta).into_owned());
