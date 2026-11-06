@@ -411,7 +411,7 @@ mod tests {
         assert!(!firma.contains("->"), "emit no debe devolver nada: {firma}");
         let handle = fuente.split("fn handle(").nth(1).expect("falta fn handle");
         let pos_calculo = handle.find("let bloqueado").expect("falta el cálculo");
-        let pos_emit = handle.find("emit(ctx").expect("handle no emite");
+        let pos_emit = handle.find("emit(uid").expect("handle no emite");
         let pos_ret = handle.find("if bloqueado").expect("falta el retorno");
         assert!(pos_calculo < pos_emit && pos_emit < pos_ret);
         assert!(

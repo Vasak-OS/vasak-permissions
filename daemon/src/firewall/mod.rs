@@ -54,10 +54,11 @@
 
 pub mod conexiones;
 pub mod dns;
+pub mod dominio;
 pub mod enrolar;
 pub mod mapa;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 
 use aya::maps::{HashMap as BpfHashMap, MapError};
@@ -84,8 +85,43 @@ const DENY: u8 = 1;
 /// se aplica es un control de seguridad ausente, no un detalle.
 const CAPACIDAD_BLOCKED: usize = 4096;
 
+/// El nombre del mapa del bloqueo por dominio (M2), el del `static` en
+/// `firewall-ebpf`. Igual que `BLOCKED`: si se renombra allá y no acá, escribirlo
+/// falla en vez de hacerlo en silencio sobre un mapa que no existe.
+const MAPA_DOMINIO: &str = "DOMAIN_BLOCKED";
+
+/// El tope de entradas de `DOMAIN_BLOCKED`. **Tiene que coincidir** con el
+/// `with_max_entries` del programa BPF; una prueba lo ata a la fuente. Importa
+/// para el fail-closed, igual que [`CAPACIDAD_BLOCKED`].
+const CAPACIDAD_DOMINIO: usize = 4096;
+
 /// Los dos programas `cgroup/connect` que se adjuntan a la raíz, en orden.
 const PROGRAMAS: [&str; 2] = ["connect4", "connect6"];
+
+/// La clave de `DOMAIN_BLOCKED`: la misma clave de pid de `BLOCKED`
+/// (`uid << 32 | pid`) más la IP de destino en 16 bytes (IPv4 en los primeros 4,
+/// los 16 de IPv6). **`repr(C)` y byte a byte idéntica** a la del programa BPF
+/// (`firewall-ebpf::DomainKey`): una prueba de correspondencia ata los dos lados.
+/// `Pod` para que aya la escriba como clave cruda del mapa.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DomainKey {
+    /// `uid << 32 | pid`, idéntica a la clave de `BLOCKED`.
+    pid_key: u64,
+    /// IP de destino en 16 bytes, mismo formato que `ConnectionEvent.dst`.
+    ip: [u8; 16],
+}
+
+// SAFETY: `DomainKey` es `repr(C)`, `Copy` y sin punteros ni padding con
+// significado: una secuencia de bytes cualquiera de su tamaño es un valor válido,
+// que es lo que `aya::Pod` exige para usarla como clave cruda del mapa.
+unsafe impl aya::Pod for DomainKey {}
+
+/// Arma la clave de dominio. Acá —como [`clave`]— porque es el punto exacto donde
+/// el daemon y el programa BPF se pueden desincronizar sin que nada avise.
+fn clave_dominio(pid_key: u64, ip: [u8; 16]) -> DomainKey {
+    DomainKey { pid_key, ip }
+}
 
 /// El motor eBPF visto por la lógica del cortafuegos: lo justo para adjuntar un
 /// programa y marcar o desmarcar un pid en el mapa `BLOCKED`.
@@ -103,6 +139,13 @@ pub trait MotorBpf {
 
     /// Quita `clave` del mapa `BLOCKED`.
     fn quitar(&mut self, clave: u64) -> Result<(), MapError>;
+
+    /// Marca la pareja `(clave de pid, IP) → DENY` en `DOMAIN_BLOCKED` (M2): a
+    /// partir de ahora el programa corta el `connect()` de ese pid a esa IP.
+    fn insertar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError>;
+
+    /// Quita la pareja `(clave de pid, IP)` de `DOMAIN_BLOCKED`.
+    fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError>;
 }
 
 /// El cortafuegos cargado: es dueño del motor eBPF y, a través de él, del
@@ -186,6 +229,52 @@ impl<M: MotorBpf> Firewall<M> {
             )),
         }
     }
+
+    /// Corta una IP para un pid por una regla de dominio (M2): mete
+    /// `(pid_key, ip) → DENY` en `DOMAIN_BLOCKED`. Fail-closed: un mapa lleno da un
+    /// error que lo nombra, para que el llamador lo registre ruidoso en vez de
+    /// creer que el corte quedó aplicado.
+    pub fn bloquear_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), String> {
+        self.motor.insertar_ip(pid_key, ip).map_err(|e| {
+            let base = format!(
+                "no se pudo cortar la IP {} para la clave de pid {pid_key:#x} (dominio): {}",
+                ip_texto(&ip),
+                con_causas(&e)
+            );
+            if es_mapa_lleno(&e) {
+                format!(
+                    "{base}. El mapa DOMAIN_BLOCKED está lleno (tope {CAPACIDAD_DOMINIO}): \
+                     el corte por dominio de esa IP NO se está aplicando"
+                )
+            } else {
+                base
+            }
+        })
+    }
+
+    /// Descorta una IP de un pid. No es error quitar una que no estaba (el proceso
+    /// pudo salir, o el TTL ya la bajó), igual que [`Self::unblock`].
+    pub fn desbloquear_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), String> {
+        match self.motor.quitar_ip(pid_key, ip) {
+            Ok(()) => Ok(()),
+            Err(e) if es_clave_ausente(&e) => Ok(()),
+            Err(e) => Err(format!(
+                "no se pudo descortar la IP {} para la clave de pid {pid_key:#x} (dominio): {}",
+                ip_texto(&ip),
+                con_causas(&e)
+            )),
+        }
+    }
+}
+
+/// Texto legible de una IP en 16 bytes, para los mensajes de error: IPv4 si los
+/// últimos 12 bytes son cero, IPv6 si no.
+fn ip_texto(ip: &[u8; 16]) -> String {
+    if ip[4..].iter().all(|&b| b == 0) {
+        std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string()
+    } else {
+        std::net::Ipv6Addr::from(*ip).to_string()
+    }
 }
 
 /// El cortafuegos más la contabilidad de **qué pids tenemos marcados**, con qué
@@ -209,8 +298,22 @@ impl<M: MotorBpf> Firewall<M> {
 /// reconciliación se prueban sin root con el motor de mentira.
 pub struct Enforcer<M: MotorBpf = MotorAya> {
     firewall: Firewall<M>,
-    /// `pid → uid` de los que tenemos marcados ahora mismo.
+    /// `pid → uid` de los que tenemos marcados con el kill-switch de M0.
     marcados: HashMap<u32, u32>,
+    /// Los pids enrolados por una regla de dominio (M2) y las IPs que les tenemos
+    /// cortadas ahora mismo en `DOMAIN_BLOCKED`. Es el espejo en userspace del
+    /// mapa BPF: hace falta para quitar las entradas al salir el pid (su `/proc`
+    /// ya no está) y para diferenciar qué agregar y qué quitar al reconciliar.
+    dominio: HashMap<u32, DomPid>,
+}
+
+/// Un pid enrolado por regla de dominio: con qué uid y ejecutable, y las IPs que
+/// le tenemos cortadas. El ejecutable se guarda para reconciliar por binario
+/// cuando el snoop ata una IP nueva a un dominio que ese binario bloquea.
+struct DomPid {
+    uid: u32,
+    binary: String,
+    ips: HashSet<[u8; 16]>,
 }
 
 impl<M: MotorBpf> Enforcer<M> {
@@ -218,6 +321,7 @@ impl<M: MotorBpf> Enforcer<M> {
         Self {
             firewall,
             marcados: HashMap::new(),
+            dominio: HashMap::new(),
         }
     }
 
@@ -234,11 +338,150 @@ impl<M: MotorBpf> Enforcer<M> {
     /// al apagar el switch—. No hace nada si no lo teníamos marcado. Usa el uid
     /// anotado, que es la única forma de reconstruir la clave una vez que el
     /// proceso ya no está.
+    ///
+    /// Limpia **las dos** capas: el kill-switch de M0 (`BLOCKED`) y, si el pid
+    /// estaba enrolado por una regla de dominio, sus IPs cortadas en
+    /// `DOMAIN_BLOCKED`. Un pid reciclado heredaría un corte ajeno si no se
+    /// limpiaran, así que se quitan las dos al salir.
     pub fn limpiar(&mut self, pid: u32) -> Result<(), String> {
+        if let Some(dom) = self.dominio.remove(&pid) {
+            let pid_key = clave(dom.uid, pid);
+            for ip in dom.ips {
+                // Mejor esfuerzo: el proceso ya salió, así que una IP que no se
+                // pueda quitar no bloquea nada vivo; se registra y se sigue.
+                if let Err(e) = self.firewall.desbloquear_ip(pid_key, ip) {
+                    tracing::warn!("Cortafuegos (dominio): al limpiar el pid {pid}: {e}");
+                }
+            }
+        }
         if let Some(uid) = self.marcados.remove(&pid) {
             self.firewall.unblock(uid, pid)?;
         }
         Ok(())
+    }
+
+    /// Lleva el bloqueo por dominio de un pid al día. `tiene_reglas` dice si su
+    /// binario tiene **alguna** regla de dominio ahora; `deseadas`, las IPs que
+    /// debería cortar (vacío si todavía nadie resolvió esos dominios).
+    ///
+    /// # Por qué `tiene_reglas` aparte de `deseadas`
+    ///
+    /// Un pid de un binario con regla se **enrola** (queda anotado) aunque todavía
+    /// no haya IPs que cortar: si no, el empujón del snoop
+    /// ([`Self::reconciliar_dominio_binario`]) —que sólo alcanza a los pids
+    /// enrolados— nunca llegaría a él, y la regla no cortaría nada. Así que con
+    /// `tiene_reglas` el pid queda enrolado con IPs vacías; sin reglas, se limpia y
+    /// sale del enrolado.
+    ///
+    /// Fail-closed: una IP deseada que no se pudo escribir **no** queda anotada
+    /// como aplicada —no se finge un corte que no está— y el error sube; se
+    /// reintenta en el próximo reconcile. Una IP que no se pudo quitar se deja
+    /// anotada para reintentar quitarla.
+    ///
+    /// Devuelve los errores sin cortar, como [`Self::reconciliar`].
+    pub fn reconciliar_dominio_pid(
+        &mut self,
+        uid: u32,
+        pid: u32,
+        binary: &str,
+        deseadas: HashSet<[u8; 16]>,
+        tiene_reglas: bool,
+    ) -> Vec<String> {
+        let mut errores = Vec::new();
+
+        // Binario sin reglas: nada que enrolar. Si estaba enrolado, se limpia
+        // entero (la regla se borró), quitando sus IPs del mapa.
+        if !tiene_reglas {
+            if let Some(dom) = self.dominio.remove(&pid) {
+                let pid_key = clave(dom.uid, pid);
+                for ip in dom.ips {
+                    if let Err(e) = self.firewall.desbloquear_ip(pid_key, ip) {
+                        errores.push(e);
+                    }
+                }
+            }
+            return errores;
+        }
+
+        let actuales = self
+            .dominio
+            .get(&pid)
+            .map(|d| d.ips.clone())
+            .unwrap_or_default();
+        let pid_key = clave(uid, pid);
+        let mut aplicadas = actuales.clone();
+        for &ip in deseadas.difference(&actuales) {
+            match self.firewall.bloquear_ip(pid_key, ip) {
+                Ok(()) => {
+                    aplicadas.insert(ip);
+                }
+                Err(e) => errores.push(e),
+            }
+        }
+        for &ip in actuales.difference(&deseadas) {
+            match self.firewall.desbloquear_ip(pid_key, ip) {
+                Ok(()) => {
+                    aplicadas.remove(&ip);
+                }
+                Err(e) => errores.push(e),
+            }
+        }
+
+        // Queda enrolado aunque `aplicadas` esté vacío: el binario tiene reglas, y
+        // el pid tiene que estar enrolado para que el empujón del snoop lo alcance.
+        self.dominio.insert(
+            pid,
+            DomPid {
+                uid,
+                binary: binary.to_string(),
+                ips: aplicadas,
+            },
+        );
+        errores
+    }
+
+    /// Reconcilia **todos** los pids vivos enrolados de un `(uid, binary)` contra
+    /// `deseadas`. Es lo que corre cuando el snoop de DNS ata una IP nueva a un
+    /// dominio que ese binario bloquea: cada pid enrolado del binario toma el
+    /// conjunto de IPs al día. `tiene_reglas` se pasa tal cual a cada pid.
+    pub fn reconciliar_dominio_binario(
+        &mut self,
+        uid: u32,
+        binary: &str,
+        deseadas: HashSet<[u8; 16]>,
+        tiene_reglas: bool,
+    ) -> Vec<String> {
+        let pids: Vec<u32> = self
+            .dominio
+            .iter()
+            .filter(|(_, d)| d.uid == uid && d.binary == binary)
+            .map(|(pid, _)| *pid)
+            .collect();
+        let mut errores = Vec::new();
+        for pid in pids {
+            errores.extend(self.reconciliar_dominio_pid(
+                uid,
+                pid,
+                binary,
+                deseadas.clone(),
+                tiene_reglas,
+            ));
+        }
+        errores
+    }
+
+    /// Los pares `(uid, binary)` distintos que tienen pids enrolados por dominio
+    /// ahora mismo. El barrido periódico de TTL los recorre para recalcular sus
+    /// IPs deseadas y bajar las vencidas.
+    pub fn pares_dominio(&self) -> Vec<(u32, String)> {
+        let mut pares: Vec<(u32, String)> = self
+            .dominio
+            .values()
+            .map(|d| (d.uid, d.binary.clone()))
+            .collect();
+        pares.sort();
+        pares.dedup();
+        pares
     }
 
     /// Lleva lo marcado a coincidir con `deseados` (`pid → uid` que deberían
@@ -395,6 +638,21 @@ impl MotorAya {
         BpfHashMap::try_from(mapa)
     }
 
+    /// El mapa `DOMAIN_BLOCKED` como vista escribible, tomado por operación por lo
+    /// mismo que [`Self::mapa`]: el préstamo del `MapData` del `Ebpf` no se puede
+    /// retener entre escrituras.
+    fn mapa_dominio(
+        &mut self,
+    ) -> Result<BpfHashMap<&mut aya::maps::MapData, DomainKey, u8>, MapError> {
+        let mapa = self
+            .ebpf
+            .map_mut(MAPA_DOMINIO)
+            .ok_or_else(|| MapError::InvalidName {
+                name: MAPA_DOMINIO.to_string(),
+            })?;
+        BpfHashMap::try_from(mapa)
+    }
+
     /// Extrae el ring buffer `EVENTS` del objeto cargado. Sale del `Ebpf` con
     /// `take_map`: el mapa en vivo lo lee un task aparte y no vuelve a tocar este
     /// `Ebpf`, así que llevárselo evita compartir el `Ebpf` entre el enforcement y
@@ -443,6 +701,15 @@ impl MotorBpf for MotorAya {
     fn quitar(&mut self, clave: u64) -> Result<(), MapError> {
         self.mapa()?.remove(&clave)
     }
+
+    fn insertar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
+        self.mapa_dominio()?
+            .insert(clave_dominio(pid_key, ip), DENY, 0)
+    }
+
+    fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
+        self.mapa_dominio()?.remove(&clave_dominio(pid_key, ip))
+    }
 }
 
 /// Un motor de mentira para ejercitar la lógica de `Firewall` y de `Enforcer`
@@ -466,6 +733,13 @@ pub(crate) struct MotorFalso {
     pub(crate) falla_al_insertar: Option<MapError>,
     /// Si está, `quitar` falla con este error.
     pub(crate) falla_al_quitar: Option<MapError>,
+    /// Lo escrito en `DOMAIN_BLOCKED`: `(clave de pid, IP)` de cada `insertar_ip`.
+    pub(crate) insertados_ip: Vec<(u64, [u8; 16])>,
+    /// Lo quitado de `DOMAIN_BLOCKED`: cada `(clave de pid, IP)` de `quitar_ip`.
+    pub(crate) quitados_ip: Vec<(u64, [u8; 16])>,
+    /// Si está, `insertar_ip` falla con este error (para el fail-closed del mapa
+    /// de dominio lleno).
+    pub(crate) falla_al_insertar_ip: Option<MapError>,
 }
 
 #[cfg(test)]
@@ -495,6 +769,19 @@ impl MotorBpf for MotorFalso {
         self.quitados.push(clave);
         Ok(())
     }
+
+    fn insertar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
+        if let Some(e) = self.falla_al_insertar_ip.take() {
+            return Err(e);
+        }
+        self.insertados_ip.push((pid_key, ip));
+        Ok(())
+    }
+
+    fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
+        self.quitados_ip.push((pid_key, ip));
+        Ok(())
+    }
 }
 
 /// El cortafuegos de mentira listo para `Enforcer`, para las pruebas de los dos
@@ -510,6 +797,21 @@ impl<M: MotorBpf> Enforcer<M> {
     /// pidió marcar o quitar.
     pub(crate) fn motor(&self) -> &M {
         &self.firewall.motor
+    }
+
+    /// Las IPs que un pid tiene cortadas por dominio ahora mismo, para las
+    /// pruebas. `None` si el pid no está enrolado por dominio.
+    pub(crate) fn ips_dominio(&self, pid: u32) -> Option<Vec<[u8; 16]>> {
+        self.dominio.get(&pid).map(|d| {
+            let mut v: Vec<[u8; 16]> = d.ips.iter().copied().collect();
+            v.sort();
+            v
+        })
+    }
+
+    /// Cuántos pids hay enrolados por dominio.
+    pub(crate) fn dominio_marcados(&self) -> usize {
+        self.dominio.len()
     }
 }
 
@@ -824,6 +1126,311 @@ mod tests {
         assert_eq!(e.marcados(), 1);
     }
 
+    // ── Enforcer: bloqueo por dominio (M2) ────────────────────────────────────
+
+    /// Una IP v4 en los 16 bytes del mapa: octetos en los primeros 4, cero el
+    /// resto, como arma el programa BPF para `connect4`.
+    fn ip16(a: u8, b: u8, c: u8, d: u8) -> [u8; 16] {
+        let mut v = [0u8; 16];
+        v[0] = a;
+        v[1] = b;
+        v[2] = c;
+        v[3] = d;
+        v
+    }
+
+    fn set(ips: &[[u8; 16]]) -> HashSet<[u8; 16]> {
+        ips.iter().copied().collect()
+    }
+
+    /// Enrolar un pid por dominio escribe `(clave de pid, IP)` en el mapa por cada
+    /// IP deseada, con la clave `(uid << 32 | pid)` —la misma de M0—, y lo anota.
+    #[test]
+    fn reconciliar_dominio_pid_corta_las_ips_deseadas() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        let b = ip16(192, 0, 2, 2);
+
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/usr/bin/vasak-mail", set(&[a, b]), true)
+            .is_empty());
+        assert_eq!(e.dominio_marcados(), 1);
+        assert_eq!(e.ips_dominio(42), Some(vec![a, b]));
+
+        let pid_key = clave(1000, 42);
+        let mut escritas = e.motor().insertados_ip.clone();
+        escritas.sort();
+        assert_eq!(escritas, vec![(pid_key, a), (pid_key, b)]);
+    }
+
+    /// Un segundo reconcile con un conjunto distinto agrega lo nuevo y quita lo
+    /// que salió —el `reconcile` lleva el pid al estado deseado—.
+    #[test]
+    fn reconciliar_dominio_pid_agrega_y_quita_la_diferencia() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        let b = ip16(192, 0, 2, 2);
+        let c = ip16(192, 0, 2, 3);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a, b]), true);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[b, c]), true);
+
+        assert_eq!(e.ips_dominio(42), Some(vec![b, c]));
+        let pid_key = clave(1000, 42);
+        assert_eq!(
+            e.motor().quitados_ip,
+            vec![(pid_key, a)],
+            "sólo la que salió"
+        );
+        // b no se reescribió (ya estaba): sólo a y b en el primer paso, c en el segundo.
+        assert!(e.motor().insertados_ip.contains(&(pid_key, c)));
+        assert_eq!(
+            e.motor()
+                .insertados_ip
+                .iter()
+                .filter(|(_, ip)| *ip == b)
+                .count(),
+            1,
+            "una IP que ya estaba no se reescribe"
+        );
+    }
+
+    /// Reconciliar a un conjunto vacío un pid enrolado lo limpia entero: quita sus
+    /// IPs y lo saca del enrolado. Es lo que pasa al borrar la regla de dominio.
+    #[test]
+    fn reconciliar_dominio_pid_a_vacio_limpia_el_pid() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        assert_eq!(e.dominio_marcados(), 1);
+
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), false)
+            .is_empty());
+        assert_eq!(e.dominio_marcados(), 0);
+        assert_eq!(e.ips_dominio(42), None);
+        assert_eq!(e.motor().quitados_ip, vec![(clave(1000, 42), a)]);
+    }
+
+    /// Un pid sin enrolar y sin IPs deseadas no toca el mapa: la gran mayoría de
+    /// los `exec`/`fork` (binarios sin regla de dominio) pasa por acá sin costo.
+    #[test]
+    fn reconciliar_dominio_pid_sin_reglas_ni_enrolar_no_hace_nada() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), false)
+            .is_empty());
+        assert_eq!(e.dominio_marcados(), 0);
+        assert!(e.motor().insertados_ip.is_empty());
+        assert!(e.motor().quitados_ip.is_empty());
+    }
+
+    /// Un binario con regla pero todavía sin IPs resueltas **enrola** el pid con un
+    /// conjunto vacío: hace falta para que el empujón del snoop lo alcance después.
+    #[test]
+    fn reconciliar_dominio_pid_con_reglas_pero_sin_ips_enrola_vacio() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true)
+            .is_empty());
+        assert_eq!(
+            e.dominio_marcados(),
+            1,
+            "queda enrolado aunque no corte nada"
+        );
+        assert_eq!(e.ips_dominio(42), Some(vec![]));
+        assert!(e.motor().insertados_ip.is_empty(), "no escribió ninguna IP");
+    }
+
+    /// Fail-closed: si el mapa de dominio está lleno, la IP que no se pudo escribir
+    /// **no** queda anotada como cortada —no se finge el corte— y el error sube.
+    #[test]
+    fn reconciliar_dominio_pid_fail_closed_no_anota_lo_que_no_pudo_cortar() {
+        let motor = MotorFalso {
+            falla_al_insertar_ip: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut e = Enforcer::nuevo(Firewall::con_motor(motor).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        let b = ip16(192, 0, 2, 2);
+        // La primera inserción falla (MotorFalso falla una vez), la segunda entra.
+        let errores = e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a, b]), true);
+        assert_eq!(errores.len(), 1);
+        assert!(
+            errores[0].contains("DOMAIN_BLOCKED está lleno"),
+            "{}",
+            errores[0]
+        );
+        // Sólo una de las dos quedó anotada: la que sí se pudo escribir.
+        assert_eq!(e.ips_dominio(42).map(|v| v.len()), Some(1));
+    }
+
+    /// Limpiar un pid enrolado por dominio (su `exit`) quita sus IPs del mapa y lo
+    /// saca del enrolado, aunque no tuviera kill-switch de M0.
+    #[test]
+    fn limpiar_un_pid_de_dominio_quita_sus_ips() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        e.limpiar(42).expect("limpiar");
+        assert_eq!(e.dominio_marcados(), 0);
+        assert_eq!(e.motor().quitados_ip, vec![(clave(1000, 42), a)]);
+    }
+
+    /// Reconciliar por binario alcanza a todos los pids vivos de ese `(uid, binary)`
+    /// —lo que corre cuando el snoop ata una IP nueva al dominio—.
+    #[test]
+    fn reconciliar_dominio_binario_alcanza_a_todos_los_pids_del_binario() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        // Dos pids del mismo binario, uno de otro.
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        e.reconciliar_dominio_pid(1000, 43, "/app", set(&[a]), true);
+        e.reconciliar_dominio_pid(1000, 99, "/otro", set(&[a]), true);
+
+        let b = ip16(192, 0, 2, 2);
+        e.reconciliar_dominio_binario(1000, "/app", set(&[a, b]), true);
+        // Los dos pids de /app ganan b; el de /otro no.
+        assert_eq!(e.ips_dominio(42), Some(vec![a, b]));
+        assert_eq!(e.ips_dominio(43), Some(vec![a, b]));
+        assert_eq!(e.ips_dominio(99), Some(vec![a]));
+    }
+
+    /// `pares_dominio` da los `(uid, binary)` distintos con pids enrolados, para el
+    /// barrido de TTL.
+    #[test]
+    fn pares_dominio_da_los_binarios_distintos_enrolados() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        e.reconciliar_dominio_pid(1000, 43, "/app", set(&[a]), true);
+        e.reconciliar_dominio_pid(1001, 50, "/app", set(&[a]), true);
+        assert_eq!(
+            e.pares_dominio(),
+            vec![(1000, "/app".to_string()), (1001, "/app".to_string())]
+        );
+    }
+
+    /// El kill-switch de M0 y el bloqueo por dominio conviven sobre el mismo pid y
+    /// se limpian juntos al salir, sin pisarse: son dos mapas distintos.
+    #[test]
+    fn m0_y_dominio_conviven_y_se_limpian_juntos() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.bloquear(1000, 42).expect("M0");
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        assert_eq!(e.marcados(), 1);
+        assert_eq!(e.dominio_marcados(), 1);
+
+        e.limpiar(42).expect("limpiar");
+        assert_eq!(e.marcados(), 0);
+        assert_eq!(e.dominio_marcados(), 0);
+        assert_eq!(e.motor().quitados, vec![clave(1000, 42)], "M0 limpio");
+        assert_eq!(
+            e.motor().quitados_ip,
+            vec![(clave(1000, 42), a)],
+            "dominio limpio"
+        );
+    }
+
+    /// Granularidad por binario: la clave lleva el pid, así que lo cortado para un
+    /// pid no alcanza a otro del mismo uid. Un pid de otro binario (sin regla) ni
+    /// se enrola ni recibe entradas, y reconciliar «por binario» no toca sus pids.
+    #[test]
+    fn la_ip_cortada_para_un_pid_no_alcanza_a_otro_del_mismo_uid() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        // Otro pid del mismo uid, de un binario sin regla: no recibe nada.
+        e.reconciliar_dominio_pid(1000, 43, "/otro", HashSet::new(), false);
+        e.reconciliar_dominio_binario(1000, "/app", set(&[a]), true);
+
+        assert_eq!(e.ips_dominio(43), None, "el pid ajeno no se enrola");
+        assert_eq!(
+            e.motor().insertados_ip,
+            vec![(clave(1000, 42), a)],
+            "sólo la clave del pid con la regla; ninguna del otro pid"
+        );
+        assert_ne!(clave(1000, 42), clave(1000, 43));
+    }
+
+    /// La `DomainKey` que escribe el daemon tiene el layout que lee el programa BPF:
+    /// el pid de M0 en el offset 0 y la IP en el 8, 24 bytes en total.
+    #[test]
+    fn la_clave_de_dominio_lleva_el_pid_y_la_ip_en_su_sitio() {
+        let k = clave_dominio(clave(1000, 42), ip16(192, 0, 2, 1));
+        assert_eq!(std::mem::offset_of!(DomainKey, pid_key), 0);
+        assert_eq!(std::mem::offset_of!(DomainKey, ip), 8);
+        // SAFETY: `DomainKey` es `repr(C)` y Copy; se leen sus 24 bytes como crudos.
+        let bytes: [u8; 24] = unsafe { std::mem::transmute(k) };
+        assert_eq!(bytes[..8], clave(1000, 42).to_ne_bytes());
+        assert_eq!(bytes[8..12], [192, 0, 2, 1]);
+        assert_eq!(bytes[12..], [0u8; 12]);
+    }
+
+    /// Fail-closed completo: la IP que no entró al mapa no se anota, y el próximo
+    /// reconcile la **reintenta** en vez de darla por cortada.
+    #[test]
+    fn la_ip_que_no_entro_al_mapa_se_reintenta_en_el_siguiente_reconcile() {
+        let motor = MotorFalso {
+            falla_al_insertar_ip: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut e = Enforcer::nuevo(Firewall::con_motor(motor).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        assert_eq!(
+            e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true)
+                .len(),
+            1
+        );
+        assert_eq!(e.ips_dominio(42), Some(vec![]), "no se anotó como cortada");
+        assert!(e.motor().insertados_ip.is_empty());
+
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true)
+            .is_empty());
+        assert_eq!(e.ips_dominio(42), Some(vec![a]));
+        assert_eq!(e.motor().insertados_ip, vec![(clave(1000, 42), a)]);
+    }
+
+    /// El error de mapa lleno de `bloquear_ip` sube con el mensaje accionable; uno
+    /// que no es de mapa lleno no lo menciona.
+    #[test]
+    fn bloquear_ip_con_el_mapa_lleno_devuelve_error_accionable() {
+        let motor = MotorFalso {
+            falla_al_insertar_ip: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut fw = Firewall::con_motor(motor).unwrap();
+        let err = fw
+            .bloquear_ip(clave(1000, 42), ip16(192, 0, 2, 1))
+            .expect_err("tiene que fallar");
+        assert!(err.contains("192.0.2.1"), "{err}");
+        assert!(err.contains("DOMAIN_BLOCKED está lleno"), "{err}");
+        assert!(err.contains("NO se está aplicando"), "{err}");
+    }
+
+    /// Aditivo: en el programa BPF el veredicto es el OR del kill-switch de M0 y del
+    /// match por dominio, y el kill-switch sigue saliendo de `BLOCKED` con la misma
+    /// clave. Sin reglas `DOMAIN_BLOCKED` está vacío y el OR vale lo que M0.
+    #[test]
+    fn la_fuente_bpf_combina_m0_y_dominio_con_un_or() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        assert!(
+            fuente.contains("let bloqueado = kill_switch || dominio_bloqueado;"),
+            "el veredicto dejó de ser kill_switch OR dominio"
+        );
+        assert!(
+            fuente.contains("BLOCKED.get(&key)"),
+            "el kill-switch de M0 ya no consulta BLOCKED por la clave de pid"
+        );
+        assert!(
+            fuente.contains("DOMAIN_BLOCKED.get(&domain_key)")
+                && fuente.contains("pid_key: key,")
+                && fuente.contains("ip: dst,"),
+            "el match por dominio tiene que usar la clave de pid y el destino del connect"
+        );
+    }
+
     /// Los dos lados se desincronizan sin aviso si alguien toca uno solo. Esta
     /// prueba lee la fuente del programa BPF (siempre disponible, a diferencia del
     /// toolchain BPF que necesita la correspondencia del objeto) y exige que la
@@ -848,6 +1455,45 @@ mod tests {
             "el tope del mapa BPF y CAPACIDAD_BLOCKED discrepan; el fail-closed \
              del mapa lleno dejaría de corresponder al tope real"
         );
+    }
+
+    /// La clave y el mapa del bloqueo por dominio tienen que ser los mismos de los
+    /// dos lados: si el programa BPF cambia la forma de `DomainKey` o el nombre/tope
+    /// del mapa y el daemon no, el daemon escribiría una clave que el programa no
+    /// consulta y el bloqueo por dominio quedaría inerte sin que nada falle.
+    #[test]
+    fn la_fuente_bpf_define_la_misma_clave_de_dominio_y_el_mismo_mapa() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        assert!(
+            fuente.contains("struct DomainKey {"),
+            "el programa BPF ya no define DomainKey"
+        );
+        for campo in ["pid_key: u64,", "ip: [u8; 16],"] {
+            assert!(
+                fuente.contains(campo),
+                "DomainKey del programa BPF ya no tiene «{campo}»; se desincronizó del daemon"
+            );
+        }
+        // El orden importa tanto como los campos: `pid_key` antes de `ip`.
+        let cuerpo = fuente
+            .split("struct DomainKey {")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("falta el cuerpo de DomainKey");
+        assert!(
+            cuerpo.find("pid_key").unwrap_or(usize::MAX) < cuerpo.find("ip:").unwrap_or(0),
+            "el orden de DomainKey cambió"
+        );
+        assert!(
+            fuente.contains(&format!("static {MAPA_DOMINIO}: HashMap<DomainKey, u8>")),
+            "el mapa del bloqueo por dominio ya no se llama «{MAPA_DOMINIO}» o cambió de tipo"
+        );
+        assert!(
+            fuente.contains(&format!("with_max_entries({CAPACIDAD_DOMINIO},")),
+            "el tope de DOMAIN_BLOCKED y CAPACIDAD_DOMINIO discrepan"
+        );
+        // Y los dos lados miden lo mismo: 24 bytes (u64 + [u8;16], repr(C)).
+        assert_eq!(std::mem::size_of::<DomainKey>(), 24);
     }
 
     /// Sin privilegios la carga no puede salir bien, y tiene que decirlo con un

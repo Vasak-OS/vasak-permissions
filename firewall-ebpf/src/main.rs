@@ -52,6 +52,39 @@ static BLOCKED: HashMap<u64, u8> = HashMap::with_max_entries(4096, 0);
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// El set de `(clave de pid, IP) → DENY` del bloqueo por dominio (M2). El daemon
+/// lo puebla **sólo** para los pids de binarios con una regla de dominio, con las
+/// IPs que el snoop de DNS vio resolver a esos dominios (ver `firewall::dominio`
+/// en el daemon). El programa, además del kill-switch de M0, corta el `connect()`
+/// de un pid a una IP si la pareja está acá.
+///
+/// # Por qué la clave lleva el pid y no sólo la IP
+///
+/// El bloqueo por dominio es **por aplicación**: "a esta app, este dominio". Como
+/// la mayoría de las apps del escritorio corren bajo el mismo uid, cortar por
+/// `(uid, IP)` bloquearía el dominio para **todas**. Al meter el pid en la clave,
+/// sólo los pids del binario con la regla —que el daemon enrola reusando el
+/// enrolado por pid de M0— tienen entradas, así que el corte es por binario. El
+/// daemon pone una entrada por cada pid vivo del binario y cada IP resuelta.
+///
+/// Sin reglas de dominio este mapa está **vacío** y cada consulta falla, así que
+/// el veredicto queda idéntico al de M0 (aditivo).
+#[map]
+static DOMAIN_BLOCKED: HashMap<DomainKey, u8> = HashMap::with_max_entries(4096, 0);
+
+/// La clave de [`DOMAIN_BLOCKED`]: la misma clave de pid de `BLOCKED`
+/// (`uid << 32 | tgid`) más la IP de destino, en el mismo formato de 16 bytes que
+/// `ConnectionEvent.dst` (IPv4 en los primeros 4 bytes, los 16 de IPv6). `repr(C)`
+/// y compartida **byte a byte** con el daemon (`firewall::clave_dominio`), que la
+/// arma con el mismo layout; una prueba de correspondencia ata los dos lados.
+#[repr(C)]
+struct DomainKey {
+    /// `uid << 32 | tgid`, idéntica a la clave de `BLOCKED`.
+    pid_key: u64,
+    /// IP de destino: IPv4 en los primeros 4 bytes, o los 16 de IPv6. Orden de red.
+    ip: [u8; 16],
+}
+
 /// El único valor que M0 escribe. Deja lugar a `allow` explícito y a un id de
 /// set de IPs para M2 sin cambiar la forma del mapa.
 const DENY: u8 = 1;
@@ -100,9 +133,10 @@ pub fn connect6(ctx: SockAddrContext) -> i32 {
     handle(&ctx, AF_INET6)
 }
 
-/// El veredicto compartido por v4 y v6: mismo mapa, misma clave, misma regla, más
-/// la emisión del evento de observación. `family` es constante en cada punto de
-/// enganche, así que la rama de la otra familia en [`emit`] se elimina.
+/// El veredicto compartido por v4 y v6: el kill-switch de M0, el bloqueo por
+/// dominio de M2 aditivo encima, y la emisión del evento de observación. `family`
+/// es constante en cada punto de enganche, así que la rama de la otra familia en
+/// [`destino`] se elimina.
 #[inline(always)]
 fn handle(ctx: &SockAddrContext, family: u8) -> i32 {
     // `bpf_get_current_pid_tgid()` devuelve `tgid << 32 | pid`; el tgid es el
@@ -111,12 +145,32 @@ fn handle(ctx: &SockAddrContext, family: u8) -> i32 {
     let uid = (bpf_get_current_uid_gid() & 0xffff_ffff) as u32;
     let key = ((uid as u64) << 32) | (tgid as u64);
 
+    // El destino se lee una sola vez acá: lo usan el match por dominio y la
+    // emisión del evento.
+    let (dst, port, proto) = destino(ctx, family);
+
+    // M0 — kill-switch de red por app. Si el pid está en DENY, se corta.
     // SAFETY: `HashMap::get` del lado BPF es unsafe por contrato; la clave es un
     // `u64` por valor y el acceso no sale del mapa.
-    let bloqueado = matches!(unsafe { BLOCKED.get(&key) }, Some(&policy) if policy == DENY);
+    let kill_switch = matches!(unsafe { BLOCKED.get(&key) }, Some(&policy) if policy == DENY);
+
+    // M2 — bloqueo por dominio, ADITIVO a M0. Sólo pega si el daemon metió esta
+    // (clave de pid, IP) en `DOMAIN_BLOCKED` —cosa que hace únicamente para los
+    // pids de binarios con una regla de dominio—. Con el mapa vacío (sin reglas)
+    // este `get` falla siempre y el veredicto es el mismo que el de M0.
+    // SAFETY: igual que arriba; la clave es un `repr(C)` por valor y el acceso no
+    // sale del mapa.
+    let domain_key = DomainKey {
+        pid_key: key,
+        ip: dst,
+    };
+    let dominio_bloqueado =
+        matches!(unsafe { DOMAIN_BLOCKED.get(&domain_key) }, Some(&policy) if policy == DENY);
+
+    let bloqueado = kill_switch || dominio_bloqueado;
 
     // Después del veredicto y sin tocarlo: la emisión es observacional.
-    emit(ctx, uid, tgid, family, bloqueado);
+    emit(uid, tgid, family, dst, port, proto, bloqueado);
 
     if bloqueado {
         BLOCK
@@ -125,14 +179,11 @@ fn handle(ctx: &SockAddrContext, family: u8) -> i32 {
     }
 }
 
-/// Emite el evento de la conexión al ring buffer. Si está lleno, no hace nada: el
-/// mapa en vivo nunca demora ni altera el `connect()`.
+/// Lee el destino del `connect()` del contexto: la IP en 16 bytes (IPv4 en los
+/// primeros 4, los 16 de IPv6), el puerto en orden de host y el protocolo. Se lee
+/// una vez y lo comparten el match por dominio y [`emit`].
 #[inline(always)]
-fn emit(ctx: &SockAddrContext, uid: u32, tgid: u32, family: u8, bloqueado: bool) {
-    let Some(mut slot) = EVENTS.reserve::<ConnectionEvent>(0) else {
-        return;
-    };
-
+fn destino(ctx: &SockAddrContext, family: u8) -> ([u8; 16], u16, u8) {
     let sa = ctx.sock_addr;
     // SAFETY: `sock_addr` es el contexto del hook, válido mientras corre el
     // programa; `user_ip4`/`user_ip6`/`user_port`/`protocol` son de lectura
@@ -165,6 +216,17 @@ fn emit(ctx: &SockAddrContext, uid: u32, tgid: u32, family: u8, bloqueado: bool)
     };
     // `user_port` trae el puerto en orden de red en sus 16 bits bajos; a host.
     let port = u16::from_be((port_raw & 0xffff) as u16);
+    (dst, port, proto)
+}
+
+/// Emite el evento de la conexión al ring buffer. Si está lleno, no hace nada: el
+/// mapa en vivo nunca demora ni altera el `connect()`. No devuelve nada y no toca
+/// el veredicto: sólo observa.
+#[inline(always)]
+fn emit(uid: u32, tgid: u32, family: u8, dst: [u8; 16], port: u16, proto: u8, bloqueado: bool) {
+    let Some(mut slot) = EVENTS.reserve::<ConnectionEvent>(0) else {
+        return;
+    };
 
     // SAFETY: `reserve` entregó memoria alineada para un `ConnectionEvent`; se
     // escriben **todos** los campos antes de `submit`, así que nada queda sin

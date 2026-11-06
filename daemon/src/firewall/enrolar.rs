@@ -96,6 +96,13 @@ pub type RedCortada = Arc<Mutex<HashMap<u32, HashSet<String>>>>;
 pub struct Contexto<M: MotorBpf = MotorAya> {
     pub enforcer: Arc<Mutex<Option<Enforcer<M>>>>,
     pub red: RedCortada,
+    /// La política de bloqueo por dominio (M2): `uid → binary → {dominios}`. La
+    /// consulta `atender_evento` en cada exec/fork para enrolar los pids de un
+    /// binario con regla de dominio.
+    pub dominios: super::dominio::DominiosBloqueados,
+    /// El snoop de DNS (M2): `(uid, IP) → dominio`. De acá salen las IPs a cortar
+    /// para un dominio bloqueado. El daemon nunca resuelve, sólo observa.
+    pub dns: super::dns::ModeloDnsCompartido,
 }
 
 // `Clone` a mano: `#[derive(Clone)]` exigiría `M: Clone`, y el enforcer no lo es
@@ -105,6 +112,8 @@ impl<M: MotorBpf> Clone for Contexto<M> {
         Self {
             enforcer: Arc::clone(&self.enforcer),
             red: Arc::clone(&self.red),
+            dominios: Arc::clone(&self.dominios),
+            dns: Arc::clone(&self.dns),
         }
     }
 }
@@ -134,7 +143,7 @@ pub fn fijar(red: &RedCortada, uid: u32, binary: &str, cortado: bool) {
 /// El uid real y el ejecutable canonicalizado de un pid vivo, o `None` si ya no
 /// está. El ejecutable se canonicaliza para que coincida con la ruta que guarda
 /// la política (que también la canonicaliza en `PinnedCaller`).
-fn identidad_de(pid: u32) -> Option<(u32, String)> {
+pub(crate) fn identidad_de(pid: u32) -> Option<(u32, String)> {
     let uid = crate::procesos::uid_real_de(pid)?;
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -177,6 +186,11 @@ pub fn atender_evento<M: MotorBpf>(ctx: &Contexto<M>, evento: Evento, pid: u32) 
     };
     let cortado = esta_cortado(&ctx.red, uid, &exe);
     aplicar(ctx, decidir(evento, cortado), uid, pid);
+
+    // M2 — bloqueo por dominio: enrola/reconcilia los pids de un binario con regla
+    // de dominio con las IPs que el snoop resolvió. Para un binario sin reglas y un
+    // pid no enrolado no hace nada. Aditivo al kill-switch de M0 de arriba.
+    super::dominio::reconciliar_pid(ctx, uid, pid, &exe, super::dominio::ahora_epoch());
 }
 
 /// Barre `/proc` y devuelve `pid → uid` de los procesos vivos cuyo ejecutable
@@ -287,6 +301,8 @@ mod tests {
         Contexto {
             enforcer: Arc::new(Mutex::new(Some(crate::firewall::enforcer_falso()))),
             red,
+            dominios: super::super::dominio::dominios_bloqueados_nuevo(HashMap::new()),
+            dns: super::super::dns::modelo_dns_nuevo(),
         }
     }
 
@@ -374,6 +390,8 @@ mod tests {
         let ctx: Contexto = Contexto {
             enforcer: Arc::new(Mutex::new(None)),
             red,
+            dominios: super::super::dominio::dominios_bloqueados_nuevo(HashMap::new()),
+            dns: super::super::dns::modelo_dns_nuevo(),
         };
         atender_evento(&ctx, Evento::Exec, std::process::id());
         atender_evento(&ctx, Evento::Exit, std::process::id());
@@ -467,6 +485,8 @@ mod tests {
         let ctx = Contexto {
             enforcer: Arc::new(Mutex::new(Some(enf))),
             red,
+            dominios: super::super::dominio::dominios_bloqueados_nuevo(HashMap::new()),
+            dns: super::super::dns::modelo_dns_nuevo(),
         };
         atender_evento(&ctx, Evento::Exec, std::process::id());
         assert_eq!(ctx.enforcer.lock().unwrap().as_ref().unwrap().marcados(), 0);

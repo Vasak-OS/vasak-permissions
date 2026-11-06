@@ -85,6 +85,15 @@ struct PermissionService {
     /// la foto filtrada por uid y nada se persiste. Queda vacío si el cortafuegos
     /// no se cargó (el lector no se lanza).
     modelo: firewall::conexiones::ModeloCompartido,
+    /// La política de bloqueo por dominio en memoria (M2 del #93): `uid → binary →
+    /// {dominios}`, compartida con el conector de procesos y el snoop de DNS.
+    /// `SetDomainRule` la actualiza para que los `exec` y las respuestas de DNS
+    /// futuras vean el cambio sin releer el disco.
+    dominios: firewall::dominio::DominiosBloqueados,
+    /// El snoop de DNS (M2): `(uid, IP) → dominio`. De acá salen las IPs que el
+    /// bloqueo por dominio corta. Compartido con el hilo del snoop, que lo puebla,
+    /// y con la resincronización de `SetDomainRule`, que lo lee.
+    dns: firewall::dns::ModeloDnsCompartido,
 }
 
 /// Rejects anything this service cannot honour.
@@ -518,14 +527,68 @@ impl PermissionService {
     /// no hace nada (el enforcer compartido está en `None`).
     async fn sincronizar_red(&self, uid: u32, binary_path: String, cortado: bool) {
         firewall::enrolar::fijar(&self.red, uid, &binary_path, cortado);
-        let ctx = firewall::enrolar::Contexto {
-            enforcer: Arc::clone(&self.enforcer),
-            red: Arc::clone(&self.red),
-        };
+        let ctx = self.contexto_cortafuegos();
         if let Err(e) =
             tokio::task::spawn_blocking(move || firewall::enrolar::resincronizar(&ctx)).await
         {
             tracing::error!("No se pudo resincronizar el cortafuegos: {e}");
+        }
+    }
+
+    /// El contexto del cortafuegos para los barridos: todo lo que `enrolar` y
+    /// `dominio` necesitan, con cada pieza clonada del servicio (son `Arc`).
+    fn contexto_cortafuegos(&self) -> firewall::enrolar::Contexto {
+        firewall::enrolar::Contexto {
+            enforcer: Arc::clone(&self.enforcer),
+            red: Arc::clone(&self.red),
+            dominios: Arc::clone(&self.dominios),
+            dns: Arc::clone(&self.dns),
+        }
+    }
+
+    /// Guarda una regla de bloqueo por dominio y la lleva al cortafuegos. Separado
+    /// de `set_domain_rule` para poder probar la lógica sin un bus, como
+    /// `guardar_red`. Devuelve `Ok` sin tocar nada si la regla ya estaba como se
+    /// pide (no reescribe el archivo ni resincroniza de gusto).
+    async fn guardar_dominio(
+        &self,
+        uid: u32,
+        binary_path: String,
+        domain: String,
+        blocked: bool,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut policy = self.store.load(uid).map_err(FdoError::Failed)?;
+            if !policy.set_domain_rule(&binary_path, &domain, blocked) {
+                return Ok(()); // ya estaba así: nada que guardar ni resincronizar
+            }
+            self.store.save(uid, &policy).map_err(FdoError::Failed)?;
+        }
+        self.sincronizar_dominio(uid, binary_path, domain, blocked)
+            .await;
+        Ok(())
+    }
+
+    /// Lleva el cambio de una regla de dominio al cortafuegos: actualiza el modelo
+    /// en memoria (para los `exec` y las respuestas de DNS futuras) y barre `/proc`
+    /// para enrolar los pids vivos del binario que ahora la tiene o limpiar los que
+    /// la perdieron, para que la regla tenga efecto sin reiniciar la app. El barrido
+    /// corre en `spawn_blocking`, como el de red.
+    async fn sincronizar_dominio(
+        &self,
+        uid: u32,
+        binary_path: String,
+        domain: String,
+        blocked: bool,
+    ) {
+        firewall::dominio::fijar(&self.dominios, uid, &binary_path, &domain, blocked);
+        let ctx = self.contexto_cortafuegos();
+        let ahora = firewall::dominio::ahora_epoch();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || firewall::dominio::resincronizar(&ctx, ahora)).await
+        {
+            tracing::error!("No se pudo resincronizar el bloqueo por dominio: {e}");
         }
     }
 }
@@ -1012,6 +1075,68 @@ impl PermissionService {
     #[zbus(signal)]
     async fn connection_observed(emisor: &SignalEmitter<'_>, uid: u32) -> zbus::Result<()>;
 
+    /// Prende o apaga una regla de **bloqueo por dominio** por aplicación (M2 del
+    /// #93): a `binary_path` se le corta (o se le restaura) el egreso al `domain`.
+    ///
+    /// Detrás de polkit, como todo lo que cambia la política —y por el mismo motivo
+    /// que `SetPermission`: sin él una aplicación podría escribirse o borrarse sus
+    /// propias reglas—. La identidad del llamante (su uid) sale de la conexión, no
+    /// de un argumento, así que la regla se guarda contra **su** política y nadie
+    /// puede tocar la de otro usuario.
+    ///
+    /// El `domain` se normaliza y se valida ([`vasak_permissions_protocol::valid_domain`]):
+    /// una entrada que no es un nombre de host se rechaza antes de tocar nada. La
+    /// regla es sobre la **ruta de un ejecutable** (hay pids que enrolar), no sobre
+    /// una identidad del portal.
+    ///
+    /// El daemon es quien resuelve el dominio a IPs y puebla el mapa BPF, desde el
+    /// snoop de DNS; este método **nunca** recibe una IP, sólo el dominio. Nada del
+    /// tráfico se persiste: sólo la regla.
+    async fn set_domain_rule(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        binary_path: String,
+        domain: String,
+        blocked: bool,
+    ) -> zbus::fdo::Result<()> {
+        // Una regla de dominio es sobre un ejecutable con pid, no sobre una
+        // identidad del portal (que no tiene proceso que enrolar).
+        if vasak_permissions_protocol::is_portal_key(&binary_path) || !binary_path.starts_with('/')
+        {
+            return Err(FdoError::InvalidArgs(format!(
+                "una regla de bloqueo por dominio necesita la ruta de un ejecutable, \
+                 no «{binary_path}»"
+            )));
+        }
+        let Some(domain) = vasak_permissions_protocol::valid_domain(&domain) else {
+            return Err(FdoError::InvalidArgs(format!(
+                "«{domain}» no es un dominio válido"
+            )));
+        };
+
+        let caller = caller_of(connection, &header).await?;
+        polkit::authorize(connection, &caller).await?;
+
+        self.guardar_dominio(caller.uid, binary_path, domain, blocked)
+            .await
+    }
+
+    /// Las reglas de bloqueo por dominio del **usuario que llama**, como JSON (una
+    /// fila `(binary_path, domain)` por regla). Filtradas por su uid por
+    /// construcción: se carga su propia política, igual que `ListConnections` sólo
+    /// le da sus conexiones. Un cliente nunca ve las reglas de otra persona.
+    async fn list_domain_rules(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let caller = caller_of(connection, &header).await?;
+        let policy = self.store.load(caller.uid).map_err(FdoError::Failed)?;
+        serde_json::to_string(&policy.domain_rules())
+            .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
     /// Permite exactamente lo que se bloqueó: ese perfil, esa ruta, esos
     /// permisos.
     ///
@@ -1229,6 +1354,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(std::sync::Mutex::new(enforcer_inicial));
     let red: firewall::enrolar::RedCortada =
         Arc::new(std::sync::Mutex::new(store.red_cortada_inicial()));
+    // La política de bloqueo por dominio (M2), proyectada de la política guardada,
+    // y el snoop de DNS que la hace cumplir: el modelo `(uid, IP) → dominio` que el
+    // hilo del snoop puebla y del que salen las IPs a cortar. Se crean acá —no
+    // dentro del lector del ring— porque el conector de procesos y `SetDomainRule`
+    // los necesitan aunque el mapa en vivo no se lance.
+    let dominios: firewall::dominio::DominiosBloqueados =
+        firewall::dominio::dominios_bloqueados_nuevo(store.domain_rules_initial());
+    let dns = firewall::dns::modelo_dns_nuevo();
 
     let service = PermissionService {
         store,
@@ -1241,6 +1374,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enforcer: Arc::clone(&enforcer),
         red: Arc::clone(&red),
         modelo: Arc::clone(&modelo),
+        dominios: Arc::clone(&dominios),
+        dns: Arc::clone(&dns),
     };
 
     let connection = service_bus()?
@@ -1267,14 +1402,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let contexto = firewall::enrolar::Contexto {
         enforcer: Arc::clone(&enforcer),
         red: Arc::clone(&red),
+        dominios: Arc::clone(&dominios),
+        dns: Arc::clone(&dns),
     };
-    // Barrido inicial de `/proc`: corta los pids vivos que la política ya marca,
-    // antes de empezar a confiar en el conector. En `spawn_blocking` para no
-    // bloquear el runtime con el recorrido de `/proc`.
+    // Barrido inicial de `/proc`: corta los pids vivos que la política ya marca
+    // (M0) y enrola los de binarios con regla de dominio (M2, con el conjunto de
+    // IPs vacío hasta que el snoop resuelva), antes de empezar a confiar en el
+    // conector. En `spawn_blocking` para no bloquear el runtime con `/proc`.
     let contexto_inicial = contexto.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || firewall::enrolar::resincronizar(&contexto_inicial))
+    let _ = tokio::task::spawn_blocking(move || {
+        firewall::enrolar::resincronizar(&contexto_inicial);
+        firewall::dominio::resincronizar(&contexto_inicial, firewall::dominio::ahora_epoch());
+    })
+    .await;
+    // Barrido periódico de TTL del bloqueo por dominio: baja las IPs cuyo snoop
+    // venció. Sin esto, una IP que dejó de resolver el dominio seguiría cortada
+    // hasta el próximo evento del binario. Cada 30 s; `barrer` sólo toca mutexes.
+    let contexto_barrido = contexto.clone();
+    tokio::spawn(async move {
+        let mut tic = tokio::time::interval(std::time::Duration::from_secs(30));
+        tic.tick().await; // la primera es inmediata; se descarta
+        loop {
+            tic.tick().await;
+            let ctx = contexto_barrido.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                firewall::dominio::barrer(&ctx, firewall::dominio::ahora_epoch())
+            })
             .await;
+        }
+    });
     std::thread::spawn(move || procesos::escuchar(procesos_para_el_hilo, Some(contexto)));
 
     // El lector del mapa en vivo (M1/M2): lee el ring buffer `EVENTS`, enriquece
@@ -1283,21 +1439,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // enforcement sigue y el mapa en vivo queda vacío. Degrada ruidoso sin tumbar el
     // servicio.
     if let Some(ring) = ring_eventos {
-        // El snoop de DNS (M2): un modelo `(uid, IP) → dominio` que puebla un hilo
-        // leyendo las respuestas DNS por NFLOG, y que el lector del ring consulta
-        // para enriquecer cada conexión. Observacional y sólo en memoria. El hilo
-        // degrada ruidoso si no puede instalar la regla (sin `nft`/CAP_NET_ADMIN):
-        // el mapa sigue andando, sin dominios. Se lanza junto al lector porque sin
-        // él nada consume el modelo del snoop.
-        let dns = firewall::dns::modelo_dns_nuevo();
+        // El snoop de DNS: un hilo que lee las respuestas DNS por NFLOG y puebla el
+        // modelo `(uid, IP) → dominio`. Lo consumen dos cosas: el lector del ring,
+        // que enriquece cada conexión con el dominio (M1), y el **bloqueo por
+        // dominio** (M2), al que el snoop le empuja las IPs recién resueltas por el
+        // `contexto`. Observacional y sólo en memoria. Degrada ruidoso si no puede
+        // instalar la regla (sin `nft`/CAP_NET_ADMIN): el mapa sigue, sin dominios.
         let dns_para_el_hilo = Arc::clone(&dns);
-        std::thread::spawn(move || firewall::dns::escuchar(dns_para_el_hilo));
+        let contexto_snoop = firewall::enrolar::Contexto {
+            enforcer: Arc::clone(&enforcer),
+            red: Arc::clone(&red),
+            dominios: Arc::clone(&dominios),
+            dns: Arc::clone(&dns),
+        };
+        std::thread::spawn(move || firewall::dns::escuchar(dns_para_el_hilo, Some(contexto_snoop)));
         tokio::spawn(firewall::mapa::escuchar(
             ring,
             connection.clone(),
             Arc::clone(&modelo),
             Arc::clone(&procesos),
-            dns,
+            Arc::clone(&dns),
         ));
     }
 
@@ -1490,6 +1651,8 @@ mod tests_interfaz {
             enforcer: Arc::new(std::sync::Mutex::new(None)),
             red: Arc::new(std::sync::Mutex::new(Default::default())),
             modelo: firewall::conexiones::modelo_nuevo(),
+            dominios: firewall::dominio::dominios_bloqueados_nuevo(Default::default()),
+            dns: firewall::dns::modelo_dns_nuevo(),
         }
     }
 
@@ -1520,6 +1683,24 @@ mod tests_interfaz {
             "la señal lleva un solo argumento: {senal}"
         );
         assert!(senal.contains(r#"type="u""#), "{senal}");
+    }
+
+    /// El bloqueo por dominio (M2) expone `SetDomainRule` y `ListDomainRules` con
+    /// las firmas que la pantalla arma: setear toma `(binary_path, domain, blocked)`
+    /// y no devuelve nada; listar no toma nada y devuelve JSON (`s`). La IP nunca
+    /// aparece: el daemon la resuelve del snoop, no la recibe.
+    #[test]
+    fn el_bloqueo_por_dominio_expone_setear_y_listar_con_su_firma() {
+        let xml = introspeccion();
+
+        let setear = bloque_del_metodo(&xml, "SetDomainRule");
+        // Dos cadenas (ruta, dominio) y un booleano, en ese orden; nada de salida.
+        assert_eq!(entradas(&setear), vec!["s", "s", "b"], "{setear}");
+        assert!(salidas(&setear).is_empty(), "{setear}");
+
+        let listar = bloque_del_metodo(&xml, "ListDomainRules");
+        assert!(entradas(&listar).is_empty(), "{listar}");
+        assert_eq!(salidas(&listar), vec!["s"], "{listar}");
     }
 
     /// La interfaz exporta los nombres que el agente llama.
@@ -1724,6 +1905,8 @@ mod tests_reask {
             enforcer: Arc::new(std::sync::Mutex::new(None)),
             red: Arc::new(std::sync::Mutex::new(Default::default())),
             modelo: firewall::conexiones::modelo_nuevo(),
+            dominios: firewall::dominio::dominios_bloqueados_nuevo(Default::default()),
+            dns: firewall::dns::modelo_dns_nuevo(),
         }
     }
 
@@ -2045,5 +2228,140 @@ mod tests_reask {
         );
         // Ningún otro camino del servicio llega al cortafuegos sin pasar por acá.
         assert_eq!(fuente.matches("self.guardar_red(").count(), 1);
+    }
+
+    /// `guardar_dominio` guarda la regla, actualiza el modelo en memoria y
+    /// resincroniza sin romperse con el cortafuegos en `None`. Es el cuerpo de
+    /// `SetDomainRule` sin el bus. Prender agrega la regla; apagar la saca.
+    #[tokio::test]
+    async fn guardar_dominio_guarda_la_regla_y_mantiene_el_modelo() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-mail";
+
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), true)
+            .await
+            .expect("prender la regla tiene que guardar y sincronizar");
+        // Quedó en la política guardada.
+        let reglas = service.store.load(1000).unwrap().domain_rules();
+        assert!(reglas
+            .iter()
+            .any(|r| r.binary_path == binary && r.domain == "ads.com"));
+        // Y en el modelo en memoria que consulta el cortafuegos.
+        assert_eq!(
+            firewall::dominio::dominios_de(&service.dominios, 1000, binary),
+            ["ads.com".to_string()].into()
+        );
+
+        // Apagar la saca de los dos lados.
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), false)
+            .await
+            .expect("apagar la regla tiene que guardar y sincronizar");
+        assert!(service.store.load(1000).unwrap().domain_rules().is_empty());
+        assert!(firewall::dominio::dominios_de(&service.dominios, 1000, binary).is_empty());
+    }
+
+    /// Pedir una regla que ya estaba como se pide no reescribe ni rompe: devuelve
+    /// `Ok` sin tocar nada.
+    #[tokio::test]
+    async fn guardar_dominio_idempotente_no_rompe() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-mail";
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), true)
+            .await
+            .expect("prender");
+        // Prenderla de nuevo: Ok, sin cambios.
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), true)
+            .await
+            .expect("idempotente");
+        assert_eq!(service.store.load(1000).unwrap().domain_rules().len(), 1);
+    }
+
+    /// F4: en `SetDomainRule` la regla sólo se persiste tras autorizar con polkit, y
+    /// `guardar_dominio` recibe el uid del llamante identificado, nunca uno de un
+    /// argumento. Igual que la red, se vigila el orden en la fuente (no hay bus en
+    /// las pruebas).
+    #[test]
+    fn la_regla_de_dominio_se_aplica_solo_tras_autorizar() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        let inicio = fuente
+            .find("async fn set_domain_rule(")
+            .expect("set_domain_rule");
+        let cuerpo = &fuente[inicio..];
+        let fin = cuerpo
+            .find(
+                "
+    }
+",
+            )
+            .expect("fin de set_domain_rule");
+        let cuerpo = &cuerpo[..fin];
+        let autorizar = cuerpo
+            .find("polkit::authorize(")
+            .expect("polkit en set_domain_rule");
+        let llamada = cuerpo
+            .find("self.guardar_dominio(")
+            .expect("guardar_dominio en set_domain_rule");
+        assert!(autorizar < llamada, "guardar_dominio corre tras polkit");
+        assert!(
+            cuerpo.contains("self.guardar_dominio(caller.uid,"),
+            "el uid tiene que venir del llamante identificado"
+        );
+        assert_eq!(fuente.matches("self.guardar_dominio(").count(), 1);
+    }
+
+    /// F4, la otra mitad: el llamante se identifica antes de autorizar, y la firma
+    /// de `SetDomainRule`/`ListDomainRules` no ofrece un `uid` que el cliente pueda
+    /// elegir.
+    #[test]
+    fn el_bloqueo_por_dominio_no_acepta_uid_del_cliente() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        for metodo in ["async fn set_domain_rule(", "async fn list_domain_rules("] {
+            let desde = fuente.find(metodo).expect(metodo);
+            let firma = &fuente[desde..desde + fuente[desde..].find(") ->").unwrap()];
+            assert!(!firma.contains("uid"), "{metodo} recibe un uid: {firma}");
+        }
+        let desde = fuente.find("async fn set_domain_rule(").unwrap();
+        let cuerpo = &fuente[desde..];
+        assert!(
+            cuerpo.find("caller_of(").unwrap() < cuerpo.find("polkit::authorize(").unwrap(),
+            "hay que identificar al llamante antes de autorizar"
+        );
+    }
+
+    /// `ListDomainRules` sólo lee la política del uid del llamante.
+    #[test]
+    fn listar_reglas_de_dominio_lee_solo_la_politica_del_llamante() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        let desde = fuente.find("async fn list_domain_rules(").unwrap();
+        let cuerpo = &fuente[desde..];
+        let cuerpo = &cuerpo[..cuerpo.find("\n    }\n").unwrap()];
+        assert!(cuerpo.contains("self.store.load(caller.uid)"), "{cuerpo}");
+        assert_eq!(cuerpo.matches(".load(").count(), 1);
+    }
+
+    /// Las reglas son por usuario: lo que prende el uid 1000 no aparece en la
+    /// política ni en el modelo del uid 1001.
+    #[tokio::test]
+    async fn la_regla_de_un_usuario_no_se_ve_ni_aplica_a_otro() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-mail";
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(service.store.load(1000).unwrap().domain_rules().len(), 1);
+        assert!(service.store.load(1001).unwrap().domain_rules().is_empty());
+        assert!(firewall::dominio::dominios_de(&service.dominios, 1001, binary).is_empty());
     }
 }

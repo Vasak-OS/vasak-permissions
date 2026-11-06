@@ -264,6 +264,20 @@ impl ModeloDns {
             .map(|e| e.dominio.clone())
     }
 
+    /// Las IPs **no vencidas** que `uid` resolvió para `dominio` (M2). Es el otro
+    /// lado de [`Self::dominio_de`]: el bloqueo por dominio pregunta «qué IPs son
+    /// este dominio para este usuario» para cortárselas a los pids del binario con
+    /// la regla. La comparación ignora la caja porque el DNS es insensible a ella.
+    pub fn ips_de(&self, uid: u32, dominio: &str, ahora: u64) -> Vec<String> {
+        self.registros
+            .iter()
+            .filter(|((u, _), e)| {
+                *u == uid && e.vence > ahora && e.dominio.eq_ignore_ascii_case(dominio)
+            })
+            .map(|((_, ip), _)| ip.clone())
+            .collect()
+    }
+
     /// Saca la entrada que vence antes, para hacer lugar a una nueva.
     fn desalojar_el_que_vence_antes(&mut self) {
         if let Some(clave) = self
@@ -501,7 +515,13 @@ fn mensaje_config(grupo: u16, tipo_attr: u16, valor: &[u8]) -> Vec<u8> {
 /// modelo. Se lanza en un hilo propio (bloqueante, como el conector de
 /// `procesos.rs`). Degrada ruidoso: si la regla no se instala o el socket no abre,
 /// se registra y se sale —el mapa en vivo sigue, sin dominios—.
-pub fn escuchar(modelo: ModeloDnsCompartido) {
+///
+/// `contexto` conecta el snoop con el **bloqueo por dominio** (M2): cuando ve
+/// resolver un dominio que algún binario bloquea, empuja las IPs recién resueltas
+/// al corte de los pids de ese binario. `None` lo deja como puro snoop del mapa en
+/// vivo (M1), sin aplicar reglas. El `contexto.dns` tiene que ser el mismo
+/// `modelo` que se puebla acá, para que la IP recién anotada ya esté al empujar.
+pub fn escuchar(modelo: ModeloDnsCompartido, contexto: Option<super::enrolar::Contexto>) {
     if !instalar_regla() {
         return;
     }
@@ -592,7 +612,12 @@ pub fn escuchar(modelo: ModeloDnsCompartido) {
             if remitente.nl_pid != 0 {
                 continue; // no vino del kernel
             }
-            procesar_tanda(&buffer[..leidos as usize], &modelo, ahora_epoch());
+            procesar_tanda(
+                &buffer[..leidos as usize],
+                &modelo,
+                contexto.as_ref(),
+                ahora_epoch(),
+            );
             continue;
         }
         if leidos < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -607,7 +632,12 @@ pub fn escuchar(modelo: ModeloDnsCompartido) {
 /// Recorre los mensajes netlink de una lectura y vuelca al modelo las respuestas
 /// DNS de los que son paquetes NFLOG. Separado para no repetir la aritmética de
 /// `nlmsg_len` y para poder probar el volcado sin socket.
-fn procesar_tanda(buffer: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
+fn procesar_tanda(
+    buffer: &[u8],
+    modelo: &ModeloDnsCompartido,
+    contexto: Option<&super::enrolar::Contexto>,
+    ahora: u64,
+) {
     let mut off = 0;
     while off + 16 <= buffer.len() {
         let len = u32::from_ne_bytes([
@@ -621,7 +651,7 @@ fn procesar_tanda(buffer: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
         }
         let tipo = u16::from_ne_bytes([buffer[off + 4], buffer[off + 5]]);
         if (tipo >> 8) == NFNL_SUBSYS_ULOG && (tipo & 0xFF) == NFULNL_MSG_PACKET {
-            volcar_mensaje(&buffer[off..off + len], modelo, ahora);
+            volcar_mensaje(&buffer[off..off + len], modelo, contexto, ahora);
         }
         off += (len + 3) & !3; // NLMSG_ALIGN
     }
@@ -630,7 +660,16 @@ fn procesar_tanda(buffer: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
 /// Destripa un mensaje NFLOG, parsea su respuesta DNS y la anota en el modelo,
 /// atribuida al uid del socket. Se descarta lo que no se pueda atribuir a un uid
 /// local: sin él no hay clave `(uid, IP)` que una app vaya a consultar.
-fn volcar_mensaje(nlmsg: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
+///
+/// Si hay `contexto` (M2), además empuja las IPs recién resueltas al bloqueo por
+/// dominio: se suelta el candado del modelo antes de reconciliar, así que no se
+/// sostiene a través del candado del enforcer.
+fn volcar_mensaje(
+    nlmsg: &[u8],
+    modelo: &ModeloDnsCompartido,
+    contexto: Option<&super::enrolar::Contexto>,
+    ahora: u64,
+) {
     let Some((Some(uid), dns)) = dns_de_nflog(nlmsg) else {
         return;
     };
@@ -639,6 +678,9 @@ fn volcar_mensaje(nlmsg: &[u8], modelo: &ModeloDnsCompartido, ahora: u64) {
     };
     if let Ok(mut m) = modelo.lock() {
         m.observar(uid, &respuesta, ahora);
+    }
+    if let Some(ctx) = contexto {
+        super::dominio::reconciliar_dominio(ctx, uid, &respuesta.dominio, ahora);
     }
 }
 
@@ -1066,7 +1108,7 @@ mod tests {
         let mut roto = vec![0u8; 16];
         roto[0..4].copy_from_slice(&9999u32.to_ne_bytes());
         tanda.extend(roto);
-        procesar_tanda(&tanda, &modelo, 100);
+        procesar_tanda(&tanda, &modelo, None, 100);
 
         let m = modelo.lock().unwrap();
         assert_eq!(m.dominio_de(1000, "192.0.2.1", 101), Some("uno.com".into()));
@@ -1224,7 +1266,7 @@ mod tests {
             &["www", "example", "com"],
             &[(TIPO_A, 300, vec![93, 184, 216, 34])],
         );
-        procesar_tanda(&nflog(Some(1000), &ipv4_udp(&dns)), &modelo, 100);
+        procesar_tanda(&nflog(Some(1000), &ipv4_udp(&dns)), &modelo, None, 100);
 
         let dominio = modelo
             .lock()
@@ -1246,7 +1288,7 @@ mod tests {
     fn una_respuesta_sin_uid_no_entra_al_modelo() {
         let modelo = modelo_dns_nuevo();
         let dns = respuesta(&["x", "com"], &[(TIPO_A, 300, vec![1, 2, 3, 4])]);
-        procesar_tanda(&nflog(None, &ipv4_udp(&dns)), &modelo, 100);
+        procesar_tanda(&nflog(None, &ipv4_udp(&dns)), &modelo, None, 100);
         assert_eq!(modelo.lock().unwrap().dominio_de(0, "1.2.3.4", 101), None);
     }
 

@@ -25,6 +25,28 @@ const DENY: u8 = 1;
 /// el parser del daemon usa los mismos desplazamientos.
 const EVENTO_LEN: usize = 32;
 
+/// La clave de `DOMAIN_BLOCKED`, igual que en el daemon y el programa BPF:
+/// `(uid << 32 | pid)` más la IP de destino en 16 bytes. `repr(C)` + `Pod` para
+/// que aya la escriba como clave cruda.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DomainKey {
+    pid_key: u64,
+    ip: [u8; 16],
+}
+
+// SAFETY: `repr(C)`, `Copy`, sin punteros: cualquier secuencia de bytes de su
+// tamaño es válida, que es lo que `aya::Pod` exige.
+unsafe impl aya::Pod for DomainKey {}
+
+/// La IPv4 en los 16 bytes del mapa, como la arma `connect4`: octetos primero,
+/// cero el resto.
+fn ip16(ip: [u8; 4]) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[..4].copy_from_slice(&ip);
+    v
+}
+
 /// El objeto commiteado, el mismo que embebe el daemon. `include_bytes_aligned!`
 /// (no `include_bytes!`): el parser de aya exige el ELF alineado, y los bytes de
 /// un `include_bytes!` a secas pueden quedar desalineados y hacer fallar la carga.
@@ -47,6 +69,12 @@ fn clave(uid: u32, pid: u32) -> u64 {
 /// y no bloqueante, devuelve `EINPROGRESS` u otro, nunca `EPERM`: ese es el
 /// discriminante.
 fn errno_de_connect() -> i32 {
+    errno_de_connect_a([192, 0, 2, 1])
+}
+
+/// Igual, pero a una IP de destino cualquiera (dentro de TEST-NET, que no rutea),
+/// para distinguir qué destino corta el bloqueo por dominio y cuál no.
+fn errno_de_connect_a(ip: [u8; 4]) -> i32 {
     // SAFETY: llamadas a la API de sockets de POSIX con argumentos válidos; el
     // descriptor se cierra antes de salir.
     unsafe {
@@ -57,7 +85,7 @@ fn errno_de_connect() -> i32 {
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
         addr.sin_port = 80u16.to_be();
-        addr.sin_addr.s_addr = u32::from_be_bytes([192, 0, 2, 1]).to_be();
+        addr.sin_addr.s_addr = u32::from_be_bytes(ip).to_be();
         let r = libc::connect(
             fd,
             &addr as *const _ as *const libc::sockaddr,
@@ -171,5 +199,87 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
     assert!(
         vio_bloqueado_al_80,
         "no se observó el connect bloqueado al 192.0.2.1:80 en el mapa en vivo"
+    );
+
+    // ── Bloqueo por dominio (M2): corte por (clave de pid, IP) ────────────────
+    //
+    // El daemon mete una `(clave de pid, IP)` en `DOMAIN_BLOCKED` por una regla de
+    // dominio (resuelve el dominio a esa IP desde el snoop). El programa corta el
+    // `connect()` de **ese** pid a **esa** IP, y a nada más. Acá se escribe el mapa
+    // a mano —como lo haría el daemon tras resolver el dominio— y se comprueba la
+    // granularidad por binario: la regla de otra app (otro pid) del mismo uid no
+    // alcanza a este proceso. El kill-switch de M0 ya se quitó arriba, así que lo
+    // único que puede cortar es la regla de dominio.
+    let ip_bloqueada = [192, 0, 2, 50];
+    let ip_libre = [192, 0, 2, 51];
+    let ip_de_otro = [192, 0, 2, 52];
+    let otro_pid = pid.wrapping_add(1);
+    {
+        let mapa = ebpf
+            .map_mut("DOMAIN_BLOCKED")
+            .expect("falta el mapa DOMAIN_BLOCKED");
+        let mut dominio: BpfHashMap<_, DomainKey, u8> =
+            BpfHashMap::try_from(mapa).expect("DOMAIN_BLOCKED no es un HashMap");
+        // La IP del dominio bloqueado, para ESTE pid.
+        dominio
+            .insert(
+                DomainKey {
+                    pid_key: key,
+                    ip: ip16(ip_bloqueada),
+                },
+                DENY,
+                0,
+            )
+            .expect("no se pudo marcar la IP del dominio");
+        // La misma clase de regla, pero anotada contra OTRO pid (otra app del mismo
+        // uid): no debe alcanzar a este proceso.
+        dominio
+            .insert(
+                DomainKey {
+                    pid_key: clave(uid, otro_pid),
+                    ip: ip16(ip_de_otro),
+                },
+                DENY,
+                0,
+            )
+            .expect("no se pudo marcar la IP de otro pid");
+    }
+
+    assert_eq!(
+        errno_de_connect_a(ip_bloqueada),
+        libc::EPERM,
+        "el connect de un pid enrolado a la IP de su dominio bloqueado tiene que cortarse"
+    );
+    assert_ne!(
+        errno_de_connect_a(ip_libre),
+        libc::EPERM,
+        "una IP sin regla no se corta: sólo la del dominio bloqueado"
+    );
+    // El corazón de la granularidad por binario: la IP cortada para OTRO pid NO
+    // corta a este, aunque compartan uid.
+    assert_ne!(
+        errno_de_connect_a(ip_de_otro),
+        libc::EPERM,
+        "la regla de otra app (otro pid) del mismo uid no puede alcanzar a este proceso"
+    );
+
+    // Al quitar la regla, la IP vuelve a pasar.
+    {
+        let mapa = ebpf
+            .map_mut("DOMAIN_BLOCKED")
+            .expect("falta el mapa DOMAIN_BLOCKED");
+        let mut dominio: BpfHashMap<_, DomainKey, u8> =
+            BpfHashMap::try_from(mapa).expect("DOMAIN_BLOCKED no es un HashMap");
+        dominio
+            .remove(&DomainKey {
+                pid_key: key,
+                ip: ip16(ip_bloqueada),
+            })
+            .expect("no se pudo desmarcar la IP del dominio");
+    }
+    assert_ne!(
+        errno_de_connect_a(ip_bloqueada),
+        libc::EPERM,
+        "tras quitar la regla de dominio, la IP vuelve a pasar"
     );
 }
