@@ -139,15 +139,6 @@ impl UserPolicy {
         }
     }
 
-    /// Los dominios que este ejecutable tiene bloqueados. Es lo que el cortafuegos
-    /// usa para armar el conjunto de IPs a cortar a los pids de ese binario.
-    pub fn domains_blocked_for(&self, binary_path: &str) -> Vec<String> {
-        self.domain_rules
-            .get(binary_path)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// Todas las reglas de bloqueo por dominio de este usuario, aplanadas, para
     /// `ListDomainRules`. Una fila por `(ejecutable, dominio)`.
     pub fn domain_rules(&self) -> Vec<BlockedDomain> {
@@ -839,6 +830,17 @@ mod tests {
         );
     }
 
+    /// Los dominios bloqueados de un ejecutable según `domain_rules`, para las
+    /// pruebas.
+    fn dominios_de(policy: &UserPolicy, app: &str) -> Vec<String> {
+        policy
+            .domain_rules()
+            .into_iter()
+            .filter(|r| r.binary_path == app)
+            .map(|r| r.domain)
+            .collect()
+    }
+
     /// Prender y apagar una regla de dominio: se agrega, se saca, y al quedar sin
     /// dominios el ejecutable sale del mapa (no deja una entrada vacía).
     #[test]
@@ -855,10 +857,10 @@ mod tests {
             "pedir la misma regla no cambia nada"
         );
         assert!(policy.set_domain_rule(app, "track.io", true));
-        assert_eq!(policy.domains_blocked_for(app), vec!["ads.com", "track.io"]);
+        assert_eq!(dominios_de(&policy, app), vec!["ads.com", "track.io"]);
 
         // No contagia a otro ejecutable.
-        assert!(policy.domains_blocked_for("/usr/bin/otro").is_empty());
+        assert!(dominios_de(&policy, "/usr/bin/otro").is_empty());
 
         assert!(
             policy.set_domain_rule(app, "ads.com", false),
@@ -868,11 +870,11 @@ mod tests {
             !policy.set_domain_rule(app, "ads.com", false),
             "quitar lo que no está no cambia nada"
         );
-        assert_eq!(policy.domains_blocked_for(app), vec!["track.io"]);
+        assert_eq!(dominios_de(&policy, app), vec!["track.io"]);
 
         // Al sacar el último, el ejecutable sale del mapa.
         assert!(policy.set_domain_rule(app, "track.io", false));
-        assert!(policy.domains_blocked_for(app).is_empty());
+        assert!(dominios_de(&policy, app).is_empty());
         assert!(policy.domain_rules().is_empty());
     }
 
@@ -913,7 +915,7 @@ mod tests {
 
         let reloaded = store.load(1000).expect("load");
         assert_eq!(
-            reloaded.domains_blocked_for("/usr/bin/vasak-mail"),
+            dominios_de(&reloaded, "/usr/bin/vasak-mail"),
             vec!["ads.com"]
         );
 

@@ -144,7 +144,13 @@ fn el_objeto_commiteado_corresponde_a_la_fuente() {
 fn el_objeto_commiteado_trae_el_ring_buffer_de_eventos() {
     let objeto = std::fs::read(objeto_commiteado()).expect("no se pudo leer el objeto");
     let contiene = |n: &str| objeto.windows(n.len()).any(|w| w == n.as_bytes());
-    for nombre in ["EVENTS", "BLOCKED", "DOMAIN_BLOCKED", "connect4", "connect6"] {
+    for nombre in [
+        "EVENTS",
+        "BLOCKED",
+        "DOMAIN_BLOCKED",
+        "connect4",
+        "connect6",
+    ] {
         assert!(
             contiene(nombre),
             "el objeto BPF commiteado no trae «{nombre}»"
