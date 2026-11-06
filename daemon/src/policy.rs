@@ -6,13 +6,15 @@
 //! grant itself whatever it likes. Here it belongs to root, one file per user,
 //! and the only way to change it is to come through the bus.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use vasak_permissions_protocol::{Application, Decision, PermissionEntry, Provenance};
+use vasak_permissions_protocol::{
+    Application, BlockedDomain, Decision, PermissionEntry, Provenance,
+};
 
 /// Root-owned, outside every user's reach.
 const POLICY_DIR: &str = "/var/lib/vasak-permissions";
@@ -37,6 +39,15 @@ struct StoredApplication {
 pub struct UserPolicy {
     #[serde(default)]
     applications: BTreeMap<String, StoredApplication>,
+    /// Reglas de bloqueo por dominio (M2 del #93): ejecutable → dominios cortados.
+    ///
+    /// Va aparte de `applications`/`decisions` a propósito: una decisión es sobre
+    /// un recurso con nombre (`network`, `camera`), y esto es un conjunto de
+    /// dominios por ejecutable, que el cortafuegos resuelve a IPs y corta. Con
+    /// `default` y `skip_serializing_if` para que una política escrita antes de
+    /// M2 se siga leyendo —sale vacía— y una sin reglas no engorde el archivo.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    domain_rules: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl UserPolicy {
@@ -97,6 +108,57 @@ impl UserPolicy {
             .iter()
             .filter(|(_, app)| app.decisions.get("network") == Some(&Decision::Denied))
             .map(|(binary_path, _)| binary_path.clone())
+            .collect()
+    }
+
+    /// Prende o apaga una regla de bloqueo por dominio de un ejecutable (M2).
+    ///
+    /// `blocked = true` agrega el dominio al conjunto del ejecutable; `false` lo
+    /// saca, y si era el último el ejecutable sale del mapa (no queda una entrada
+    /// vacía). Devuelve si algo cambió —para no reescribir el archivo ni
+    /// resincronizar el cortafuegos al pedir lo que ya estaba—.
+    ///
+    /// `domain` tiene que venir ya normalizado por
+    /// [`vasak_permissions_protocol::valid_domain`]: acá no se valida de nuevo, el
+    /// servicio lo hace antes de guardar.
+    pub fn set_domain_rule(&mut self, binary_path: &str, domain: &str, blocked: bool) -> bool {
+        if blocked {
+            self.domain_rules
+                .entry(binary_path.to_string())
+                .or_default()
+                .insert(domain.to_string())
+        } else {
+            let Some(set) = self.domain_rules.get_mut(binary_path) else {
+                return false;
+            };
+            let changed = set.remove(domain);
+            if set.is_empty() {
+                self.domain_rules.remove(binary_path);
+            }
+            changed
+        }
+    }
+
+    /// Los dominios que este ejecutable tiene bloqueados. Es lo que el cortafuegos
+    /// usa para armar el conjunto de IPs a cortar a los pids de ese binario.
+    pub fn domains_blocked_for(&self, binary_path: &str) -> Vec<String> {
+        self.domain_rules
+            .get(binary_path)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Todas las reglas de bloqueo por dominio de este usuario, aplanadas, para
+    /// `ListDomainRules`. Una fila por `(ejecutable, dominio)`.
+    pub fn domain_rules(&self) -> Vec<BlockedDomain> {
+        self.domain_rules
+            .iter()
+            .flat_map(|(binary_path, domains)| {
+                domains.iter().map(move |domain| BlockedDomain {
+                    binary_path: binary_path.clone(),
+                    domain: domain.clone(),
+                })
+            })
             .collect()
     }
 
@@ -257,6 +319,43 @@ impl PolicyStore {
             }
         }
         red
+    }
+
+    /// Las reglas de bloqueo por dominio de todos los usuarios con política, por
+    /// uid y ejecutable (M2). Es lo que el cortafuegos carga al arrancar para saber
+    /// qué pids enrolar y qué dominios resolver, antes de confiar en el conector de
+    /// procesos y el snoop de DNS.
+    ///
+    /// Un archivo ilegible o dañado se saltea, igual que en [`Self::red_cortada_inicial`]:
+    /// un usuario que falte queda sin reglas de dominio, no con unas equivocadas.
+    pub fn domain_rules_initial(&self) -> HashMap<u32, HashMap<String, HashSet<String>>> {
+        let mut reglas = HashMap::new();
+        let Ok(entradas) = std::fs::read_dir(&self.directory) else {
+            return reglas;
+        };
+        for entrada in entradas.flatten() {
+            let Some(uid) = entrada
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(policy) = self.load(uid) else {
+                continue;
+            };
+            let mut por_binario: HashMap<String, HashSet<String>> = HashMap::new();
+            for (binary_path, domains) in &policy.domain_rules {
+                if !domains.is_empty() {
+                    por_binario.insert(binary_path.clone(), domains.iter().cloned().collect());
+                }
+            }
+            if !por_binario.is_empty() {
+                reglas.insert(uid, por_binario);
+            }
+        }
+        reglas
     }
 
     pub fn save(&self, uid: u32, policy: &UserPolicy) -> Result<(), String> {
@@ -737,6 +836,125 @@ mod tests {
         assert_eq!(
             red.get(&1001),
             Some(&HashSet::from(["/home/b/z.AppImage".to_string()]))
+        );
+    }
+
+    /// Prender y apagar una regla de dominio: se agrega, se saca, y al quedar sin
+    /// dominios el ejecutable sale del mapa (no deja una entrada vacía).
+    #[test]
+    fn una_regla_de_dominio_se_prende_y_se_apaga() {
+        let mut policy = UserPolicy::default();
+        let app = "/usr/bin/vasak-mail";
+
+        assert!(
+            policy.set_domain_rule(app, "ads.com", true),
+            "nueva regla cambia"
+        );
+        assert!(
+            !policy.set_domain_rule(app, "ads.com", true),
+            "pedir la misma regla no cambia nada"
+        );
+        assert!(policy.set_domain_rule(app, "track.io", true));
+        assert_eq!(policy.domains_blocked_for(app), vec!["ads.com", "track.io"]);
+
+        // No contagia a otro ejecutable.
+        assert!(policy.domains_blocked_for("/usr/bin/otro").is_empty());
+
+        assert!(
+            policy.set_domain_rule(app, "ads.com", false),
+            "quitar cambia"
+        );
+        assert!(
+            !policy.set_domain_rule(app, "ads.com", false),
+            "quitar lo que no está no cambia nada"
+        );
+        assert_eq!(policy.domains_blocked_for(app), vec!["track.io"]);
+
+        // Al sacar el último, el ejecutable sale del mapa.
+        assert!(policy.set_domain_rule(app, "track.io", false));
+        assert!(policy.domains_blocked_for(app).is_empty());
+        assert!(policy.domain_rules().is_empty());
+    }
+
+    /// `domain_rules` aplana todas las reglas en filas `(ejecutable, dominio)`,
+    /// ordenadas, para `ListDomainRules`.
+    #[test]
+    fn las_reglas_de_dominio_se_listan_aplanadas() {
+        let mut policy = UserPolicy::default();
+        policy.set_domain_rule("/usr/bin/b", "z.com", true);
+        policy.set_domain_rule("/usr/bin/a", "y.com", true);
+        policy.set_domain_rule("/usr/bin/a", "x.com", true);
+
+        let reglas = policy.domain_rules();
+        let filas: Vec<(String, String)> = reglas
+            .into_iter()
+            .map(|r| (r.binary_path, r.domain))
+            .collect();
+        assert_eq!(
+            filas,
+            vec![
+                ("/usr/bin/a".into(), "x.com".into()),
+                ("/usr/bin/a".into(), "y.com".into()),
+                ("/usr/bin/b".into(), "z.com".into()),
+            ]
+        );
+    }
+
+    /// Las reglas de dominio sobreviven el guardado y la relectura, y una política
+    /// anterior a M2 (sin el campo) se sigue leyendo sin reglas.
+    #[test]
+    fn las_reglas_de_dominio_se_guardan_y_se_releen() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+
+        let mut policy = UserPolicy::default();
+        policy.set_domain_rule("/usr/bin/vasak-mail", "ads.com", true);
+        store.save(1000, &policy).expect("save");
+
+        let reloaded = store.load(1000).expect("load");
+        assert_eq!(
+            reloaded.domains_blocked_for("/usr/bin/vasak-mail"),
+            vec!["ads.com"]
+        );
+
+        // Una política vieja, sin `domain_rules`, se lee sin reglas.
+        let vieja = r#"{"applications":{}}"#;
+        let p: UserPolicy = serde_json::from_str(vieja).expect("se lee");
+        assert!(p.domain_rules().is_empty());
+    }
+
+    /// El conjunto inicial de reglas de dominio reúne a cada usuario con política,
+    /// por uid y ejecutable, y saltea lo que no es un `<uid>.json`.
+    #[test]
+    fn el_conjunto_inicial_de_reglas_de_dominio_reune_a_cada_usuario() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+
+        let mut p1000 = UserPolicy::default();
+        p1000.set_domain_rule("/usr/bin/vasak-mail", "ads.com", true);
+        p1000.set_domain_rule("/usr/bin/vasak-mail", "track.io", true);
+        store.save(1000, &p1000).expect("save");
+
+        // Un usuario sin reglas de dominio no aparece.
+        let mut p1001 = UserPolicy::default();
+        p1001.record(
+            &application("/home/b/z.AppImage"),
+            "camera",
+            Decision::Denied,
+            false,
+        );
+        store.save(1001, &p1001).expect("save");
+
+        std::fs::write(dir.path().join("notas.txt"), "nada").expect("write");
+
+        let reglas = store.domain_rules_initial();
+        assert_eq!(reglas.len(), 1, "sólo 1000 tiene reglas de dominio");
+        assert_eq!(
+            reglas.get(&1000).and_then(|m| m.get("/usr/bin/vasak-mail")),
+            Some(&HashSet::from([
+                "ads.com".to_string(),
+                "track.io".to_string()
+            ]))
         );
     }
 
