@@ -951,7 +951,10 @@ mod tests {
             domain: None,
         };
         let json = serde_json::to_string(&sin_dominio).expect("serializa");
-        assert!(!json.contains("domain"), "sin dominio no debe emitir el campo");
+        assert!(
+            !json.contains("domain"),
+            "sin dominio no debe emitir el campo"
+        );
 
         // Un JSON de M1, anterior a este campo, deserializa con `domain: None`.
         let m1 = r#"{"uid":1000,"binary_path":"/home/x/app","ip":"192.0.2.1","port":443,"proto":"tcp","allowed":true,"count":1,"last_seen_secs":1}"#;
