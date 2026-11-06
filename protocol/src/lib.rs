@@ -1090,6 +1090,31 @@ mod tests {
         assert_eq!(valid_domain(&format!("{}.com", "a".repeat(64))), None);
     }
 
+    /// Entradas que no son un host aunque parezcan: con esquema, con puerto, con
+    /// ruta, con control o no ASCII; y los bordes exactos de longitud.
+    #[test]
+    fn valid_domain_rechaza_esquema_puerto_y_bordes_de_longitud() {
+        for malo in [
+            "http://example.com",
+            "example.com:443",
+            "example.com/ruta",
+            "exa\nmple.com",
+            "exa\0mple.com",
+            "ejemplo\u{e9}.com",
+            "   ",
+        ] {
+            assert_eq!(valid_domain(malo), None, "{malo:?} no tenía que validar");
+        }
+        // 253 bytes es el máximo; 254 se rechaza.
+        let etiqueta = "a".repeat(63);
+        let justo = format!("{etiqueta}.{etiqueta}.{etiqueta}.{}", "a".repeat(61));
+        assert_eq!(justo.len(), 253);
+        assert_eq!(valid_domain(&justo), Some(justo.clone()));
+        assert_eq!(valid_domain(&format!("{justo}a")), None);
+        // 63 bytes por etiqueta entra; 64 no (cubierto arriba).
+        assert!(valid_domain(&format!("{etiqueta}.com")).is_some());
+    }
+
     /// These strings are written to disk. If a rename ever changes one, every
     /// decision recorded under the old spelling silently stops matching and
     /// the user is asked all over again.

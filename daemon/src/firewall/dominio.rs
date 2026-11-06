@@ -545,6 +545,32 @@ mod tests {
         );
     }
 
+    /// TTL: una IP vencida no cuenta (al segundo exacto de vencer ya no), y el
+    /// barrido la **quita del mapa** con la clave del pid, no sólo del registro.
+    #[test]
+    fn una_ip_vencida_no_se_usa_y_el_barrido_la_quita_del_mapa() {
+        let dom = dominios_vacios();
+        let dns = modelo_dns_nuevo();
+        fijar(&dom, 1000, "/app", "ads.com", true);
+        dns.lock()
+            .unwrap()
+            .observar(1000, &resp("ads.com", &["192.0.2.1"], 300), 1000);
+        // Vence en 1300: un segundo antes cuenta; en 1300 y después, no.
+        assert_eq!(ips_deseadas(&dom, &dns, 1000, "/app", 1299).len(), 1);
+        assert!(ips_deseadas(&dom, &dns, 1000, "/app", 1300).is_empty());
+
+        let ctx = ctx_falso(dom, dns);
+        reconciliar_pid(&ctx, 1000, 42, "/app", 1299);
+        barrer(&ctx, 1300);
+        let g = ctx.enforcer.lock().unwrap();
+        let enf = g.as_ref().unwrap();
+        assert_eq!(enf.ips_dominio(42), Some(vec![]));
+        assert_eq!(
+            enf.motor().quitados_ip,
+            vec![((1000u64 << 32) | 42, ip16(192, 0, 2, 1))]
+        );
+    }
+
     /// Sin cortafuegos cargado (enforcer en `None`) los adapters recorren su camino
     /// sin romperse: el daemon degrada sin tumbar nada.
     #[test]

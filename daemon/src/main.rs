@@ -2315,4 +2315,53 @@ mod tests_reask {
         );
         assert_eq!(fuente.matches("self.guardar_dominio(").count(), 1);
     }
+
+    /// F4, la otra mitad: el llamante se identifica antes de autorizar, y la firma
+    /// de `SetDomainRule`/`ListDomainRules` no ofrece un `uid` que el cliente pueda
+    /// elegir.
+    #[test]
+    fn el_bloqueo_por_dominio_no_acepta_uid_del_cliente() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        for metodo in ["async fn set_domain_rule(", "async fn list_domain_rules("] {
+            let desde = fuente.find(metodo).expect(metodo);
+            let firma = &fuente[desde..desde + fuente[desde..].find(") ->").unwrap()];
+            assert!(!firma.contains("uid"), "{metodo} recibe un uid: {firma}");
+        }
+        let desde = fuente.find("async fn set_domain_rule(").unwrap();
+        let cuerpo = &fuente[desde..];
+        assert!(
+            cuerpo.find("caller_of(").unwrap() < cuerpo.find("polkit::authorize(").unwrap(),
+            "hay que identificar al llamante antes de autorizar"
+        );
+    }
+
+    /// `ListDomainRules` sólo lee la política del uid del llamante.
+    #[test]
+    fn listar_reglas_de_dominio_lee_solo_la_politica_del_llamante() {
+        let completa = include_str!("main.rs");
+        let fuente = completa.split("mod tests_reask").next().unwrap();
+        let desde = fuente.find("async fn list_domain_rules(").unwrap();
+        let cuerpo = &fuente[desde..];
+        let cuerpo = &cuerpo[..cuerpo.find("\n    }\n").unwrap()];
+        assert!(cuerpo.contains("self.store.load(caller.uid)"), "{cuerpo}");
+        assert_eq!(cuerpo.matches(".load(").count(), 1);
+    }
+
+    /// Las reglas son por usuario: lo que prende el uid 1000 no aparece en la
+    /// política ni en el modelo del uid 1001.
+    #[tokio::test]
+    async fn la_regla_de_un_usuario_no_se_ve_ni_aplica_a_otro() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = servicio_con_almacen(&dir);
+        let binary = "/usr/bin/vasak-mail";
+        service
+            .guardar_dominio(1000, binary.into(), "ads.com".into(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(service.store.load(1000).unwrap().domain_rules().len(), 1);
+        assert!(service.store.load(1001).unwrap().domain_rules().is_empty());
+        assert!(firewall::dominio::dominios_de(&service.dominios, 1001, binary).is_empty());
+    }
 }

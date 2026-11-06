@@ -1332,6 +1332,105 @@ mod tests {
         );
     }
 
+    /// Granularidad por binario: la clave lleva el pid, así que lo cortado para un
+    /// pid no alcanza a otro del mismo uid. Un pid de otro binario (sin regla) ni
+    /// se enrola ni recibe entradas, y reconciliar «por binario» no toca sus pids.
+    #[test]
+    fn la_ip_cortada_para_un_pid_no_alcanza_a_otro_del_mismo_uid() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true);
+        // Otro pid del mismo uid, de un binario sin regla: no recibe nada.
+        e.reconciliar_dominio_pid(1000, 43, "/otro", HashSet::new(), false);
+        e.reconciliar_dominio_binario(1000, "/app", set(&[a]), true);
+
+        assert_eq!(e.ips_dominio(43), None, "el pid ajeno no se enrola");
+        assert_eq!(
+            e.motor().insertados_ip,
+            vec![(clave(1000, 42), a)],
+            "sólo la clave del pid con la regla; ninguna del otro pid"
+        );
+        assert_ne!(clave(1000, 42), clave(1000, 43));
+    }
+
+    /// La `DomainKey` que escribe el daemon tiene el layout que lee el programa BPF:
+    /// el pid de M0 en el offset 0 y la IP en el 8, 24 bytes en total.
+    #[test]
+    fn la_clave_de_dominio_lleva_el_pid_y_la_ip_en_su_sitio() {
+        let k = clave_dominio(clave(1000, 42), ip16(192, 0, 2, 1));
+        assert_eq!(std::mem::offset_of!(DomainKey, pid_key), 0);
+        assert_eq!(std::mem::offset_of!(DomainKey, ip), 8);
+        // SAFETY: `DomainKey` es `repr(C)` y Copy; se leen sus 24 bytes como crudos.
+        let bytes: [u8; 24] = unsafe { std::mem::transmute(k) };
+        assert_eq!(bytes[..8], clave(1000, 42).to_ne_bytes());
+        assert_eq!(bytes[8..12], [192, 0, 2, 1]);
+        assert_eq!(bytes[12..], [0u8; 12]);
+    }
+
+    /// Fail-closed completo: la IP que no entró al mapa no se anota, y el próximo
+    /// reconcile la **reintenta** en vez de darla por cortada.
+    #[test]
+    fn la_ip_que_no_entro_al_mapa_se_reintenta_en_el_siguiente_reconcile() {
+        let motor = MotorFalso {
+            falla_al_insertar_ip: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut e = Enforcer::nuevo(Firewall::con_motor(motor).unwrap());
+        let a = ip16(192, 0, 2, 1);
+        assert_eq!(
+            e.reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true)
+                .len(),
+            1
+        );
+        assert_eq!(e.ips_dominio(42), Some(vec![]), "no se anotó como cortada");
+        assert!(e.motor().insertados_ip.is_empty());
+
+        assert!(e
+            .reconciliar_dominio_pid(1000, 42, "/app", set(&[a]), true)
+            .is_empty());
+        assert_eq!(e.ips_dominio(42), Some(vec![a]));
+        assert_eq!(e.motor().insertados_ip, vec![(clave(1000, 42), a)]);
+    }
+
+    /// El error de mapa lleno de `bloquear_ip` sube con el mensaje accionable; uno
+    /// que no es de mapa lleno no lo menciona.
+    #[test]
+    fn bloquear_ip_con_el_mapa_lleno_devuelve_error_accionable() {
+        let motor = MotorFalso {
+            falla_al_insertar_ip: Some(error_mapa_lleno()),
+            ..Default::default()
+        };
+        let mut fw = Firewall::con_motor(motor).unwrap();
+        let err = fw
+            .bloquear_ip(clave(1000, 42), ip16(192, 0, 2, 1))
+            .expect_err("tiene que fallar");
+        assert!(err.contains("192.0.2.1"), "{err}");
+        assert!(err.contains("DOMAIN_BLOCKED está lleno"), "{err}");
+        assert!(err.contains("NO se está aplicando"), "{err}");
+    }
+
+    /// Aditivo: en el programa BPF el veredicto es el OR del kill-switch de M0 y del
+    /// match por dominio, y el kill-switch sigue saliendo de `BLOCKED` con la misma
+    /// clave. Sin reglas `DOMAIN_BLOCKED` está vacío y el OR vale lo que M0.
+    #[test]
+    fn la_fuente_bpf_combina_m0_y_dominio_con_un_or() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        assert!(
+            fuente.contains("let bloqueado = kill_switch || dominio_bloqueado;"),
+            "el veredicto dejó de ser kill_switch OR dominio"
+        );
+        assert!(
+            fuente.contains("BLOCKED.get(&key)"),
+            "el kill-switch de M0 ya no consulta BLOCKED por la clave de pid"
+        );
+        assert!(
+            fuente.contains("DOMAIN_BLOCKED.get(&domain_key)")
+                && fuente.contains("pid_key: key,")
+                && fuente.contains("ip: dst,"),
+            "el match por dominio tiene que usar la clave de pid y el destino del connect"
+        );
+    }
+
     /// Los dos lados se desincronizan sin aviso si alguien toca uno solo. Esta
     /// prueba lee la fuente del programa BPF (siempre disponible, a diferencia del
     /// toolchain BPF que necesita la correspondencia del objeto) y exige que la
