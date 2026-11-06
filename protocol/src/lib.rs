@@ -423,6 +423,53 @@ pub fn portal_app_id(key: &str) -> Option<&str> {
     key.strip_prefix(PORTAL_PREFIX)
 }
 
+// ── Reglas de bloqueo por dominio (M2 del #93) ──────────────────────────────
+
+/// Lo más largo que se acepta como dominio, el máximo de un nombre DNS
+/// (RFC 1035 §3.1). No es cosmética: el dominio termina en un archivo JSON de
+/// política y en un renglón de la pantalla, y uno de un kilobyte no es un
+/// dominio, es alguien probando qué pasa.
+const MAX_DOMAIN: usize = 253;
+
+/// Normaliza y valida un dominio para una regla de bloqueo, o `None` si no sirve
+/// como nombre de host.
+///
+/// # Por qué normalizar y no sólo validar
+///
+/// La regla se escribe por dominio y después se compara contra lo que el snoop de
+/// DNS vio resolver. El DNS es **insensible a mayúsculas**, así que `Example.COM`
+/// y `example.com` son el mismo nombre: si la regla guardara una forma y el snoop
+/// otra, el bloqueo no emparejaría y no haría nada sin que nada fallara. Por eso
+/// se baja a minúsculas y se recorta el punto final (FQDN) antes de guardar, y el
+/// snoop compara también en minúsculas.
+///
+/// Se rechaza lo que no es un nombre de host —vacío, etiquetas vacías (`..`),
+/// etiquetas de más de 63 bytes, guiones al borde de una etiqueta, o cualquier
+/// carácter fuera de letras, dígitos, punto y guion—: un dominio con una barra o
+/// un `..` se leería como una ruta en el archivo y en la pantalla, la misma
+/// confusión que [`portal_key`] evita.
+pub fn valid_domain(domain: &str) -> Option<String> {
+    let normalizado = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalizado.is_empty() || normalizado.len() > MAX_DOMAIN {
+        return None;
+    }
+    for etiqueta in normalizado.split('.') {
+        if etiqueta.is_empty() || etiqueta.len() > 63 {
+            return None;
+        }
+        if etiqueta.starts_with('-') || etiqueta.ends_with('-') {
+            return None;
+        }
+        if !etiqueta
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return None;
+        }
+    }
+    Some(normalizado)
+}
+
 // ── Resources ───────────────────────────────────────────────────────────────
 
 /// Something an application can ask to use.
@@ -909,6 +956,30 @@ pub struct ObservedConnection {
     pub domain: Option<String>,
 }
 
+/// Una regla de bloqueo por dominio: a la aplicación `binary_path` se le corta el
+/// egreso al dominio `domain` (M2 del #93).
+///
+/// # Qué es y qué no
+///
+/// Es **por aplicación**: "bloquear a esta app este dominio", no un bloqueo global
+/// del dominio para todo el usuario. El snoop de DNS resuelve el dominio a sus IPs
+/// y el cortafuegos eBPF corta los `connect()` de los pids de **ese** ejecutable a
+/// **esas** IPs, sin tocar a otras aplicaciones del mismo usuario (granularidad
+/// por binario). Se persiste en la política del usuario, detrás de polkit como
+/// cualquier otro cambio.
+///
+/// Se guarda y se lista contra la **ruta del ejecutable**, la misma identidad
+/// imposible de falsificar que el resto de la política. `domain` ya viene
+/// normalizado por [`valid_domain`] (minúsculas, sin el punto final).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedDomain {
+    /// El ejecutable al que se le corta el dominio, canonicalizado como el resto
+    /// de la política.
+    pub binary_path: String,
+    /// El dominio bloqueado, normalizado ([`valid_domain`]).
+    pub domain: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,6 +1031,63 @@ mod tests {
         let m1 = r#"{"uid":1000,"binary_path":"/home/x/app","ip":"192.0.2.1","port":443,"proto":"tcp","allowed":true,"count":1,"last_seen_secs":1}"#;
         let vuelta: ObservedConnection = serde_json::from_str(m1).expect("deserializa M1");
         assert_eq!(vuelta, sin_dominio);
+    }
+
+    /// Una regla de bloqueo por dominio viaja como JSON por el bus: la vuelta por
+    /// serde la devuelve igual, campo por campo.
+    #[test]
+    fn la_regla_de_dominio_sobrevive_el_json() {
+        let regla = BlockedDomain {
+            binary_path: "/usr/bin/vasak-mail".into(),
+            domain: "ads.example.com".into(),
+        };
+        let json = serde_json::to_string(&regla).expect("serializa");
+        let vuelta: BlockedDomain = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(regla, vuelta);
+    }
+
+    /// `valid_domain` normaliza a minúsculas y recorta el punto final (FQDN), para
+    /// que la regla empareje contra lo que el snoop vio aunque el DNS use otra caja.
+    #[test]
+    fn valid_domain_normaliza_caja_y_punto_final() {
+        assert_eq!(valid_domain("Example.COM"), Some("example.com".into()));
+        assert_eq!(
+            valid_domain("www.Example.com."),
+            Some("www.example.com".into())
+        );
+        assert_eq!(
+            valid_domain("  cdn.sitio.NET  "),
+            Some("cdn.sitio.net".into())
+        );
+        // Un solo label (p. ej. un host de red local) también es válido.
+        assert_eq!(valid_domain("localhost"), Some("localhost".into()));
+        assert_eq!(valid_domain("a-b.c3.io"), Some("a-b.c3.io".into()));
+    }
+
+    /// Lo que no es un nombre de host se rechaza: así no entra una barra o un `..`
+    /// que después se leería como una ruta en el archivo de política y en la
+    /// pantalla —la misma confusión que el prefijo del portal existe para evitar—.
+    #[test]
+    fn valid_domain_rechaza_lo_que_no_es_un_host() {
+        for malo in [
+            "",
+            ".",
+            "..",
+            ".example.com",
+            "example..com",
+            "ex ample.com",
+            "exa/mple.com",
+            "exa_mple.com",
+            "-lider.com",
+            "lider-.com",
+            "a@b.com",
+            "192.0.2.1/32",
+        ] {
+            assert_eq!(valid_domain(malo), None, "{malo:?} no tenía que validar");
+        }
+        // Un dominio más largo que el máximo DNS, y una etiqueta de más de 63.
+        assert_eq!(valid_domain(&"a.".repeat(200)), None);
+        assert_eq!(valid_domain(&format!("{}.com", "a".repeat(64))), None);
     }
 
     /// These strings are written to disk. If a rename ever changes one, every
