@@ -94,6 +94,12 @@ struct PermissionService {
     /// bloqueo por dominio corta. Compartido con el hilo del snoop, que lo puebla,
     /// y con la resincronización de `SetDomainRule`, que lo lee.
     dns: firewall::dns::ModeloDnsCompartido,
+    /// El log persistente de bloqueos del cortafuegos (M3 del #93): opt-in, apagado
+    /// por omisión. Lo comparte con el lector del ring buffer, que agrega los
+    /// bloqueos cuando está prendido. `SetFirewallLogging` prende/apaga (el flag en
+    /// memoria y el persistido), `ReadFirewallLog` lee lo del uid del llamante y
+    /// `ClearFirewallLog` lo borra.
+    log: firewall::registro::FirewallLogCompartido,
 }
 
 /// Rejects anything this service cannot honour.
@@ -1137,6 +1143,101 @@ impl PermissionService {
             .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
     }
 
+    /// Prende o apaga el **log persistente de bloqueos** del cortafuegos (M3 del
+    /// #93).
+    ///
+    /// Detrás de polkit: es un ajuste **global y sensible** —el log dice quién se
+    /// conectó a dónde, de todos los usuarios del equipo—, así que cambiarlo tiene
+    /// que ser tan difícil como cualquier otro cambio de política, no algo que una
+    /// aplicación se conceda sola.
+    ///
+    /// **F4:** el flag lo escribe el daemon (en los ajustes globales y en el
+    /// interruptor en memoria); el *contenido* del log sale del ring, nunca de un
+    /// argumento D-Bus. Acá sólo llega el booleano.
+    ///
+    /// **Apagar ≠ borrar:** apagar detiene las escrituras y deja lo guardado;
+    /// borrar es `ClearFirewallLog`, aparte.
+    async fn set_firewall_logging(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+        enabled: bool,
+    ) -> zbus::fdo::Result<()> {
+        let caller = caller_of(connection, &header).await?;
+        polkit::authorize(connection, &caller).await?;
+
+        // Se persiste primero y recién después se prende/apaga en memoria: si el
+        // guardado falla, el interruptor en vivo no queda diciendo algo que el disco
+        // no respalda. El candado de escritura serializa contra los guardados de
+        // política sobre el mismo directorio.
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut settings = self.store.load_settings();
+            settings.firewall_logging_enabled = enabled;
+            self.store
+                .save_settings(&settings)
+                .map_err(FdoError::Failed)?;
+        }
+        self.log.set_enabled(enabled);
+        tracing::info!(
+            "Log de bloqueos del cortafuegos {} por el usuario {}",
+            if enabled { "prendido" } else { "apagado" },
+            caller.uid
+        );
+        Ok(())
+    }
+
+    /// Si el log de bloqueos está prendido. No cambia nada ni pide autorización:
+    /// leer el estado de un interruptor no concede nada.
+    async fn firewall_logging_enabled(&self) -> zbus::fdo::Result<bool> {
+        Ok(self.log.enabled())
+    }
+
+    /// El log de bloqueos del cortafuegos como JSON (una [`FirewallLogEntry`] por
+    /// bloqueo), **filtrado por el uid del llamante** —como `ListConnections` y
+    /// `ListBlocked`, y por el mismo motivo: este servicio atiende a todo el equipo y
+    /// el log dice quién se conectó a dónde—. Un usuario sólo ve sus propios
+    /// bloqueos; nunca los de otra persona.
+    ///
+    /// No pide autorización: leer lo propio no concede nada (pedir la contraseña para
+    /// *mirar* enseñaría a tipearla sin leer). El uid del llamante sale de la
+    /// conexión, no de un argumento.
+    ///
+    /// [`FirewallLogEntry`]: vasak_permissions_protocol::FirewallLogEntry
+    async fn read_firewall_log(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        let caller = caller_of(connection, &header).await?;
+        let entradas = self.log.leer(caller.uid);
+        serde_json::to_string(&entradas)
+            .map_err(|e| FdoError::Failed(format!("no se pudo serializar: {e}")))
+    }
+
+    /// Borra el log de bloqueos **entero**, de todos los usuarios.
+    ///
+    /// Detrás de polkit: borrar es una acción destructiva y explícita, aparte de
+    /// apagar (apagar deja el log; esto lo borra). Como el archivo es de todo el
+    /// equipo, y borrarlo requiere la autenticación de polkit, no se expone un borrado
+    /// por uid —no haría más seguro un archivo que ya pide la contraseña para
+    /// vaciarse—.
+    async fn clear_firewall_log(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let caller = caller_of(connection, &header).await?;
+        polkit::authorize(connection, &caller).await?;
+
+        self.log.borrar().map_err(FdoError::Failed)?;
+        tracing::info!(
+            "Log de bloqueos del cortafuegos borrado por el usuario {}",
+            caller.uid
+        );
+        Ok(())
+    }
+
     /// Permite exactamente lo que se bloqueó: ese perfil, esa ruta, esos
     /// permisos.
     ///
@@ -1362,6 +1463,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dominios: firewall::dominio::DominiosBloqueados =
         firewall::dominio::dominios_bloqueados_nuevo(store.domain_rules_initial());
     let dns = firewall::dns::modelo_dns_nuevo();
+    // El log de bloqueos (M3), al lado de las políticas (mismo directorio, de root
+    // y 0700). Arranca con el interruptor que dicen los ajustes globales: **apagado**
+    // en un sistema recién instalado. Existe aunque el cortafuegos no cargue (el
+    // lector no corre, pero `SetFirewallLogging`/`ReadFirewallLog`/`ClearFirewallLog`
+    // sí): el flag persiste y el log se puede leer o borrar igual.
+    let log = firewall::registro::nuevo(
+        store.directory(),
+        store.load_settings().firewall_logging_enabled,
+    );
 
     let service = PermissionService {
         store,
@@ -1376,6 +1486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         modelo: Arc::clone(&modelo),
         dominios: Arc::clone(&dominios),
         dns: Arc::clone(&dns),
+        log: Arc::clone(&log),
     };
 
     let connection = service_bus()?
@@ -1468,6 +1579,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&modelo),
             Arc::clone(&procesos),
             Arc::clone(&dns),
+            Arc::clone(&red),
+            Arc::clone(&dominios),
+            Arc::clone(&log),
         ));
     }
 
@@ -1662,6 +1776,7 @@ mod tests_interfaz {
             modelo: firewall::conexiones::modelo_nuevo(),
             dominios: firewall::dominio::dominios_bloqueados_nuevo(Default::default()),
             dns: firewall::dns::modelo_dns_nuevo(),
+            log: firewall::registro::nuevo(std::path::Path::new("/nonexistent"), false),
         }
     }
 
@@ -1916,6 +2031,7 @@ mod tests_reask {
             modelo: firewall::conexiones::modelo_nuevo(),
             dominios: firewall::dominio::dominios_bloqueados_nuevo(Default::default()),
             dns: firewall::dns::modelo_dns_nuevo(),
+            log: firewall::registro::nuevo(std::path::Path::new("/nonexistent"), false),
         }
     }
 

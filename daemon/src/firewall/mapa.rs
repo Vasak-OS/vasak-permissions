@@ -28,8 +28,11 @@ use zbus::Connection;
 
 use vasak_permissions_protocol::{SERVICE_INTERFACE, SERVICE_PATH};
 
-use super::conexiones::{parsear, ModeloCompartido};
+use super::conexiones::{parsear, EventoConexion, ModeloCompartido};
 use super::dns::ModeloDnsCompartido;
+use super::dominio::{dominios_de, DominiosBloqueados};
+use super::enrolar::{esta_cortado, RedCortada};
+use super::registro::{armar_entrada, clasificar, FirewallLogCompartido};
 use crate::procesos::Cache;
 
 /// El nombre del ring buffer en el objeto BPF (el del `static` en
@@ -39,12 +42,16 @@ pub const MAPA_EVENTOS: &str = "EVENTS";
 
 /// Lee el ring buffer para siempre, enriqueciendo y volcando al modelo. Se lanza
 /// como task de tokio junto con la carga del cortafuegos.
+#[allow(clippy::too_many_arguments)]
 pub async fn escuchar(
     ring: RingBuf<MapData>,
     connection: Connection,
     modelo: ModeloCompartido,
     procesos: Cache,
     dns: ModeloDnsCompartido,
+    red: RedCortada,
+    dominios: DominiosBloqueados,
+    log: FirewallLogCompartido,
 ) {
     // `AsyncFd::new` quedó deprecada en tokio por seguridad de E/S, pero su
     // reemplazo (`AsyncFd::register`) no existe en la versión fijada en
@@ -79,8 +86,16 @@ pub async fn escuchar(
         {
             let ring = guard.get_inner_mut();
             while let Some(evento) = ring.next() {
-                if let Some(uid) = procesar_evento(&evento, &modelo, &procesos, &dns, ahora_epoch())
-                {
+                if let Some(uid) = procesar_evento(
+                    &evento,
+                    &modelo,
+                    &procesos,
+                    &dns,
+                    &red,
+                    &dominios,
+                    &log,
+                    ahora_epoch(),
+                ) {
                     if !con_novedad.contains(&uid) {
                         con_novedad.push(uid);
                     }
@@ -100,11 +115,15 @@ pub async fn escuchar(
 /// el dominio del snoop de DNS y lo vuelca al modelo. Devuelve el uid **si el
 /// destino era nuevo** —cuando corresponde avisar— y `None` si no se pudo parsear o
 /// ya se había visto.
+#[allow(clippy::too_many_arguments)]
 fn procesar_evento(
     bytes: &[u8],
     modelo: &ModeloCompartido,
     procesos: &Cache,
     dns: &ModeloDnsCompartido,
+    red: &RedCortada,
+    dominios: &DominiosBloqueados,
+    log: &FirewallLogCompartido,
     ahora: u64,
 ) -> Option<u32> {
     let ev = parsear(bytes)?;
@@ -116,11 +135,49 @@ fn procesar_evento(
         .lock()
         .ok()
         .and_then(|d| d.dominio_de(ev.uid, &ev.ip, ahora));
+
+    // Log persistente de bloqueos (M3), opt-in: **sólo** una conexión que el
+    // cortafuegos cortó, nunca una permitida, y sólo si el log está prendido. Se
+    // consulta el interruptor antes de clasificar el motivo para no pagar ese
+    // trabajo con el log apagado.
+    if ev.bloqueado && log.enabled() {
+        registrar_bloqueo(log, red, dominios, &ev, &exe, dominio.as_deref(), ahora);
+    }
+
     let nuevo = modelo
         .lock()
         .map(|mut m| m.observar(exe, &ev, dominio, ahora))
         .unwrap_or(false);
     nuevo.then_some(ev.uid)
+}
+
+/// Deriva el motivo best-effort de un corte y lo manda al log. El motivo sale del
+/// estado de política que el daemon ya mantiene, **no** del programa BPF:
+///
+/// - `kill-switch`: la red de la app está cortada entera ([`esta_cortado`]).
+/// - `domain-rule`: el dominio que la app resolvió para esta IP (el del snoop) está
+///   entre los que el binario bloquea. Es best-effort: una regla puede cortar una
+///   IP cuyo snoop venció o resolvió otro nombre, y ahí el motivo cae a
+///   `forced-resolver` o a vacío —se documenta—.
+/// - `forced-resolver`: la app tiene reglas de dominio y el puerto es 53/853/443.
+fn registrar_bloqueo(
+    log: &FirewallLogCompartido,
+    red: &RedCortada,
+    dominios: &DominiosBloqueados,
+    ev: &EventoConexion,
+    exe: &str,
+    domain: Option<&str>,
+    ahora: u64,
+) {
+    let cortado = esta_cortado(red, ev.uid, exe);
+    let doms = dominios_de(dominios, ev.uid, exe);
+    let tiene_reglas = !doms.is_empty();
+    let ip_por_dominio = domain.is_some_and(|d| doms.iter().any(|bd| bd.eq_ignore_ascii_case(d)));
+    let motivo = clasificar(cortado, ip_por_dominio, tiene_reglas, ev.port);
+    let entrada = armar_entrada(
+        ahora, ev.uid, exe, &ev.ip, domain, ev.port, ev.proto, motivo,
+    );
+    log.registrar(&entrada);
 }
 
 /// El ejecutable del pid, para la fila del mapa. Primero la caché del conector
@@ -172,14 +229,36 @@ fn ahora_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use crate::firewall::conexiones::modelo_nuevo;
     use crate::firewall::dns::{modelo_dns_nuevo, parsear_respuesta};
+    use crate::firewall::dominio::dominios_bloqueados_nuevo;
+    use crate::firewall::registro;
     use crate::procesos::cache_nueva;
 
     /// El uid del proceso de la prueba, para fabricar un evento a su nombre.
     fn mi_uid() -> u32 {
         // SAFETY: `getuid` no tiene precondiciones y no falla.
         unsafe { libc::getuid() }
+    }
+
+    /// Un conjunto de red cortada vacío, para las pruebas que no clasifican motivo.
+    fn red_vacia() -> RedCortada {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Una política de dominios vacía.
+    fn dominios_vacios() -> DominiosBloqueados {
+        dominios_bloqueados_nuevo(HashMap::new())
+    }
+
+    /// Un log **apagado** (y con una ruta inexistente): no escribe nada, para las
+    /// pruebas que sólo ejercitan el mapa en vivo. El camino del log tiene sus
+    /// propias pruebas más abajo y en `registro.rs`.
+    fn log_apagado() -> FirewallLogCompartido {
+        registro::nuevo(std::path::Path::new("/nonexistent"), false)
     }
 
     /// Arma los 32 bytes de un `ConnectionEvent`, como el programa BPF, para
@@ -208,12 +287,30 @@ mod tests {
         let bytes = bytes_evento(mi_uid(), std::process::id());
 
         assert_eq!(
-            procesar_evento(&bytes, &modelo, &cache, &dns, 100),
+            procesar_evento(
+                &bytes,
+                &modelo,
+                &cache,
+                &dns,
+                &red_vacia(),
+                &dominios_vacios(),
+                &log_apagado(),
+                100
+            ),
             Some(mi_uid()),
             "la primera vez devuelve el uid para avisar"
         );
         assert_eq!(
-            procesar_evento(&bytes, &modelo, &cache, &dns, 101),
+            procesar_evento(
+                &bytes,
+                &modelo,
+                &cache,
+                &dns,
+                &red_vacia(),
+                &dominios_vacios(),
+                &log_apagado(),
+                101
+            ),
             None,
             "la repetición no vuelve a avisar"
         );
@@ -242,7 +339,16 @@ mod tests {
         dns.lock().unwrap().observar(mi_uid(), &respuesta, 100);
 
         let bytes = bytes_evento(mi_uid(), std::process::id());
-        procesar_evento(&bytes, &modelo, &cache, &dns, 150);
+        procesar_evento(
+            &bytes,
+            &modelo,
+            &cache,
+            &dns,
+            &red_vacia(),
+            &dominios_vacios(),
+            &log_apagado(),
+            150,
+        );
 
         let foto = modelo.lock().unwrap().instantanea(mi_uid());
         assert_eq!(foto.len(), 1);
@@ -261,6 +367,9 @@ mod tests {
             &modelo,
             &cache,
             &dns,
+            &red_vacia(),
+            &dominios_vacios(),
+            &log_apagado(),
             160,
         );
         let suya = modelo.lock().unwrap().instantanea(ajeno);
@@ -280,7 +389,16 @@ mod tests {
         dns.lock().unwrap().observar(mi_uid(), &respuesta, 100);
 
         let bytes = bytes_evento(mi_uid(), std::process::id());
-        procesar_evento(&bytes, &modelo, &cache, &dns, 100_000); // mucho después
+        procesar_evento(
+            &bytes,
+            &modelo,
+            &cache,
+            &dns,
+            &red_vacia(),
+            &dominios_vacios(),
+            &log_apagado(),
+            100_000,
+        ); // mucho después
         assert_eq!(modelo.lock().unwrap().instantanea(mi_uid())[0].domain, None);
     }
 
@@ -300,6 +418,9 @@ mod tests {
             &modelo,
             &cache,
             &dns,
+            &red_vacia(),
+            &dominios_vacios(),
+            &log_apagado(),
             150,
         );
         let foto = modelo.lock().unwrap().instantanea(mi_uid());
@@ -339,8 +460,151 @@ mod tests {
         let modelo = modelo_nuevo();
         let cache = cache_nueva();
         let dns = modelo_dns_nuevo();
-        assert_eq!(procesar_evento(&[0u8; 8], &modelo, &cache, &dns, 1), None);
+        assert_eq!(
+            procesar_evento(
+                &[0u8; 8],
+                &modelo,
+                &cache,
+                &dns,
+                &red_vacia(),
+                &dominios_vacios(),
+                &log_apagado(),
+                1
+            ),
+            None
+        );
         assert!(modelo.lock().unwrap().instantanea(mi_uid()).is_empty());
+    }
+
+    /// El ejecutable canonicalizado del proceso de la prueba: el mismo que
+    /// `resolver_exe` devuelve para su pid, y la clave contra la que se arma la
+    /// política de red/dominio en estas pruebas.
+    fn mi_exe() -> String {
+        let exe = std::fs::read_link("/proc/self/exe").expect("ejecutable propio");
+        std::fs::canonicalize(&exe)
+            .unwrap_or(exe)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Los 32 bytes de un `ConnectionEvent` **bloqueado** (verdict 1), para el log de
+    /// bloqueos de M3.
+    fn bytes_evento_bloqueado(uid: u32, tgid: u32) -> Vec<u8> {
+        let mut m = bytes_evento(uid, tgid);
+        m[28] = 1; // verdict = DENY
+        m
+    }
+
+    /// Una conexión **bloqueada** con la red de la app cortada se registra en el log
+    /// con el motivo `kill-switch`; una **permitida** no se registra nunca.
+    #[test]
+    fn un_bloqueo_por_kill_switch_se_registra_con_su_motivo() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let red = red_vacia();
+        crate::firewall::enrolar::fijar(&red, mi_uid(), &mi_exe(), true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), true);
+
+        // Una permitida al mismo destino no deja rastro en el log.
+        procesar_evento(
+            &bytes_evento(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            &red,
+            &dominios_vacios(),
+            &log,
+            10,
+        );
+        assert!(
+            log.leer(mi_uid()).is_empty(),
+            "una conexión permitida no se registra"
+        );
+
+        // La bloqueada sí, con motivo kill-switch.
+        procesar_evento(
+            &bytes_evento_bloqueado(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            &red,
+            &dominios_vacios(),
+            &log,
+            20,
+        );
+        let entradas = log.leer(mi_uid());
+        assert_eq!(entradas.len(), 1, "se registró el bloqueo");
+        assert_eq!(entradas[0].reason, "kill-switch");
+        assert_eq!(entradas[0].uid, mi_uid());
+        assert_eq!(entradas[0].destination, "192.0.2.1");
+        assert_eq!(entradas[0].port, 443);
+        assert_eq!(entradas[0].proto, "tcp");
+    }
+
+    /// Un bloqueo cuya IP cae bajo una regla de dominio (el snoop ató la IP al
+    /// dominio que el binario bloquea) se registra con motivo `domain-rule` y el
+    /// destino en forma de dominio.
+    #[test]
+    fn un_bloqueo_por_dominio_se_registra_con_el_dominio() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        // El binario bloquea example.com, y el snoop ató 192.0.2.1 → example.com.
+        let dominios = dominios_vacios();
+        crate::firewall::dominio::fijar(&dominios, mi_uid(), &mi_exe(), "example.com", true);
+        let respuesta = parsear_respuesta(&respuesta_dns(&["example", "com"], [192, 0, 2, 1]))
+            .expect("respuesta válida");
+        dns.lock().unwrap().observar(mi_uid(), &respuesta, 100);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), true);
+
+        procesar_evento(
+            &bytes_evento_bloqueado(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            &red_vacia(),
+            &dominios,
+            &log,
+            150,
+        );
+        let entradas = log.leer(mi_uid());
+        assert_eq!(entradas.len(), 1);
+        assert_eq!(entradas[0].reason, "domain-rule");
+        assert_eq!(
+            entradas[0].destination, "example.com",
+            "el destino se muestra como dominio"
+        );
+    }
+
+    /// Con el log **apagado**, un bloqueo no se registra: el opt-in se respeta en el
+    /// camino del ring, no sólo en el archivo.
+    #[test]
+    fn con_el_log_apagado_un_bloqueo_no_se_registra() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let red = red_vacia();
+        crate::firewall::enrolar::fijar(&red, mi_uid(), &mi_exe(), true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), false); // apagado
+
+        procesar_evento(
+            &bytes_evento_bloqueado(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            &red,
+            &dominios_vacios(),
+            &log,
+            20,
+        );
+        assert!(
+            log.leer(mi_uid()).is_empty(),
+            "apagado no registra ni los bloqueos"
+        );
     }
 
     /// `resolver_exe` lee `/proc/<pid>/exe` cuando el pid no está en la caché:
