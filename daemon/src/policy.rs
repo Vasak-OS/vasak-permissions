@@ -221,6 +221,26 @@ impl UserPolicy {
     }
 }
 
+/// Ajustes **globales** del servicio: no por usuario, sino del equipo. Van en su
+/// propio archivo (`settings.json`), aparte de las políticas por uid.
+///
+/// Hoy guarda sólo el interruptor del **log de bloqueos del cortafuegos** (M3 del
+/// #93). Cada campo con `default` para que un archivo anterior a M3 —o ausente, un
+/// sistema recién instalado— se lea sin romper: sale en su valor por omisión.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GlobalSettings {
+    /// Si el log persistente de bloqueos del cortafuegos está prendido. **Apagado
+    /// por omisión**: un sistema recién instalado no registra nada. Apagarlo detiene
+    /// las escrituras; **no** borra lo guardado (borrar es `ClearFirewallLog`).
+    #[serde(default)]
+    pub firewall_logging_enabled: bool,
+}
+
+/// El nombre del archivo de ajustes globales, bajo el directorio de política. Su
+/// raíz (`settings`) no parsea como uid, así que los barridos por `<uid>.json`
+/// (`red_cortada_inicial`, `domain_rules_initial`) lo saltean.
+const SETTINGS_FILE: &str = "settings.json";
+
 /// Reads and writes the per-user policy files.
 #[derive(Debug, Clone)]
 pub struct PolicyStore {
@@ -360,6 +380,49 @@ impl PolicyStore {
 
         write_atomically(&self.path_for(uid), serialised.as_bytes())
             .map_err(|e| format!("no se pudo guardar la política: {e}"))
+    }
+
+    /// El directorio donde viven los archivos del servicio. Lo usa el log de
+    /// bloqueos del cortafuegos (M3) para poner los suyos al lado de las políticas,
+    /// de root y 0700, y respeta el override de desarrollo
+    /// (`VASAK_PERMISSIONS_TEST_ROOT`) sin tener que repetirlo.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.directory.join(SETTINGS_FILE)
+    }
+
+    /// Lee los ajustes globales. Un archivo ausente —un sistema recién instalado—
+    /// son los ajustes por omisión (todo apagado). Uno ilegible o dañado se trata
+    /// igual, con un aviso: para un interruptor de log, el valor seguro ante la duda
+    /// es **apagado**, no seguir registrando con un archivo que no se entiende.
+    pub fn load_settings(&self) -> GlobalSettings {
+        let path = self.settings_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return GlobalSettings::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!(
+                "los ajustes globales en {} están dañados ({e}); se usan los \
+                 valores por omisión (log de bloqueos apagado)",
+                path.display()
+            );
+            GlobalSettings::default()
+        })
+    }
+
+    /// Guarda los ajustes globales, de forma atómica y 0600, como las políticas.
+    pub fn save_settings(&self, settings: &GlobalSettings) -> Result<(), String> {
+        std::fs::create_dir_all(&self.directory)
+            .map_err(|e| format!("no se pudo crear {}: {e}", self.directory.display()))?;
+        let _ = std::fs::set_permissions(&self.directory, PermissionsExt::from_mode(0o700));
+
+        let serialised = serde_json::to_string_pretty(settings)
+            .map_err(|e| format!("no se pudo serializar los ajustes: {e}"))?;
+        write_atomically(&self.settings_path(), serialised.as_bytes())
+            .map_err(|e| format!("no se pudo guardar los ajustes: {e}"))
     }
 }
 
@@ -965,6 +1028,73 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = PolicyStore::at(dir.path().to_path_buf());
         assert!(store.load(4242).expect("load").entries().is_empty());
+    }
+
+    /// Apagado por omisión: sin archivo de ajustes —un sistema recién instalado— el
+    /// log de bloqueos está apagado.
+    #[test]
+    fn el_log_de_bloqueos_viene_apagado_por_omision() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+        assert!(
+            !store.load_settings().firewall_logging_enabled,
+            "un sistema recién instalado no registra nada"
+        );
+    }
+
+    /// El interruptor del log sobrevive el guardado y la relectura, y el archivo de
+    /// ajustes es 0600 (no legible por el mundo) y no se confunde con una política
+    /// por uid.
+    #[test]
+    fn el_interruptor_del_log_se_guarda_y_se_relee() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+
+        store
+            .save_settings(&GlobalSettings {
+                firewall_logging_enabled: true,
+            })
+            .expect("save");
+        assert!(
+            store.load_settings().firewall_logging_enabled,
+            "quedó prendido"
+        );
+
+        let mode = std::fs::metadata(dir.path().join(SETTINGS_FILE))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "los ajustes no pueden ser legibles por el mundo"
+        );
+
+        // El archivo de ajustes no se cuenta como la red cortada de un usuario.
+        assert!(
+            store.red_cortada_inicial().is_empty(),
+            "settings.json no es un <uid>.json"
+        );
+    }
+
+    /// Un archivo de ajustes dañado no se trata como «prendido»: ante la duda, el
+    /// log queda apagado (el valor seguro para un interruptor de log).
+    #[test]
+    fn un_archivo_de_ajustes_danado_cae_a_apagado() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join(SETTINGS_FILE), "{ roto").expect("write");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+        assert!(!store.load_settings().firewall_logging_enabled);
+    }
+
+    /// Un archivo de ajustes anterior a este campo (un `{}`) se lee sin romper y sale
+    /// apagado: el `default` del campo lo cubre.
+    #[test]
+    fn un_archivo_de_ajustes_anterior_a_m3_se_lee_apagado() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join(SETTINGS_FILE), "{}").expect("write");
+        let store = PolicyStore::at(dir.path().to_path_buf());
+        assert!(!store.load_settings().firewall_logging_enabled);
     }
 
     /// Lo decidido por el portal se guarda, se lee y llega a la pantalla.
