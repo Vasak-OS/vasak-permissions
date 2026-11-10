@@ -1923,6 +1923,38 @@ mod tests {
         );
     }
 
+    /// Aditivo: un pid sin regla de dominio no entra a `FORCE_RESOLVER` ni al
+    /// enrolar ni cuando cambian los resolvedores; su DNS no se toca.
+    #[test]
+    fn un_pid_sin_regla_de_dominio_nunca_se_fuerza() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), false);
+        e.actualizar_resolvedores(set(&[ip16(127, 0, 0, 53)]), true);
+        assert!(e.motor().forzados.is_empty(), "no hay pid forzado");
+    }
+
+    /// Fail hacia no-romper en caliente: si `resolv.conf` deja de poder leerse
+    /// (`forzar_dns` vuelve a `false`), los pids ya forzados se re-estampan sólo con
+    /// `FORCE_DOH` y el 53/853 deja de cortarse; el stub sigue permitido.
+    #[test]
+    fn perder_los_resolvedores_re_estampa_solo_doh_y_deja_el_stub() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        let (con, f1) = resolver::resolvedores_desde(Some("nameserver 192.0.2.1\n"));
+        e.actualizar_resolvedores(con, f1);
+        let (sin, f2) = resolver::resolvedores_desde(None);
+        e.actualizar_resolvedores(sin, f2);
+        assert_eq!(
+            e.motor().forzados.last(),
+            Some(&(clave(1000, 42), FORCE_DOH))
+        );
+        assert_eq!(e.motor().resolvedores_quitados, vec![ip16(192, 0, 2, 1)]);
+        assert!(!e
+            .motor()
+            .resolvedores_quitados
+            .contains(&ip16(127, 0, 0, 53)));
+    }
+
     /// `poblar_doh` escribe cada IP de la lista en `KNOWN_DOH` a través del motor.
     #[test]
     fn poblar_doh_escribe_cada_ip() {
