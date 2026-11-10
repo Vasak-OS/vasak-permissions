@@ -47,8 +47,11 @@
 //! 53/853 y `FORCE_DOH` el de 443. El daemon deja `FORCE_DNS` **apagado** cuando
 //! no pudo determinar los resolvedores del sistema (fail hacia no-romper: sin eso
 //! bloquearía todo el DNS de la app); `FORCE_DOH` va siempre, porque su lista es
-//! estática y segura. Un DoH propio a una IP **fuera** de la lista sigue evadiendo
-//! la regla: es un residual conocido, no un cierre total.
+//! estática y segura. El forzado cierra la resolución **vía `connect()`** y es
+//! mejor esfuerzo, no un cierre total: un DoH propio a una IP fuera de la lista, el
+//! UDP no conectado (que no dispara este hook), y un resolvedor cifrado en puerto
+//! no estándar siguen evadiendo. La lista completa de residuales está en el módulo
+//! `resolver` del daemon.
 
 #![no_std]
 #![no_main]

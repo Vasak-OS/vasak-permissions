@@ -28,9 +28,27 @@
 //!
 //! # Residual conocido
 //!
-//! Un DoH propio de la app a una IP **fuera** de `KNOWN_DOH` sigue evadiendo la
-//! regla por dominio: el daemon no inspecciona TLS, sólo el destino. La lista es
-//! mejor esfuerzo y actualizable; esto no es un cierre total, y así se documenta.
+//! El forzado cierra la resolución **vía `connect()`** (el único camino que ve el
+//! hook), y es mejor esfuerzo, no un cierre total. No pretende detener a un
+//! atacante determinado —que puede tunelizar—; es endurecimiento de defensa en
+//! profundidad. Sigue evadiendo la regla por dominio:
+//!
+//! - **DoH propio a una IP fuera de `KNOWN_DOH`:** el daemon no inspecciona TLS,
+//!   sólo el destino. La lista es mejor esfuerzo y actualizable.
+//! - **UDP no conectado** (`sendto`/`sendmsg` sin `connect()`): no dispara
+//!   `cgroup/connect`, así que escapa a TODO el cortafuegos, forzado incluido —el
+//!   límite del gate por `connect()` que M0 ya documenta—. Una app evasiva puede
+//!   resolver por UDP-53 no conectado a cualquier DNS hasta que exista un hook
+//!   `sendmsg`.
+//! - **DoT/DoH en puerto no estándar** (p.ej. DoT en 9443): el gate sólo mira
+//!   53/853/443, así que un resolvedor cifrado en otro puerto evade.
+//! - **Túnel/VPN genérico:** límite de todo control por destino; no es propio de
+//!   este PR, pero se nombra.
+//!
+//! Y sobre la **observabilidad** (no el corte): forzar al resolvedor del sistema
+//! garantiza «pasa por el resolvedor», pero el daemon sólo **ve** el dominio si el
+//! snoop de PR-A destripa ese transporte; hoy el snoop sólo mira UDP, así que una
+//! resolución por TCP-53 pasa por el resolvedor pero no se observa (tema de PR-A).
 
 use std::collections::HashSet;
 
