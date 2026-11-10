@@ -579,6 +579,102 @@ mod tests {
         );
     }
 
+    /// Una conexión **permitida** nunca deja rastro, aunque el log esté prendido y
+    /// el destino caiga bajo una regla de dominio de la app: sólo se registra lo
+    /// que el cortafuegos cortó.
+    #[test]
+    fn una_conexion_permitida_no_se_registra_ni_con_regla_de_dominio() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let dominios = dominios_vacios();
+        crate::firewall::dominio::fijar(&dominios, mi_uid(), &mi_exe(), "example.com", true);
+        let respuesta = parsear_respuesta(&respuesta_dns(&["example", "com"], [192, 0, 2, 1]))
+            .expect("respuesta válida");
+        dns.lock().unwrap().observar(mi_uid(), &respuesta, 100);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), true);
+
+        procesar_evento(
+            &bytes_evento(mi_uid(), std::process::id()), // permitida
+            &modelo,
+            &cache,
+            &dns,
+            &red_vacia(),
+            &dominios,
+            &log,
+            150,
+        );
+        assert!(log.leer(mi_uid()).is_empty(), "lo permitido no se registra");
+        assert!(!dir.path().join("firewall-blocks.log").exists());
+    }
+
+    /// Un bloqueo en el puerto 443 de una app con reglas de dominio, sin dominio
+    /// resuelto para la IP, se registra como `forced-resolver`.
+    #[test]
+    fn un_bloqueo_con_reglas_de_dominio_en_443_es_forced_resolver() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let dominios = dominios_vacios();
+        crate::firewall::dominio::fijar(&dominios, mi_uid(), &mi_exe(), "example.com", true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), true);
+
+        procesar_evento(
+            &bytes_evento_bloqueado(mi_uid(), std::process::id()),
+            &modelo,
+            &cache,
+            &dns,
+            &red_vacia(),
+            &dominios,
+            &log,
+            20,
+        );
+        let entradas = log.leer(mi_uid());
+        assert_eq!(entradas.len(), 1);
+        assert_eq!(entradas[0].reason, "forced-resolver");
+        assert_eq!(entradas[0].destination, "192.0.2.1");
+    }
+
+    /// Apagar el log corta las escrituras del ring pero lo ya guardado queda.
+    #[test]
+    fn apagar_el_log_deja_lo_guardado_y_frena_lo_nuevo() {
+        let modelo = modelo_nuevo();
+        let cache = cache_nueva();
+        let dns = modelo_dns_nuevo();
+        let red = red_vacia();
+        crate::firewall::enrolar::fijar(&red, mi_uid(), &mi_exe(), true);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = registro::nuevo(dir.path(), true);
+        let ev = bytes_evento_bloqueado(mi_uid(), std::process::id());
+
+        procesar_evento(
+            &ev,
+            &modelo,
+            &cache,
+            &dns,
+            &red,
+            &dominios_vacios(),
+            &log,
+            1,
+        );
+        log.set_enabled(false);
+        procesar_evento(
+            &ev,
+            &modelo,
+            &cache,
+            &dns,
+            &red,
+            &dominios_vacios(),
+            &log,
+            2,
+        );
+        let entradas = log.leer(mi_uid());
+        assert_eq!(entradas.len(), 1, "queda lo viejo, no entra lo nuevo");
+        assert_eq!(entradas[0].timestamp_secs, 1);
+    }
+
     /// Con el log **apagado**, un bloqueo no se registra: el opt-in se respeta en el
     /// camino del ring, no sólo en el archivo.
     #[test]

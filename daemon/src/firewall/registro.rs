@@ -537,6 +537,55 @@ mod tests {
         assert!(tam_activo <= 200 + 200, "el activo queda acotado");
     }
 
+    /// Borrar también saca el archivo rotado: no queda historia escondida en el `.1`.
+    #[test]
+    fn borrar_tambien_saca_el_archivo_rotado() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = Arc::new(FirewallLog {
+            enabled: AtomicBool::new(true),
+            io: Mutex::new(RegistroCortafuegos::nuevo(dir.path(), 200)),
+        });
+        for _ in 0..20 {
+            log.registrar(&entrada_ejemplo(1000, "kill-switch"));
+        }
+        assert!(dir.path().join(ARCHIVO_ROTADO).exists());
+        log.borrar().expect("borra");
+        assert!(!dir.path().join(ARCHIVO_ROTADO).exists());
+        assert!(log.leer(1000).is_empty());
+    }
+
+    /// El total en disco nunca pasa de dos archivos del tope, y lo más viejo es lo
+    /// que se cae: tras muchas escrituras sobreviven sólo las últimas.
+    #[test]
+    fn el_log_queda_acotado_y_se_cae_lo_mas_viejo() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tope = 300u64;
+        let log = Arc::new(FirewallLog {
+            enabled: AtomicBool::new(true),
+            io: Mutex::new(RegistroCortafuegos::nuevo(dir.path(), tope)),
+        });
+        for n in 0..200u64 {
+            let mut e = entrada_ejemplo(1000, "kill-switch");
+            e.timestamp_secs = n;
+            log.registrar(&e);
+        }
+        let tam = |a: &str| {
+            std::fs::metadata(dir.path().join(a))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        assert!(
+            tam(ARCHIVO) + tam(ARCHIVO_ROTADO) <= 2 * tope,
+            "el total no crece sin límite"
+        );
+        let leidas = log.leer(1000);
+        assert_eq!(leidas.last().map(|e| e.timestamp_secs), Some(199));
+        assert!(
+            leidas.first().is_some_and(|e| e.timestamp_secs > 0),
+            "lo más viejo se cayó"
+        );
+    }
+
     /// Borrar saca los dos archivos; borrar de nuevo (ya vacío) no es error. Apagar
     /// no borró; esto sí.
     #[test]
