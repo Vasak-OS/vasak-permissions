@@ -27,6 +27,31 @@
 //! como constante por programa, así que el verificador ve sólo el acceso al campo
 //! del contexto que corresponde a cada punto de enganche (`user_ip4` en v4,
 //! `user_ip6` en v6): la rama de la otra familia es código muerto que se elimina.
+//!
+//! # Forzar el resolvedor del sistema (M2, PR-C)
+//!
+//! Una regla por dominio sólo es efectiva si la app resuelve por el resolvedor
+//! que el daemon observa (el snoop). Una app que corre su **propio** DoH/DoT
+//! esconde el dominio y evade la regla. Para los pids de binarios con **alguna**
+//! regla de dominio —los que el daemon marca en `FORCE_RESOLVER`— se cierra esa
+//! evasión, ADITIVO al kill-switch y al bloqueo por dominio:
+//!
+//! - **DNS en claro (53) y DoT (853):** se corta el `connect()` si el destino
+//!   **no** es un resolvedor del sistema (`SYSTEM_RESOLVERS`), forzando la
+//!   resolución por el resolvedor observable.
+//! - **DoH (443):** se corta el `connect()` si el destino está en la lista de IPs
+//!   de proveedores DoH conocidos (`KNOWN_DOH`), una lista estática **mejor
+//!   esfuerzo** que el daemon puebla y mantiene.
+//!
+//! El valor de `FORCE_RESOLVER` es un bitmask: `FORCE_DNS` activa el corte de
+//! 53/853 y `FORCE_DOH` el de 443. El daemon deja `FORCE_DNS` **apagado** cuando
+//! no pudo determinar los resolvedores del sistema (fail hacia no-romper: sin eso
+//! bloquearía todo el DNS de la app); `FORCE_DOH` va siempre, porque su lista es
+//! estática y segura. El forzado cierra la resolución **vía `connect()`** y es
+//! mejor esfuerzo, no un cierre total: un DoH propio a una IP fuera de la lista, el
+//! UDP no conectado (que no dispara este hook), y un resolvedor cifrado en puerto
+//! no estándar siguen evadiendo. La lista completa de residuales está en el módulo
+//! `resolver` del daemon.
 
 #![no_std]
 #![no_main]
@@ -85,9 +110,43 @@ struct DomainKey {
     ip: [u8; 16],
 }
 
+/// El marcador «este pid está bajo una regla de dominio» (M2, PR-C). El daemon lo
+/// puebla con los pids de binarios con **alguna** regla de dominio, reusando el
+/// enrolado por pid de PR-B; la clave es la misma de `BLOCKED` (`uid << 32 | pid`)
+/// y el valor es un bitmask ([`FORCE_DNS`] | [`FORCE_DOH`]). Sin pids enrolados
+/// este mapa está **vacío** y el veredicto queda idéntico (aditivo).
+#[map]
+static FORCE_RESOLVER: HashMap<u64, u8> = HashMap::with_max_entries(4096, 0);
+
+/// Las IPs de los resolvedores del sistema (stub de systemd-resolved +
+/// nameservers de `/etc/resolv.conf`), que el daemon puebla y mantiene. Un pid
+/// forzado con [`FORCE_DNS`] sólo puede hablar DNS/DoT con una IP de acá. Mismo
+/// formato de 16 bytes que `ConnectionEvent.dst` (IPv4 en los primeros 4).
+#[map]
+static SYSTEM_RESOLVERS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(64, 0);
+
+/// Las IPs de proveedores DoH conocidos (lista estática **mejor esfuerzo** que el
+/// daemon embebe y puebla). Un pid forzado con [`FORCE_DOH`] no puede conectar al
+/// 443 de ninguna de estas IPs. Mismo formato de 16 bytes.
+#[map]
+static KNOWN_DOH: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
+
 /// El único valor que M0 escribe. Deja lugar a `allow` explícito y a un id de
 /// set de IPs para M2 sin cambiar la forma del mapa.
 const DENY: u8 = 1;
+
+/// Bits del valor de [`FORCE_RESOLVER`]. `FORCE_DNS` fuerza la resolución por el
+/// resolvedor del sistema (corta 53/853 a IPs que no son resolvedor); `FORCE_DOH`
+/// corta el 443 a las IPs DoH conocidas. **Tienen que coincidir** con los del
+/// daemon (`firewall::FORCE_DNS`/`FORCE_DOH`); una prueba de correspondencia los
+/// ata.
+const FORCE_DNS: u8 = 1;
+const FORCE_DOH: u8 = 2;
+
+/// Los puertos que el forzado del resolvedor mira: DNS en claro, DoT y DoH.
+const PORT_DNS: u16 = 53;
+const PORT_DOT: u16 = 853;
+const PORT_DOH: u16 = 443;
 
 /// Para un programa `cgroup/connect`, 1 deja seguir el `connect()` y 0 lo corta
 /// con EPERM. El veredicto, no un código de error.
@@ -167,7 +226,22 @@ fn handle(ctx: &SockAddrContext, family: u8) -> i32 {
     let dominio_bloqueado =
         matches!(unsafe { DOMAIN_BLOCKED.get(&domain_key) }, Some(&policy) if policy == DENY);
 
-    let bloqueado = kill_switch || dominio_bloqueado;
+    // M2 PR-C — forzar el resolvedor del sistema, ADITIVO. Sólo se mira el mapa
+    // para los tres puertos que importan (53/853/443) y sólo pega si el pid está
+    // en `FORCE_RESOLVER` (binario con regla de dominio). Para cualquier otro pid
+    // o puerto el `get` ni se consulta y el veredicto es el mismo de arriba.
+    let resolver_forzado = if matches!(port, PORT_DNS | PORT_DOT | PORT_DOH) {
+        // SAFETY: igual que arriba; la clave es un `u64` por valor y el acceso no
+        // sale del mapa.
+        match unsafe { FORCE_RESOLVER.get(&key) } {
+            Some(&flags) => fuerza_resolvedor(flags, dst, port),
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    let bloqueado = kill_switch || dominio_bloqueado || resolver_forzado;
 
     // Después del veredicto y sin tocarlo: la emisión es observacional.
     emit(uid, tgid, family, dst, port, proto, bloqueado);
@@ -176,6 +250,28 @@ fn handle(ctx: &SockAddrContext, family: u8) -> i32 {
         BLOCK
     } else {
         ALLOW
+    }
+}
+
+/// El corte del forzado del resolvedor para un pid enrolado, por puerto (M2 PR-C).
+/// Es la **misma decisión** que `firewall::resolver::corta_por_resolvedor` del
+/// daemon —probada ahí sin root—, con los dos booleanos resueltos acá contra los
+/// mapas: `SYSTEM_RESOLVERS` (¿el destino es un resolvedor del sistema?) y
+/// `KNOWN_DOH` (¿es una IP DoH conocida?).
+///
+/// - 53/853 (DNS en claro y DoT): corta si `FORCE_DNS` está y el destino **no** es
+///   resolvedor del sistema.
+/// - 443 (DoH): corta si `FORCE_DOH` está y el destino **sí** es DoH conocido.
+#[inline(always)]
+fn fuerza_resolvedor(flags: u8, dst: [u8; 16], port: u16) -> bool {
+    match port {
+        PORT_DNS | PORT_DOT => {
+            // SAFETY: la clave es un `[u8; 16]` por valor y el acceso no sale del
+            // mapa; sólo se mira si está presente.
+            flags & FORCE_DNS != 0 && unsafe { SYSTEM_RESOLVERS.get(&dst) }.is_none()
+        }
+        PORT_DOH => flags & FORCE_DOH != 0 && unsafe { KNOWN_DOH.get(&dst) }.is_some(),
+        _ => false,
     }
 }
 

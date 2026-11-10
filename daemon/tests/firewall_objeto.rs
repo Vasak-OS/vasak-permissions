@@ -148,6 +148,9 @@ fn el_objeto_commiteado_trae_el_ring_buffer_de_eventos() {
         "EVENTS",
         "BLOCKED",
         "DOMAIN_BLOCKED",
+        "FORCE_RESOLVER",
+        "SYSTEM_RESOLVERS",
+        "KNOWN_DOH",
         "connect4",
         "connect6",
     ] {

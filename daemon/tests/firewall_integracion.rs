@@ -21,6 +21,9 @@ use aya::Ebpf;
 
 const CGROUP_RAIZ: &str = "/sys/fs/cgroup";
 const DENY: u8 = 1;
+/// Los bits del valor de `FORCE_RESOLVER`, iguales al daemon y al programa BPF.
+const FORCE_DNS: u8 = 1;
+const FORCE_DOH: u8 = 2;
 /// El tamaño del `ConnectionEvent` del programa (32 bytes con relleno explícito);
 /// el parser del daemon usa los mismos desplazamientos.
 const EVENTO_LEN: usize = 32;
@@ -38,6 +41,15 @@ struct DomainKey {
 // SAFETY: `repr(C)`, `Copy`, sin punteros: cualquier secuencia de bytes de su
 // tamaño es válida, que es lo que `aya::Pod` exige.
 unsafe impl aya::Pod for DomainKey {}
+
+/// La clave de 16 bytes de `SYSTEM_RESOLVERS`/`KNOWN_DOH`, igual que en el daemon:
+/// aya no implementa `Pod` para arreglos, así que hace falta el envoltorio.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Ip16([u8; 16]);
+
+// SAFETY: `repr(transparent)` sobre `[u8; 16]`, `Copy`, sin punteros.
+unsafe impl aya::Pod for Ip16 {}
 
 /// La IPv4 en los 16 bytes del mapa, como la arma `connect4`: octetos primero,
 /// cero el resto.
@@ -75,6 +87,13 @@ fn errno_de_connect() -> i32 {
 /// Igual, pero a una IP de destino cualquiera (dentro de TEST-NET, que no rutea),
 /// para distinguir qué destino corta el bloqueo por dominio y cuál no.
 fn errno_de_connect_a(ip: [u8; 4]) -> i32 {
+    errno_de_connect_puerto(ip, 80)
+}
+
+/// Igual, a una IP y **puerto** cualesquiera: lo usa el forzado del resolvedor, que
+/// decide por puerto (53/853/443). No bloqueante, así que sin cortar devuelve
+/// `EINPROGRESS`/`ECONNREFUSED`, nunca `EPERM`: ese es el discriminante.
+fn errno_de_connect_puerto(ip: [u8; 4], puerto: u16) -> i32 {
     // SAFETY: llamadas a la API de sockets de POSIX con argumentos válidos; el
     // descriptor se cierra antes de salir.
     unsafe {
@@ -84,7 +103,7 @@ fn errno_de_connect_a(ip: [u8; 4]) -> i32 {
         }
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_port = 80u16.to_be();
+        addr.sin_port = puerto.to_be();
         addr.sin_addr.s_addr = u32::from_be_bytes(ip).to_be();
         let r = libc::connect(
             fd,
@@ -281,5 +300,104 @@ fn un_pid_marcado_no_conecta_y_uno_sin_marcar_si() {
         errno_de_connect_a(ip_bloqueada),
         libc::EPERM,
         "tras quitar la regla de dominio, la IP vuelve a pasar"
+    );
+
+    // ── Forzar el resolvedor del sistema (M2, PR-C) ───────────────────────────
+    //
+    // El daemon marca `FORCE_RESOLVER[clave de pid] = FORCE_DNS|FORCE_DOH` para los
+    // pids de binarios con regla de dominio, puebla `SYSTEM_RESOLVERS` con los
+    // resolvedores del sistema y `KNOWN_DOH` con las IPs DoH conocidas. Acá se
+    // escriben a mano y se comprueba el corte por puerto. El kill-switch de M0 y el
+    // bloqueo por dominio ya se quitaron, así que lo único que puede cortar es el
+    // forzado del resolvedor.
+    let resolvedor = [127u8, 0, 0, 53]; // el stub de systemd-resolved
+    let no_resolvedor = [192u8, 0, 2, 60]; // TEST-NET, no es resolvedor
+    let doh = [1u8, 1, 1, 1]; // Cloudflare, una IP DoH conocida
+    {
+        let mapa = ebpf
+            .map_mut("SYSTEM_RESOLVERS")
+            .expect("falta el mapa SYSTEM_RESOLVERS");
+        let mut resolvers: BpfHashMap<_, Ip16, u8> =
+            BpfHashMap::try_from(mapa).expect("SYSTEM_RESOLVERS no es un HashMap");
+        resolvers
+            .insert(Ip16(ip16(resolvedor)), 1, 0)
+            .expect("no se pudo poblar el resolvedor");
+    }
+    {
+        let mapa = ebpf.map_mut("KNOWN_DOH").expect("falta el mapa KNOWN_DOH");
+        let mut doh_map: BpfHashMap<_, Ip16, u8> =
+            BpfHashMap::try_from(mapa).expect("KNOWN_DOH no es un HashMap");
+        doh_map
+            .insert(Ip16(ip16(doh)), 1, 0)
+            .expect("no se pudo poblar la IP DoH");
+    }
+
+    // Un pid NO forzado: su 53 a cualquier lado pasa, incluso a un no-resolvedor.
+    assert_ne!(
+        errno_de_connect_puerto(no_resolvedor, 53),
+        libc::EPERM,
+        "un pid sin FORCE_RESOLVER no tiene forzado el resolvedor: su 53 pasa"
+    );
+
+    // Marcar este pid como forzado (los dos bits), como hace el daemon al enrolar
+    // un binario con regla de dominio con los resolvedores ya determinados.
+    {
+        let mapa = ebpf
+            .map_mut("FORCE_RESOLVER")
+            .expect("falta el mapa FORCE_RESOLVER");
+        let mut forzar: BpfHashMap<_, u64, u8> =
+            BpfHashMap::try_from(mapa).expect("FORCE_RESOLVER no es un HashMap");
+        forzar
+            .insert(key, FORCE_DNS | FORCE_DOH, 0)
+            .expect("no se pudo marcar FORCE_RESOLVER");
+    }
+
+    // 53 a un no-resolvedor: cortado (se fuerza la resolución por el resolvedor).
+    assert_eq!(
+        errno_de_connect_puerto(no_resolvedor, 53),
+        libc::EPERM,
+        "un pid forzado no puede hablar DNS en claro con un no-resolvedor"
+    );
+    // 53 al resolvedor del sistema: pasa (si no, se rompería todo el DNS).
+    assert_ne!(
+        errno_de_connect_puerto(resolvedor, 53),
+        libc::EPERM,
+        "un pid forzado SÍ puede hablar DNS con el resolvedor del sistema"
+    );
+    // 853 (DoT) a un no-resolvedor: cortado, igual que el 53 en claro.
+    assert_eq!(
+        errno_de_connect_puerto(no_resolvedor, 853),
+        libc::EPERM,
+        "un pid forzado no puede hablar DoT con un no-resolvedor"
+    );
+    // 443 a una IP DoH conocida: cortado.
+    assert_eq!(
+        errno_de_connect_puerto(doh, 443),
+        libc::EPERM,
+        "un pid forzado no puede conectar al 443 de una IP DoH conocida"
+    );
+    // 443 a una IP que NO es DoH conocida: pasa (sólo se bloquea la lista DoH; un
+    // DoH propio a una IP desconocida es el residual documentado).
+    assert_ne!(
+        errno_de_connect_puerto(no_resolvedor, 443),
+        libc::EPERM,
+        "el 443 a una IP que no es DoH conocida no se corta"
+    );
+
+    // Al desmarcar el pid, su 53 a un no-resolvedor vuelve a pasar.
+    {
+        let mapa = ebpf
+            .map_mut("FORCE_RESOLVER")
+            .expect("falta el mapa FORCE_RESOLVER");
+        let mut forzar: BpfHashMap<_, u64, u8> =
+            BpfHashMap::try_from(mapa).expect("FORCE_RESOLVER no es un HashMap");
+        forzar
+            .remove(&key)
+            .expect("no se pudo desmarcar FORCE_RESOLVER");
+    }
+    assert_ne!(
+        errno_de_connect_puerto(no_resolvedor, 53),
+        libc::EPERM,
+        "tras quitar FORCE_RESOLVER, el 53 vuelve a pasar"
     );
 }
