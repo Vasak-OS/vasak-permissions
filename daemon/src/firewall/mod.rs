@@ -57,6 +57,7 @@ pub mod dns;
 pub mod dominio;
 pub mod enrolar;
 pub mod mapa;
+pub mod registro;
 pub mod resolver;
 
 use std::collections::{HashMap, HashSet};
