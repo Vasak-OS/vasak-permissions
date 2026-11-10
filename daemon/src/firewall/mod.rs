@@ -109,12 +109,16 @@ const MAPA_RESOLVEDORES: &str = "SYSTEM_RESOLVERS";
 const MAPA_DOH: &str = "KNOWN_DOH";
 
 /// El tope de `FORCE_RESOLVER`. **Tiene que coincidir** con el programa BPF.
+/// Sólo lo lee la prueba de correspondencia; `not(test)` lo marca permitido.
+#[cfg_attr(not(test), allow(dead_code))]
 const CAPACIDAD_FORZAR: usize = 4096;
 
 /// El tope de `SYSTEM_RESOLVERS`. **Tiene que coincidir** con el programa BPF.
+#[cfg_attr(not(test), allow(dead_code))]
 const CAPACIDAD_RESOLVEDORES: usize = 64;
 
 /// El tope de `KNOWN_DOH`. **Tiene que coincidir** con el programa BPF.
+#[cfg_attr(not(test), allow(dead_code))]
 const CAPACIDAD_DOH: usize = 256;
 
 /// Bits del valor de `FORCE_RESOLVER`. **Tienen que coincidir** con los del
