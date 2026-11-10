@@ -57,6 +57,7 @@ pub mod dns;
 pub mod dominio;
 pub mod enrolar;
 pub mod mapa;
+pub mod resolver;
 
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -95,6 +96,34 @@ const MAPA_DOMINIO: &str = "DOMAIN_BLOCKED";
 /// para el fail-closed, igual que [`CAPACIDAD_BLOCKED`].
 const CAPACIDAD_DOMINIO: usize = 4096;
 
+/// El nombre del mapa del marcador «pid bajo regla de dominio» (M2, PR-C), el del
+/// `static` en `firewall-ebpf`. El daemon lo puebla con los pids de binarios con
+/// alguna regla de dominio; el valor es el bitmask [`FORCE_DNS`]/[`FORCE_DOH`].
+const MAPA_FORZAR: &str = "FORCE_RESOLVER";
+
+/// El nombre del mapa de los resolvedores del sistema (M2, PR-C).
+const MAPA_RESOLVEDORES: &str = "SYSTEM_RESOLVERS";
+
+/// El nombre del mapa de las IPs DoH conocidas (M2, PR-C).
+const MAPA_DOH: &str = "KNOWN_DOH";
+
+/// El tope de `FORCE_RESOLVER`. **Tiene que coincidir** con el programa BPF.
+const CAPACIDAD_FORZAR: usize = 4096;
+
+/// El tope de `SYSTEM_RESOLVERS`. **Tiene que coincidir** con el programa BPF.
+const CAPACIDAD_RESOLVEDORES: usize = 64;
+
+/// El tope de `KNOWN_DOH`. **Tiene que coincidir** con el programa BPF.
+const CAPACIDAD_DOH: usize = 256;
+
+/// Bits del valor de `FORCE_RESOLVER`. **Tienen que coincidir** con los del
+/// programa BPF (`firewall-ebpf::FORCE_DNS`/`FORCE_DOH`); una prueba de
+/// correspondencia los ata. `FORCE_DNS` fuerza la resolución por el resolvedor del
+/// sistema (corta 53/853 a IPs que no lo son); `FORCE_DOH` corta el 443 a las IPs
+/// DoH conocidas.
+pub(crate) const FORCE_DNS: u8 = 1;
+pub(crate) const FORCE_DOH: u8 = 2;
+
 /// Los dos programas `cgroup/connect` que se adjuntan a la raíz, en orden.
 const PROGRAMAS: [&str; 2] = ["connect4", "connect6"];
 
@@ -123,6 +152,18 @@ fn clave_dominio(pid_key: u64, ip: [u8; 16]) -> DomainKey {
     DomainKey { pid_key, ip }
 }
 
+/// Una IP en 16 bytes como clave cruda de `SYSTEM_RESOLVERS`/`KNOWN_DOH` (M2,
+/// PR-C). `repr(transparent)` sobre `[u8; 16]`: mismos 16 bytes que la clave
+/// `[u8; 16]` que el programa BPF usa en esos mapas. aya no implementa `Pod` para
+/// arreglos, así que hace falta este envoltorio para escribir el mapa.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct Ip16([u8; 16]);
+
+// SAFETY: `repr(transparent)` sobre `[u8; 16]`, `Copy` y sin padding: cualquier
+// secuencia de 16 bytes es válida, que es lo que `aya::Pod` exige.
+unsafe impl aya::Pod for Ip16 {}
+
 /// El motor eBPF visto por la lógica del cortafuegos: lo justo para adjuntar un
 /// programa y marcar o desmarcar un pid en el mapa `BLOCKED`.
 ///
@@ -146,6 +187,24 @@ pub trait MotorBpf {
 
     /// Quita la pareja `(clave de pid, IP)` de `DOMAIN_BLOCKED`.
     fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError>;
+
+    /// Marca `clave de pid → flags` en `FORCE_RESOLVER` (M2, PR-C): el pid queda
+    /// bajo el forzado del resolvedor según el bitmask.
+    fn marcar_forzado(&mut self, pid_key: u64, flags: u8) -> Result<(), MapError>;
+
+    /// Quita `clave de pid` de `FORCE_RESOLVER`.
+    fn quitar_forzado(&mut self, pid_key: u64) -> Result<(), MapError>;
+
+    /// Agrega `ip` a `SYSTEM_RESOLVERS` (M2, PR-C): una IP que los pids forzados sí
+    /// pueden usar para DNS/DoT.
+    fn insertar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError>;
+
+    /// Quita `ip` de `SYSTEM_RESOLVERS` (dejó de ser resolvedor del sistema).
+    fn quitar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError>;
+
+    /// Agrega `ip` a `KNOWN_DOH` (M2, PR-C): una IP DoH conocida que los pids
+    /// forzados no pueden usar en el 443.
+    fn insertar_doh(&mut self, ip: [u8; 16]) -> Result<(), MapError>;
 }
 
 /// El cortafuegos cargado: es dueño del motor eBPF y, a través de él, del
@@ -265,6 +324,66 @@ impl<M: MotorBpf> Firewall<M> {
             )),
         }
     }
+
+    /// Marca un pid en `FORCE_RESOLVER` con `flags` (M2, PR-C). Mejor esfuerzo con
+    /// mensaje accionable: un fallo deja al pid sin forzar (DoH evadible), no rompe
+    /// nada vivo, así que el llamador lo registra y sigue.
+    pub fn forzar_pid(&mut self, pid_key: u64, flags: u8) -> Result<(), String> {
+        self.motor.marcar_forzado(pid_key, flags).map_err(|e| {
+            format!(
+                "no se pudo marcar FORCE_RESOLVER para la clave de pid {pid_key:#x}: {}",
+                con_causas(&e)
+            )
+        })
+    }
+
+    /// Quita un pid de `FORCE_RESOLVER`. Una clave ausente es éxito, igual que
+    /// [`Self::unblock`].
+    pub fn desforzar_pid(&mut self, pid_key: u64) -> Result<(), String> {
+        match self.motor.quitar_forzado(pid_key) {
+            Ok(()) => Ok(()),
+            Err(e) if es_clave_ausente(&e) => Ok(()),
+            Err(e) => Err(format!(
+                "no se pudo quitar FORCE_RESOLVER de la clave de pid {pid_key:#x}: {}",
+                con_causas(&e)
+            )),
+        }
+    }
+
+    /// Agrega una IP a `SYSTEM_RESOLVERS`. Idempotente.
+    pub fn agregar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), String> {
+        self.motor.insertar_resolvedor(ip).map_err(|e| {
+            format!(
+                "no se pudo agregar el resolvedor {}: {}",
+                ip_texto(&ip),
+                con_causas(&e)
+            )
+        })
+    }
+
+    /// Quita una IP de `SYSTEM_RESOLVERS`. Una clave ausente es éxito.
+    pub fn quitar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), String> {
+        match self.motor.quitar_resolvedor(ip) {
+            Ok(()) => Ok(()),
+            Err(e) if es_clave_ausente(&e) => Ok(()),
+            Err(e) => Err(format!(
+                "no se pudo quitar el resolvedor {}: {}",
+                ip_texto(&ip),
+                con_causas(&e)
+            )),
+        }
+    }
+
+    /// Agrega una IP a `KNOWN_DOH`. Idempotente.
+    pub fn agregar_doh(&mut self, ip: [u8; 16]) -> Result<(), String> {
+        self.motor.insertar_doh(ip).map_err(|e| {
+            format!(
+                "no se pudo agregar la IP DoH {}: {}",
+                ip_texto(&ip),
+                con_causas(&e)
+            )
+        })
+    }
 }
 
 /// Texto legible de una IP en 16 bytes, para los mensajes de error: IPv4 si los
@@ -305,6 +424,14 @@ pub struct Enforcer<M: MotorBpf = MotorAya> {
     /// mapa BPF: hace falta para quitar las entradas al salir el pid (su `/proc`
     /// ya no está) y para diferenciar qué agregar y qué quitar al reconciliar.
     dominio: HashMap<u32, DomPid>,
+    /// Lo que hay ahora en `SYSTEM_RESOLVERS` (M2, PR-C), para diffear al
+    /// refrescar `/etc/resolv.conf` sin tener que vaciar el mapa BPF.
+    resolvedores: HashSet<[u8; 16]>,
+    /// Si el bit [`FORCE_DNS`] va activo en los pids forzados: `true` cuando se
+    /// pudieron determinar los resolvedores del sistema. **Fail hacia no-romper:**
+    /// arranca en `false` (hasta leer `resolv.conf` no se fuerza 53/853, para no
+    /// cortar todo el DNS de una app con regla).
+    forzar_dns: bool,
 }
 
 /// Un pid enrolado por regla de dominio: con qué uid y ejecutable, y las IPs que
@@ -322,7 +449,16 @@ impl<M: MotorBpf> Enforcer<M> {
             firewall,
             marcados: HashMap::new(),
             dominio: HashMap::new(),
+            resolvedores: HashSet::new(),
+            forzar_dns: false,
         }
+    }
+
+    /// El bitmask de `FORCE_RESOLVER` que corresponde ahora: `FORCE_DOH` siempre
+    /// (lista estática y segura) y `FORCE_DNS` sólo si se pudieron determinar los
+    /// resolvedores del sistema.
+    fn flags_forzar(&self) -> u8 {
+        FORCE_DOH | if self.forzar_dns { FORCE_DNS } else { 0 }
     }
 
     /// Marca `(uid, pid)` y lo anota como vivo. Idempotente. Fail-closed: si la
@@ -352,6 +488,11 @@ impl<M: MotorBpf> Enforcer<M> {
                 if let Err(e) = self.firewall.desbloquear_ip(pid_key, ip) {
                     tracing::warn!("Cortafuegos (dominio): al limpiar el pid {pid}: {e}");
                 }
+            }
+            // Y el marcador del forzado del resolvedor (M2, PR-C), igual mejor
+            // esfuerzo: el pid ya salió, una clave colgada no corta nada vivo.
+            if let Err(e) = self.firewall.desforzar_pid(pid_key) {
+                tracing::warn!("Cortafuegos (forzar resolvedor): al limpiar el pid {pid}: {e}");
             }
         }
         if let Some(uid) = self.marcados.remove(&pid) {
@@ -399,9 +540,19 @@ impl<M: MotorBpf> Enforcer<M> {
                         errores.push(e);
                     }
                 }
+                // Y el marcador del forzado del resolvedor: el binario ya no tiene
+                // regla, así que el pid deja de estar forzado.
+                if let Err(e) = self.firewall.desforzar_pid(pid_key) {
+                    errores.push(e);
+                }
             }
             return errores;
         }
+
+        // Primera vez que se enrola este pid: marcar `FORCE_RESOLVER`. En los
+        // reconciles siguientes el flag no cambia por pid (sólo globalmente, y eso
+        // lo re-estampa `actualizar_resolvedores`), así que no se reescribe.
+        let recien_enrolado = !self.dominio.contains_key(&pid);
 
         let actuales = self
             .dominio
@@ -437,6 +588,16 @@ impl<M: MotorBpf> Enforcer<M> {
                 ips: aplicadas,
             },
         );
+        // Al enrolarlo por primera vez, se lo marca en `FORCE_RESOLVER` (M2, PR-C):
+        // desde ya se le fuerza el resolvedor del sistema. Mejor esfuerzo —un fallo
+        // deja al pid sin forzar (DoH evadible), no rompe nada—, así que el error
+        // se junta y sube, como las IPs.
+        if recien_enrolado {
+            let flags = self.flags_forzar();
+            if let Err(e) = self.firewall.forzar_pid(clave(uid, pid), flags) {
+                errores.push(e);
+            }
+        }
         errores
     }
 
@@ -482,6 +643,69 @@ impl<M: MotorBpf> Enforcer<M> {
         pares.sort();
         pares.dedup();
         pares
+    }
+
+    /// Puebla `KNOWN_DOH` con la lista estática de IPs DoH conocidas (M2, PR-C).
+    /// Se corre una vez al arrancar; la lista no cambia en runtime. Mejor esfuerzo:
+    /// una IP que no entre se junta y sube, el resto se escribe igual.
+    pub fn poblar_doh(&mut self, ips: &HashSet<[u8; 16]>) -> Vec<String> {
+        let mut errores = Vec::new();
+        for &ip in ips {
+            if let Err(e) = self.firewall.agregar_doh(ip) {
+                errores.push(e);
+            }
+        }
+        errores
+    }
+
+    /// Lleva `SYSTEM_RESOLVERS` a `nuevos` (diff contra lo que ya estaba) y fija el
+    /// bit global `FORCE_DNS` a `forzar_dns`, re-estampando los pids forzados si
+    /// cambió (M2, PR-C). Lo corre el refresco de `/etc/resolv.conf` al arrancar y
+    /// en el barrido periódico.
+    ///
+    /// **Fail hacia no-romper:** `forzar_dns` llega en `false` cuando no se pudieron
+    /// determinar los resolvedores; entonces los pids forzados quedan con sólo
+    /// `FORCE_DOH` y el 53/853 no se corta, para no tumbar el DNS de la app.
+    ///
+    /// Devuelve los errores sin cortar, como [`Self::reconciliar`].
+    pub fn actualizar_resolvedores(
+        &mut self,
+        nuevos: HashSet<[u8; 16]>,
+        forzar_dns: bool,
+    ) -> Vec<String> {
+        let mut errores = Vec::new();
+        let agregar: Vec<[u8; 16]> = nuevos.difference(&self.resolvedores).copied().collect();
+        for ip in agregar {
+            match self.firewall.agregar_resolvedor(ip) {
+                Ok(()) => {
+                    self.resolvedores.insert(ip);
+                }
+                Err(e) => errores.push(e),
+            }
+        }
+        let sobrantes: Vec<[u8; 16]> = self.resolvedores.difference(&nuevos).copied().collect();
+        for ip in sobrantes {
+            match self.firewall.quitar_resolvedor(ip) {
+                Ok(()) => {
+                    self.resolvedores.remove(&ip);
+                }
+                Err(e) => errores.push(e),
+            }
+        }
+
+        // Si el bit global cambió, re-estampar los pids ya forzados con el nuevo
+        // bitmask: los que estaban sólo con DoH ganan/pierden el forzado de 53/853.
+        if forzar_dns != self.forzar_dns {
+            self.forzar_dns = forzar_dns;
+            let flags = self.flags_forzar();
+            let pids: Vec<(u32, u32)> = self.dominio.iter().map(|(&pid, d)| (pid, d.uid)).collect();
+            for (pid, uid) in pids {
+                if let Err(e) = self.firewall.forzar_pid(clave(uid, pid), flags) {
+                    errores.push(e);
+                }
+            }
+        }
+        errores
     }
 
     /// Lleva lo marcado a coincidir con `deseados` (`pid → uid` que deberían
@@ -653,6 +877,43 @@ impl MotorAya {
         BpfHashMap::try_from(mapa)
     }
 
+    /// El mapa `FORCE_RESOLVER` como vista escribible (M2, PR-C), tomado por
+    /// operación por lo mismo que [`Self::mapa`].
+    fn mapa_forzar(&mut self) -> Result<BpfHashMap<&mut aya::maps::MapData, u64, u8>, MapError> {
+        let mapa = self
+            .ebpf
+            .map_mut(MAPA_FORZAR)
+            .ok_or_else(|| MapError::InvalidName {
+                name: MAPA_FORZAR.to_string(),
+            })?;
+        BpfHashMap::try_from(mapa)
+    }
+
+    /// El mapa `SYSTEM_RESOLVERS` como vista escribible (M2, PR-C). La clave es
+    /// [`Ip16`] (16 bytes), tomada por operación igual que las demás.
+    fn mapa_resolvedores(
+        &mut self,
+    ) -> Result<BpfHashMap<&mut aya::maps::MapData, Ip16, u8>, MapError> {
+        let mapa = self
+            .ebpf
+            .map_mut(MAPA_RESOLVEDORES)
+            .ok_or_else(|| MapError::InvalidName {
+                name: MAPA_RESOLVEDORES.to_string(),
+            })?;
+        BpfHashMap::try_from(mapa)
+    }
+
+    /// El mapa `KNOWN_DOH` como vista escribible (M2, PR-C), con clave [`Ip16`].
+    fn mapa_doh(&mut self) -> Result<BpfHashMap<&mut aya::maps::MapData, Ip16, u8>, MapError> {
+        let mapa = self
+            .ebpf
+            .map_mut(MAPA_DOH)
+            .ok_or_else(|| MapError::InvalidName {
+                name: MAPA_DOH.to_string(),
+            })?;
+        BpfHashMap::try_from(mapa)
+    }
+
     /// Extrae el ring buffer `EVENTS` del objeto cargado. Sale del `Ebpf` con
     /// `take_map`: el mapa en vivo lo lee un task aparte y no vuelve a tocar este
     /// `Ebpf`, así que llevárselo evita compartir el `Ebpf` entre el enforcement y
@@ -710,6 +971,26 @@ impl MotorBpf for MotorAya {
     fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
         self.mapa_dominio()?.remove(&clave_dominio(pid_key, ip))
     }
+
+    fn marcar_forzado(&mut self, pid_key: u64, flags: u8) -> Result<(), MapError> {
+        self.mapa_forzar()?.insert(pid_key, flags, 0)
+    }
+
+    fn quitar_forzado(&mut self, pid_key: u64) -> Result<(), MapError> {
+        self.mapa_forzar()?.remove(&pid_key)
+    }
+
+    fn insertar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.mapa_resolvedores()?.insert(Ip16(ip), 1, 0)
+    }
+
+    fn quitar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.mapa_resolvedores()?.remove(&Ip16(ip))
+    }
+
+    fn insertar_doh(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.mapa_doh()?.insert(Ip16(ip), 1, 0)
+    }
 }
 
 /// Un motor de mentira para ejercitar la lógica de `Firewall` y de `Enforcer`
@@ -740,6 +1021,19 @@ pub(crate) struct MotorFalso {
     /// Si está, `insertar_ip` falla con este error (para el fail-closed del mapa
     /// de dominio lleno).
     pub(crate) falla_al_insertar_ip: Option<MapError>,
+    /// Lo escrito en `FORCE_RESOLVER`: `(clave de pid, flags)` de cada
+    /// `marcar_forzado`, en orden.
+    pub(crate) forzados: Vec<(u64, u8)>,
+    /// Lo quitado de `FORCE_RESOLVER`: cada `clave de pid` de `quitar_forzado`.
+    pub(crate) desforzados: Vec<u64>,
+    /// Si está, `marcar_forzado` falla una vez con este error.
+    pub(crate) falla_al_forzar: Option<MapError>,
+    /// Lo escrito en `SYSTEM_RESOLVERS`: cada IP de `insertar_resolvedor`.
+    pub(crate) resolvedores_insertados: Vec<[u8; 16]>,
+    /// Lo quitado de `SYSTEM_RESOLVERS`: cada IP de `quitar_resolvedor`.
+    pub(crate) resolvedores_quitados: Vec<[u8; 16]>,
+    /// Lo escrito en `KNOWN_DOH`: cada IP de `insertar_doh`.
+    pub(crate) doh_insertados: Vec<[u8; 16]>,
 }
 
 #[cfg(test)]
@@ -780,6 +1074,34 @@ impl MotorBpf for MotorFalso {
 
     fn quitar_ip(&mut self, pid_key: u64, ip: [u8; 16]) -> Result<(), MapError> {
         self.quitados_ip.push((pid_key, ip));
+        Ok(())
+    }
+
+    fn marcar_forzado(&mut self, pid_key: u64, flags: u8) -> Result<(), MapError> {
+        if let Some(e) = self.falla_al_forzar.take() {
+            return Err(e);
+        }
+        self.forzados.push((pid_key, flags));
+        Ok(())
+    }
+
+    fn quitar_forzado(&mut self, pid_key: u64) -> Result<(), MapError> {
+        self.desforzados.push(pid_key);
+        Ok(())
+    }
+
+    fn insertar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.resolvedores_insertados.push(ip);
+        Ok(())
+    }
+
+    fn quitar_resolvedor(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.resolvedores_quitados.push(ip);
+        Ok(())
+    }
+
+    fn insertar_doh(&mut self, ip: [u8; 16]) -> Result<(), MapError> {
+        self.doh_insertados.push(ip);
         Ok(())
     }
 }
@@ -1416,8 +1738,9 @@ mod tests {
     fn la_fuente_bpf_combina_m0_y_dominio_con_un_or() {
         let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
         assert!(
-            fuente.contains("let bloqueado = kill_switch || dominio_bloqueado;"),
-            "el veredicto dejó de ser kill_switch OR dominio"
+            fuente
+                .contains("let bloqueado = kill_switch || dominio_bloqueado || resolver_forzado;"),
+            "el veredicto dejó de ser kill_switch OR dominio OR forzado del resolvedor"
         );
         assert!(
             fuente.contains("BLOCKED.get(&key)"),
@@ -1494,6 +1817,174 @@ mod tests {
         );
         // Y los dos lados miden lo mismo: 24 bytes (u64 + [u8;16], repr(C)).
         assert_eq!(std::mem::size_of::<DomainKey>(), 24);
+    }
+
+    // ── Forzar el resolvedor del sistema (M2, PR-C) ───────────────────────────
+
+    /// Enrolar un pid de dominio lo marca en `FORCE_RESOLVER`. Con los resolvedores
+    /// aún sin determinar (arranque: `forzar_dns=false`) el bitmask es sólo
+    /// `FORCE_DOH`: se bloquea DoH pero NO se corta 53/853 (fail hacia no-romper).
+    #[test]
+    fn enrolar_un_pid_de_dominio_lo_marca_en_force_resolver_con_solo_doh() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        assert_eq!(
+            e.motor().forzados,
+            vec![(clave(1000, 42), FORCE_DOH)],
+            "sin resolvedores determinados, sólo DoH"
+        );
+    }
+
+    /// Al determinar los resolvedores (`forzar_dns=true`), los pids ya enrolados se
+    /// re-estampan con `FORCE_DOH | FORCE_DNS`: ahora sí se fuerza 53/853.
+    #[test]
+    fn determinar_los_resolvedores_reestampa_los_pids_con_dns_y_doh() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        let resolvedores = set(&[ip16(127, 0, 0, 53)]);
+        assert!(e.actualizar_resolvedores(resolvedores, true).is_empty());
+        // El último estampado del pid 42 lleva los dos bits.
+        assert_eq!(
+            e.motor().forzados.last(),
+            Some(&(clave(1000, 42), FORCE_DOH | FORCE_DNS))
+        );
+        assert!(e
+            .motor()
+            .resolvedores_insertados
+            .contains(&ip16(127, 0, 0, 53)));
+    }
+
+    /// Un pid enrolado DESPUÉS de determinar los resolvedores ya nace con los dos
+    /// bits: el bitmask sale del estado global del enforcer.
+    #[test]
+    fn un_pid_enrolado_con_resolvedores_ya_determinados_nace_con_dns_y_doh() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.actualizar_resolvedores(set(&[ip16(127, 0, 0, 53)]), true);
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        assert_eq!(
+            e.motor().forzados,
+            vec![(clave(1000, 42), FORCE_DOH | FORCE_DNS)]
+        );
+    }
+
+    /// Enrolar es idempotente en `FORCE_RESOLVER`: el reconcile repetido del mismo
+    /// pid no reescribe el marcador (sólo se estampa al enrolarlo por primera vez).
+    #[test]
+    fn reconciliar_el_mismo_pid_no_reescribe_el_marcador() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[ip16(192, 0, 2, 1)]), true);
+        assert_eq!(
+            e.motor().forzados.len(),
+            1,
+            "sólo el primer enrolado estampa"
+        );
+    }
+
+    /// Perder la regla (binario sin reglas) saca al pid de `FORCE_RESOLVER`.
+    #[test]
+    fn perder_la_regla_desmarca_el_pid_de_force_resolver() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true);
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), false);
+        assert_eq!(e.motor().desforzados, vec![clave(1000, 42)]);
+    }
+
+    /// Al salir el pid (`limpiar`), también se lo saca de `FORCE_RESOLVER`: una
+    /// clave colgada cortaría a un pid reciclado.
+    #[test]
+    fn limpiar_un_pid_de_dominio_lo_saca_de_force_resolver() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", set(&[ip16(192, 0, 2, 1)]), true);
+        e.limpiar(42).expect("limpiar");
+        assert_eq!(e.motor().desforzados, vec![clave(1000, 42)]);
+    }
+
+    /// `actualizar_resolvedores` diffea: una IP que sigue no se reescribe, una nueva
+    /// se agrega y la que salió se quita. Y si el bit global no cambia, no re-estampa.
+    #[test]
+    fn actualizar_resolvedores_diffea_y_no_reestampa_si_el_bit_no_cambia() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        e.reconciliar_dominio_pid(1000, 42, "/app", HashSet::new(), true); // estampa 1 vez
+        let a = ip16(127, 0, 0, 53);
+        let b = ip16(192, 0, 2, 1);
+        e.actualizar_resolvedores(set(&[a, b]), true); // bit pasó a true → re-estampa
+        let forzados_tras_true = e.motor().forzados.len();
+        // Otro refresco con el bit igual (true) y una IP distinta: diffea las IPs
+        // pero NO re-estampa los pids.
+        let c = ip16(192, 0, 2, 2);
+        e.actualizar_resolvedores(set(&[a, c]), true);
+        assert!(e.motor().resolvedores_insertados.contains(&c));
+        assert!(e.motor().resolvedores_quitados.contains(&b));
+        assert_eq!(
+            e.motor().forzados.len(),
+            forzados_tras_true,
+            "con el bit global sin cambiar no se re-estampan los pids"
+        );
+    }
+
+    /// `poblar_doh` escribe cada IP de la lista en `KNOWN_DOH` a través del motor.
+    #[test]
+    fn poblar_doh_escribe_cada_ip() {
+        let mut e = Enforcer::nuevo(Firewall::con_motor(MotorFalso::default()).unwrap());
+        let ips = set(&[ip16(1, 1, 1, 1), ip16(8, 8, 8, 8)]);
+        assert!(e.poblar_doh(&ips).is_empty());
+        let mut escritas = e.motor().doh_insertados.clone();
+        escritas.sort();
+        assert_eq!(escritas, vec![ip16(1, 1, 1, 1), ip16(8, 8, 8, 8)]);
+    }
+
+    /// Correspondencia con la fuente BPF: el programa define los tres mapas nuevos
+    /// con el nombre, tipo y tope que el daemon espera, y los bits `FORCE_DNS`/
+    /// `FORCE_DOH` y los puertos coinciden. Si un lado cambia sin el otro, el
+    /// forzado quedaría inerte o escribiría un mapa que el programa no consulta.
+    #[test]
+    fn la_fuente_bpf_define_los_mapas_y_los_bits_del_forzado() {
+        let fuente = include_str!("../../../firewall-ebpf/src/main.rs");
+        assert!(
+            fuente.contains(&format!("static {MAPA_FORZAR}: HashMap<u64, u8>")),
+            "el mapa FORCE_RESOLVER cambió de nombre o tipo"
+        );
+        assert!(
+            fuente.contains(&format!(
+                "static {MAPA_RESOLVEDORES}: HashMap<[u8; 16], u8>"
+            )),
+            "el mapa SYSTEM_RESOLVERS cambió de nombre o tipo"
+        );
+        assert!(
+            fuente.contains(&format!("static {MAPA_DOH}: HashMap<[u8; 16], u8>")),
+            "el mapa KNOWN_DOH cambió de nombre o tipo"
+        );
+        assert!(fuente.contains(&format!("with_max_entries({CAPACIDAD_FORZAR},")));
+        assert!(fuente.contains(&format!("with_max_entries({CAPACIDAD_RESOLVEDORES},")));
+        assert!(fuente.contains(&format!("with_max_entries({CAPACIDAD_DOH},")));
+        assert!(
+            fuente.contains(&format!("const FORCE_DNS: u8 = {FORCE_DNS};"))
+                && fuente.contains(&format!("const FORCE_DOH: u8 = {FORCE_DOH};")),
+            "los bits del forzado discrepan entre el programa BPF y el daemon"
+        );
+        // La decisión del programa es la misma que `resolver::corta_por_resolvedor`:
+        // 53/853 miran FORCE_DNS contra SYSTEM_RESOLVERS, 443 mira FORCE_DOH contra
+        // KNOWN_DOH.
+        assert!(
+            fuente.contains("PORT_DNS | PORT_DOT =>")
+                && fuente.contains("flags & FORCE_DNS != 0")
+                && fuente.contains("SYSTEM_RESOLVERS.get(&dst)")
+                && fuente.contains("is_none()"),
+            "la rama 53/853 del forzado cambió respecto de corta_por_resolvedor"
+        );
+        assert!(
+            fuente.contains("PORT_DOH =>")
+                && fuente.contains("flags & FORCE_DOH != 0")
+                && fuente.contains("KNOWN_DOH.get(&dst)")
+                && fuente.contains("is_some()"),
+            "la rama 443 del forzado cambió respecto de corta_por_resolvedor"
+        );
+        // Y el veredicto sigue siendo aditivo: OR con el forzado.
+        assert!(
+            fuente.contains("kill_switch || dominio_bloqueado || resolver_forzado"),
+            "el forzado dejó de sumarse al veredicto con un OR"
+        );
     }
 
     /// Sin privilegios la carga no puede salir bien, y tiene que decirlo con un

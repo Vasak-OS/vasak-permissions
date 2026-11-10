@@ -1411,6 +1411,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // conector. En `spawn_blocking` para no bloquear el runtime con `/proc`.
     let contexto_inicial = contexto.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        // El forzado del resolvedor del sistema (M2, PR-C) se prepara ANTES de
+        // enrolar los pids de dominio: así `FORCE_RESOLVER` queda con el bit
+        // `FORCE_DNS` correcto desde el primer enrolado. `poblar_doh` escribe la
+        // lista estática; `refrescar` lee `resolv.conf` y fija `SYSTEM_RESOLVERS`.
+        firewall::resolver::poblar_doh(&contexto_inicial);
+        firewall::resolver::refrescar(&contexto_inicial);
         firewall::enrolar::resincronizar(&contexto_inicial);
         firewall::dominio::resincronizar(&contexto_inicial, firewall::dominio::ahora_epoch());
     })
@@ -1426,6 +1432,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tic.tick().await;
             let ctx = contexto_barrido.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                // Re-leer `resolv.conf` por si cambió el resolvedor del sistema
+                // (M2, PR-C), y bajar las IPs de dominio vencidas por TTL (PR-B).
+                firewall::resolver::refrescar(&ctx);
                 firewall::dominio::barrer(&ctx, firewall::dominio::ahora_epoch())
             })
             .await;
