@@ -980,6 +980,43 @@ pub struct BlockedDomain {
     pub domain: String,
 }
 
+/// Una línea del **log persistente de bloqueos** del cortafuegos (M3 del #93): una
+/// conexión que el cortafuegos **cortó**, nunca una que dejó pasar.
+///
+/// # Qué es y qué no
+///
+/// El log es **opt-in** (apagado por omisión) y registra **sólo bloqueos**: no es
+/// un registro de todo el tráfico. El archivo que lo guarda es de root y no es
+/// legible por el mundo —dice quién se conectó a dónde—, y `ReadFirewallLog` lo
+/// filtra por el uid del llamante, así que un usuario sólo ve sus propios
+/// bloqueos. Apagar el log detiene las escrituras pero no borra lo guardado;
+/// borrar es `ClearFirewallLog`, una acción aparte detrás de polkit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirewallLogEntry {
+    /// Cuándo se cortó la conexión, en segundos desde el epoch.
+    pub timestamp_secs: u64,
+    /// El usuario real que abrió la conexión (el uid real del `connect()`).
+    pub uid: u32,
+    /// El ejecutable que conectó, canonicalizado como el resto de la política.
+    /// `pid <n>` cuando el proceso ya no estaba para resolverlo.
+    pub binary_path: String,
+    /// El destino: el dominio que la app resolvió para esta IP cuando el snoop de
+    /// DNS lo vio, o la IP cruda si no hay un nombre reciente que la ate.
+    pub destination: String,
+    /// El puerto de destino, en orden de host.
+    pub port: u16,
+    /// `tcp`, `udp` u `other` según el protocolo del socket.
+    pub proto: String,
+    /// El motivo **best-effort** del corte, derivado en userspace del estado de
+    /// política que el daemon ya mantiene: `kill-switch` (la red de la app está
+    /// cortada), `domain-rule` (la IP cae bajo una regla de dominio de la app) o
+    /// `forced-resolver` (resolvedor del sistema forzado, 53/853/443). Vacío
+    /// cuando no se pudo clasificar limpio: el corte se registra igual, sin motivo
+    /// preciso. No sale del BPF —el programa no emite el motivo—, así que es una
+    /// aproximación, no una verdad del kernel.
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1081,25 @@ mod tests {
         let json = serde_json::to_string(&regla).expect("serializa");
         let vuelta: BlockedDomain = serde_json::from_str(&json).expect("deserializa");
         assert_eq!(regla, vuelta);
+    }
+
+    /// Una línea del log de bloqueos viaja como JSON (una por línea en el archivo y
+    /// en la respuesta de `ReadFirewallLog`): la vuelta por serde la devuelve igual,
+    /// campo por campo.
+    #[test]
+    fn la_linea_del_log_de_bloqueos_sobrevive_el_json() {
+        let entrada = FirewallLogEntry {
+            timestamp_secs: 1_788_000_000,
+            uid: 1000,
+            binary_path: "/home/x/navegador.AppImage".into(),
+            destination: "ads.example.com".into(),
+            port: 443,
+            proto: "tcp".into(),
+            reason: "domain-rule".into(),
+        };
+        let json = serde_json::to_string(&entrada).expect("serializa");
+        let vuelta: FirewallLogEntry = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(entrada, vuelta);
     }
 
     /// `valid_domain` normaliza a minúsculas y recorta el punto final (FQDN), para
