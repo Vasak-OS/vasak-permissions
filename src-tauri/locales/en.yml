@@ -71,6 +71,12 @@ resources:
       It will be able to see the dates and subjects of the emails you exchanged
       with each contact. It will not be able to read the contents of the
       messages, the rest of your email, or get into your mailbox.
+  files:
+    title: Let {0} read your files?
+    explanation: >-
+      It will be able to search and read files inside the folders you choose
+      —never the whole disk—. You decide which folders it can see. It does not
+      delete or change anything.
 
 blocked:
   camera: "{0} tried to use the camera"

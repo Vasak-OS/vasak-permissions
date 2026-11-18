@@ -70,6 +70,12 @@ resources:
       Va a poder ver las fechas y los asuntos de los correos que intercambiaste
       con cada contacto. No va a poder leer el contenido de los mensajes, ni el
       resto de tu correo, ni entrar a tu casilla.
+  files:
+    title: ¿Querés que {0} lea tus archivos?
+    explanation: >-
+      Va a poder buscar y leer archivos dentro de las carpetas que vos elijas
+      —nunca todo el disco—. Vos definís qué carpetas puede ver. No borra ni
+      modifica nada.
 
 blocked:
   camera: "{0} quiso usar la cámara"
