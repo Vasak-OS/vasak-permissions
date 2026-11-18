@@ -194,7 +194,7 @@ pub fn is_delegate(binary_path: &str) -> bool {
 /// por CalDAV, así que durante la transición lleva **las dos**: `account.calendar`
 /// y `store.calendar`. Una prueba fija qué `store.*` tiene cada binario, para que
 /// un recurso del almacén entre con la migración de su aplicación y no antes.
-pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
+pub const SCOPED_BINARIES: [(&str, &[&str]); 7] = [
     // Se conecta a discos en la nube —Drive, Nextcloud, OneDrive— y a nada más.
     // No al correo, ni al calendario, ni a los contactos: eso es de las
     // aplicaciones que les corresponden.
@@ -287,6 +287,17 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 6] = [
         "/usr/bin/vasak-contacts",
         &["account.contacts", "store.email.interactions"],
     ),
+    // Lince, el asistente. Cuando la persona se lo concede, lee el correo
+    // guardado para resumirlo o buscar un hilo, y redacta envíos que ella
+    // confirma. Lo lee del almacén local, por `AccountsStore`, igual que el
+    // correo: gana `store.email` y nada más.
+    //
+    // Nunca `account.email`: la contraseña de la casilla no la toca —no la
+    // necesita, le alcanza con lo que el sincronizador guardó— y acotarlo acá
+    // es lo que impide que un Lince reemplazado pida la credencial con un
+    // diálogo que se ve igual que cualquier otro. Nada del calendario ni los
+    // contactos todavía: cada área entra con su habilidad, no antes.
+    ("/usr/bin/vasak-assistant", &["store.email"]),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -1536,16 +1547,17 @@ mod scope_tests {
     /// Sólo el calendario tiene un **área** del almacén, y sólo la suya.
     ///
     /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
-    /// alcance de cada aplicación cuando ésta lee del almacén. El calendario ya
-    /// lo hace (`store_events`), así que lleva `store.calendar`; ninguna otra
-    /// aplicación tiene un área, y la suya menos todavía: una con el área de
-    /// otra vería lo guardado de ella.
+    /// alcance de cada aplicación cuando ésta lee del almacén. El calendario lo
+    /// hace (`store_events`), así que lleva `store.calendar`; el correo lleva
+    /// `store.email`, y Lince también —lee el correo guardado para resumirlo o
+    /// redactar—. Ninguna aplicación tiene el área de otra: una que la tuviera
+    /// vería lo guardado de ella.
     ///
     /// La excepción angosta es `store.email.interactions` de la libreta de
     /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
     /// —no deja leer la casilla— y no viene con `account.email`.
     #[test]
-    fn solo_el_calendario_y_el_correo_tienen_un_area_del_almacen() {
+    fn cada_area_del_almacen_esta_en_el_alcance_que_corresponde() {
         let areas: Vec<String> = StoreResource::ALL
             .iter()
             .map(|area| Resource::Store(area.clone()).as_id())
@@ -1563,9 +1575,23 @@ mod scope_tests {
             [
                 ("/usr/bin/vasak-calendar", "store.calendar"),
                 ("/usr/bin/vasak-mail", "store.email"),
+                ("/usr/bin/vasak-assistant", "store.email"),
             ],
             "el reparto de las áreas del almacén cambió"
         );
+    }
+
+    /// Lince lee el correo guardado pero no llega a la credencial de la casilla,
+    /// ni al calendario ni a los contactos: cada área entra con su habilidad.
+    #[test]
+    fn lince_puede_pedir_el_correo_guardado_pero_no_la_credencial_de_la_casilla() {
+        let lince = "/usr/bin/vasak-assistant";
+
+        assert!(may_request(lince, "store.email"));
+        assert!(!may_request(lince, "account.email"));
+        assert!(!may_request(lince, "store.calendar"));
+        assert!(!may_request(lince, "store.contacts"));
+        assert_eq!(scope_of(lince), Some(&["store.email"][..]));
     }
 
     /// Regresión: el calendario lee los eventos de dos lados —`account_events`
