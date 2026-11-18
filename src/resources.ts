@@ -30,6 +30,10 @@ export const KNOWN_RESOURCES = [
 	// dirección —fechas, asuntos y direcciones, sin los cuerpos—, para la ficha
 	// de un contacto.
 	'store.email.interactions',
+	// Leer y buscar archivos del usuario dentro del alcance que elige (la
+	// habilidad de archivos de Lince). Consentimiento grueso; qué carpetas lo
+	// lleva la config de Lince.
+	'files',
 ] as const;
 
 export type KnownResource = (typeof KNOWN_RESOURCES)[number];

@@ -298,10 +298,12 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 7] = [
     // sincronizador guardó— y acotarlo acá es lo que impide que un Lince
     // reemplazado pida la credencial con un diálogo que se ve igual que
     // cualquier otro. Las tres áreas del almacén entran a medida que Lince gana
-    // su habilidad: correo, calendario y ahora contactos.
+    // su habilidad: correo, calendario y contactos. `files` es su habilidad de
+    // archivos (consentimiento grueso; el alcance fino —qué carpetas— lo lleva
+    // la config de Lince, no este permiso).
     (
         "/usr/bin/vasak-assistant",
-        &["store.email", "store.calendar", "store.contacts"],
+        &["store.email", "store.calendar", "store.contacts", "files"],
     ),
 ];
 
@@ -525,6 +527,16 @@ pub enum Resource {
     /// with their GPG key but not their SSH key — and each extra switch makes
     /// the list longer without making anyone safer.
     Credentials,
+    /// Leer y buscar archivos del usuario, dentro del alcance que la persona
+    /// elige (las carpetas que configura; nunca todo el disco por defecto).
+    ///
+    /// Como `store.*`, es **consentimiento y visibilidad, no una frontera**: no
+    /// lo sirve ningún demonio que se pueda confiar para cortar: lo lee Lince
+    /// directo del filesystem, como el usuario, que ya puede leer esos archivos
+    /// con cualquier programa suyo. Negarlo apaga el camino de Lince; lo que
+    /// contiene una lectura dentro del alcance es la verificación de contención
+    /// del lado de Lince, no este permiso (`is_enforceable` es falso).
+    Files,
     /// Access to one capability of the user's online accounts.
     #[serde(rename = "account")]
     Account(AccountResource),
@@ -661,6 +673,7 @@ impl Resource {
                 | Resource::Microphone
                 | Resource::Credentials
                 | Resource::Network
+                | Resource::Files
         )
     }
 
@@ -701,6 +714,7 @@ impl Resource {
             Resource::InputCapture => "input-capture".into(),
             Resource::Credentials => "credentials".into(),
             Resource::Network => "network".into(),
+            Resource::Files => "files".into(),
             Resource::Account(capability) => format!("account.{}", capability.as_id()),
             Resource::Store(area) => format!("store.{}", area.as_id()),
         }
@@ -722,6 +736,7 @@ impl Resource {
             "input-capture" => Some(Resource::InputCapture),
             "credentials" => Some(Resource::Credentials),
             "network" => Some(Resource::Network),
+            "files" => Some(Resource::Files),
             _ => None,
         }
     }
@@ -1199,6 +1214,7 @@ mod tests {
             Resource::Location,
             Resource::InputCapture,
             Resource::Network,
+            Resource::Files,
             Resource::Account(AccountResource::Email),
             Resource::Account(AccountResource::Calendar),
             Resource::Account(AccountResource::Contacts),
@@ -1417,6 +1433,39 @@ mod enforcement_tests {
             assert!(!Resource::Store(area).decision_has_effect_for(&key));
         }
     }
+
+    /// Los archivos se escriben en disco como `files`: si el texto cambia, la
+    /// decisión guardada deja de coincidir y se vuelve a preguntar.
+    #[test]
+    fn el_recurso_de_archivos_se_escribe_files() {
+        assert_eq!(Resource::Files.as_id(), "files");
+        assert_eq!(Resource::from_id("files"), Some(Resource::Files));
+    }
+
+    /// Los archivos son consentimiento y visibilidad, no una frontera: Lince los
+    /// lee directo del filesystem. Decidirlos corta el camino de Lince, pero un
+    /// rechazo no se puede prometer, y por el portal no llega ninguna lectura.
+    #[test]
+    fn los_archivos_se_deciden_pero_no_son_una_frontera() {
+        assert!(Resource::Files.decision_has_effect());
+        assert!(Resource::Files.decision_has_effect_for("/usr/bin/vasak-assistant"));
+        assert!(!Resource::Files.is_enforceable());
+        let key = portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(!Resource::Files.decision_has_effect_for(&key));
+    }
+
+    /// Sólo Lince puede pedir `files`: acotarlo es lo que impide que otro
+    /// programa muestre el mismo diálogo para leer los archivos de la persona.
+    #[test]
+    fn solo_lince_puede_pedir_los_archivos() {
+        assert!(may_request("/usr/bin/vasak-assistant", "files"));
+        for (binary, scope) in SCOPED_BINARIES {
+            if binary != "/usr/bin/vasak-assistant" {
+                assert!(!scope.contains(&"files"), "{binary}");
+                assert!(!may_request(binary, "files"), "{binary}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1591,22 +1640,24 @@ mod scope_tests {
         );
     }
 
-    /// Lince lee el correo, el calendario y los contactos guardados, pero no
-    /// llega a las credenciales de las cuentas: cada área entra con su
-    /// habilidad, las credenciales nunca.
+    /// Lince lee el correo, el calendario y los contactos guardados, y los
+    /// archivos dentro de su alcance, pero no llega a las credenciales de las
+    /// cuentas: cada capacidad entra con su habilidad, las credenciales nunca.
     #[test]
-    fn lince_lee_correo_calendario_y_contactos_guardados_pero_no_las_credenciales() {
+    fn lince_lee_correo_calendario_contactos_y_archivos_pero_no_las_credenciales() {
         let lince = "/usr/bin/vasak-assistant";
 
         assert!(may_request(lince, "store.email"));
         assert!(may_request(lince, "store.calendar"));
         assert!(may_request(lince, "store.contacts"));
+        assert!(may_request(lince, "files"));
         assert!(!may_request(lince, "account.email"));
         assert!(!may_request(lince, "account.calendar"));
         assert!(!may_request(lince, "account.contacts"));
+        assert!(!may_request(lince, "credentials"));
         assert_eq!(
             scope_of(lince),
-            Some(&["store.email", "store.calendar", "store.contacts"][..])
+            Some(&["store.email", "store.calendar", "store.contacts", "files"][..])
         );
     }
 
