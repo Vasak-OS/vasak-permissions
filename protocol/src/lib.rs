@@ -287,17 +287,21 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 7] = [
         "/usr/bin/vasak-contacts",
         &["account.contacts", "store.email.interactions"],
     ),
-    // Lince, el asistente. Cuando la persona se lo concede, lee el correo
-    // guardado para resumirlo o buscar un hilo, y redacta envíos que ella
-    // confirma. Lo lee del almacén local, por `AccountsStore`, igual que el
-    // correo: gana `store.email` y nada más.
+    // Lince, el asistente. Cuando la persona se lo concede, lee del almacén
+    // local (por `AccountsStore`) el correo guardado —para resumirlo o buscar un
+    // hilo, y redactar envíos que ella confirma— y el calendario —para ver los
+    // eventos y las tareas—. Gana `store.email` y `store.calendar`, una por cada
+    // habilidad que ya tiene; nada más.
     //
-    // Nunca `account.email`: la contraseña de la casilla no la toca —no la
-    // necesita, le alcanza con lo que el sincronizador guardó— y acotarlo acá
-    // es lo que impide que un Lince reemplazado pida la credencial con un
-    // diálogo que se ve igual que cualquier otro. Nada del calendario ni los
-    // contactos todavía: cada área entra con su habilidad, no antes.
-    ("/usr/bin/vasak-assistant", &["store.email"]),
+    // Nunca `account.email` ni `account.calendar`: las credenciales de la cuenta
+    // no las toca —le alcanza con lo que el sincronizador guardó— y acotarlo acá
+    // es lo que impide que un Lince reemplazado pida la credencial con un diálogo
+    // que se ve igual que cualquier otro. Nada de los contactos todavía: esa área
+    // entra cuando Lince gane su habilidad, no antes.
+    (
+        "/usr/bin/vasak-assistant",
+        &["store.email", "store.calendar"],
+    ),
 ];
 
 /// Si `binary_path` puede llegar a pedir `resource_id`.
@@ -1549,9 +1553,10 @@ mod scope_tests {
     /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
     /// alcance de cada aplicación cuando ésta lee del almacén. El calendario lo
     /// hace (`store_events`), así que lleva `store.calendar`; el correo lleva
-    /// `store.email`, y Lince también —lee el correo guardado para resumirlo o
-    /// redactar—. Ninguna aplicación tiene el área de otra: una que la tuviera
-    /// vería lo guardado de ella.
+    /// `store.email`. Lince lleva **las dos** —`store.email` y `store.calendar`—:
+    /// lee el correo y el calendario guardados para resumirlos o redactar. No es
+    /// una regresión que aparezca dos veces en el reparto. Ninguna aplicación
+    /// tiene el área de otra: una que la tuviera vería lo guardado de ella.
     ///
     /// La excepción angosta es `store.email.interactions` de la libreta de
     /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
@@ -1576,22 +1581,28 @@ mod scope_tests {
                 ("/usr/bin/vasak-calendar", "store.calendar"),
                 ("/usr/bin/vasak-mail", "store.email"),
                 ("/usr/bin/vasak-assistant", "store.email"),
+                ("/usr/bin/vasak-assistant", "store.calendar"),
             ],
             "el reparto de las áreas del almacén cambió"
         );
     }
 
-    /// Lince lee el correo guardado pero no llega a la credencial de la casilla,
-    /// ni al calendario ni a los contactos: cada área entra con su habilidad.
+    /// Lince lee el correo y el calendario guardados, pero no llega a las
+    /// credenciales de las cuentas ni a los contactos: cada área entra con su
+    /// habilidad.
     #[test]
-    fn lince_puede_pedir_el_correo_guardado_pero_no_la_credencial_de_la_casilla() {
+    fn lince_lee_correo_y_calendario_guardados_pero_no_las_credenciales_ni_los_contactos() {
         let lince = "/usr/bin/vasak-assistant";
 
         assert!(may_request(lince, "store.email"));
+        assert!(may_request(lince, "store.calendar"));
         assert!(!may_request(lince, "account.email"));
-        assert!(!may_request(lince, "store.calendar"));
+        assert!(!may_request(lince, "account.calendar"));
         assert!(!may_request(lince, "store.contacts"));
-        assert_eq!(scope_of(lince), Some(&["store.email"][..]));
+        assert_eq!(
+            scope_of(lince),
+            Some(&["store.email", "store.calendar"][..])
+        );
     }
 
     /// Regresión: el calendario lee los eventos de dos lados —`account_events`

@@ -194,7 +194,8 @@ fn los_unicos_recursos_del_almacen_en_un_alcance_son_historial_calendario_correo
             (CALENDARIO, "store.calendar"),
             ("/usr/bin/vasak-mail", "store.email"),
             (LIBRETA, ID),
-            ("/usr/bin/vasak-assistant", "store.email")
+            ("/usr/bin/vasak-assistant", "store.email"),
+            ("/usr/bin/vasak-assistant", "store.calendar")
         ]
     );
 }
