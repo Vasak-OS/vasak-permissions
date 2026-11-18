@@ -178,9 +178,10 @@ fn el_historial_de_correo_se_decide_pero_no_es_una_frontera() {
 
 /// Los únicos `store.*` que aparecen en el alcance de alguna aplicación son el
 /// historial de la libreta, el área del calendario (que lee los eventos del
-/// almacén) y el área del correo (lo guardado por el sincronizador), que además lee Lince. Cierra el hueco que deja la prueba de «ningún área»: ésa sólo mira
-/// las tres áreas, y un `store.*` nuevo o repartido de más pasaría sin que nadie
-/// lo vea. La separación calendario/contactos queda fijada de los dos lados.
+/// almacén), el área del correo (lo guardado por el sincronizador) y las tres
+/// áreas que lee Lince: correo, calendario y contactos. Cierra el hueco que deja
+/// la prueba de «ningún área»: ésa sólo mira las tres áreas, y un `store.*` nuevo
+/// o repartido de más pasaría sin que nadie lo vea.
 #[test]
 fn los_unicos_recursos_del_almacen_en_un_alcance_son_historial_calendario_correo_y_lince() {
     let del_almacen: Vec<(&str, &str)> = SCOPED_BINARIES
@@ -195,7 +196,8 @@ fn los_unicos_recursos_del_almacen_en_un_alcance_son_historial_calendario_correo
             ("/usr/bin/vasak-mail", "store.email"),
             (LIBRETA, ID),
             ("/usr/bin/vasak-assistant", "store.email"),
-            ("/usr/bin/vasak-assistant", "store.calendar")
+            ("/usr/bin/vasak-assistant", "store.calendar"),
+            ("/usr/bin/vasak-assistant", "store.contacts")
         ]
     );
 }
