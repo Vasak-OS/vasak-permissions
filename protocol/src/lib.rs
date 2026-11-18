@@ -293,14 +293,15 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 7] = [
     // eventos y las tareas—. Gana `store.email` y `store.calendar`, una por cada
     // habilidad que ya tiene; nada más.
     //
-    // Nunca `account.email` ni `account.calendar`: las credenciales de la cuenta
-    // no las toca —le alcanza con lo que el sincronizador guardó— y acotarlo acá
-    // es lo que impide que un Lince reemplazado pida la credencial con un diálogo
-    // que se ve igual que cualquier otro. Nada de los contactos todavía: esa área
-    // entra cuando Lince gane su habilidad, no antes.
+    // Nunca `account.email`, `account.calendar` ni `account.contacts`: las
+    // credenciales de la cuenta no las toca —le alcanza con lo que el
+    // sincronizador guardó— y acotarlo acá es lo que impide que un Lince
+    // reemplazado pida la credencial con un diálogo que se ve igual que
+    // cualquier otro. Las tres áreas del almacén entran a medida que Lince gana
+    // su habilidad: correo, calendario y ahora contactos.
     (
         "/usr/bin/vasak-assistant",
-        &["store.email", "store.calendar"],
+        &["store.email", "store.calendar", "store.contacts"],
     ),
 ];
 
@@ -1548,15 +1549,17 @@ mod scope_tests {
         }
     }
 
-    /// Sólo el calendario tiene un **área** del almacén, y sólo la suya.
+    /// Cada **área** del almacén entra en el alcance de una aplicación cuando
+    /// ésta la lee.
     ///
     /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
     /// alcance de cada aplicación cuando ésta lee del almacén. El calendario lo
     /// hace (`store_events`), así que lleva `store.calendar`; el correo lleva
-    /// `store.email`. Lince lleva **las dos** —`store.email` y `store.calendar`—:
-    /// lee el correo y el calendario guardados para resumirlos o redactar. No es
-    /// una regresión que aparezca dos veces en el reparto. Ninguna aplicación
-    /// tiene el área de otra: una que la tuviera vería lo guardado de ella.
+    /// `store.email`. Lince lleva **las tres** —`store.email`, `store.calendar`
+    /// y `store.contacts`—: lee el correo, el calendario y los contactos
+    /// guardados para resumirlos o redactar. No es una regresión que aparezca
+    /// una vez por área en el reparto. Ninguna aplicación tiene el área de otra:
+    /// una que la tuviera vería lo guardado de ella.
     ///
     /// La excepción angosta es `store.email.interactions` de la libreta de
     /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
@@ -1582,26 +1585,28 @@ mod scope_tests {
                 ("/usr/bin/vasak-mail", "store.email"),
                 ("/usr/bin/vasak-assistant", "store.email"),
                 ("/usr/bin/vasak-assistant", "store.calendar"),
+                ("/usr/bin/vasak-assistant", "store.contacts"),
             ],
             "el reparto de las áreas del almacén cambió"
         );
     }
 
-    /// Lince lee el correo y el calendario guardados, pero no llega a las
-    /// credenciales de las cuentas ni a los contactos: cada área entra con su
-    /// habilidad.
+    /// Lince lee el correo, el calendario y los contactos guardados, pero no
+    /// llega a las credenciales de las cuentas: cada área entra con su
+    /// habilidad, las credenciales nunca.
     #[test]
-    fn lince_lee_correo_y_calendario_guardados_pero_no_las_credenciales_ni_los_contactos() {
+    fn lince_lee_correo_calendario_y_contactos_guardados_pero_no_las_credenciales() {
         let lince = "/usr/bin/vasak-assistant";
 
         assert!(may_request(lince, "store.email"));
         assert!(may_request(lince, "store.calendar"));
+        assert!(may_request(lince, "store.contacts"));
         assert!(!may_request(lince, "account.email"));
         assert!(!may_request(lince, "account.calendar"));
-        assert!(!may_request(lince, "store.contacts"));
+        assert!(!may_request(lince, "account.contacts"));
         assert_eq!(
             scope_of(lince),
-            Some(&["store.email", "store.calendar"][..])
+            Some(&["store.email", "store.calendar", "store.contacts"][..])
         );
     }
 
