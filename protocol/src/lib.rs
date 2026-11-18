@@ -1553,9 +1553,10 @@ mod scope_tests {
     /// Un área (`store.email`, `store.calendar`, `store.contacts`) entra en el
     /// alcance de cada aplicación cuando ésta lee del almacén. El calendario lo
     /// hace (`store_events`), así que lleva `store.calendar`; el correo lleva
-    /// `store.email`, y Lince también —lee el correo guardado para resumirlo o
-    /// redactar—. Ninguna aplicación tiene el área de otra: una que la tuviera
-    /// vería lo guardado de ella.
+    /// `store.email`. Lince lleva **las dos** —`store.email` y `store.calendar`—:
+    /// lee el correo y el calendario guardados para resumirlos o redactar. No es
+    /// una regresión que aparezca dos veces en el reparto. Ninguna aplicación
+    /// tiene el área de otra: una que la tuviera vería lo guardado de ella.
     ///
     /// La excepción angosta es `store.email.interactions` de la libreta de
     /// direcciones (ver [`StoreResource::EmailInteractions`]): no es un área
