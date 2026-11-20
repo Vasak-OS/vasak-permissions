@@ -300,10 +300,18 @@ pub const SCOPED_BINARIES: [(&str, &[&str]); 7] = [
     // cualquier otro. Las tres áreas del almacén entran a medida que Lince gana
     // su habilidad: correo, calendario y contactos. `files` es su habilidad de
     // archivos (consentimiento grueso; el alcance fino —qué carpetas— lo lleva
-    // la config de Lince, no este permiso).
+    // la config de Lince, no este permiso). `web` es su habilidad web —buscar en
+    // la web y leer páginas por cuenta de la persona—, del mismo tipo que
+    // `files`: consentimiento y visibilidad, no una frontera.
     (
         "/usr/bin/vasak-assistant",
-        &["store.email", "store.calendar", "store.contacts", "files"],
+        &[
+            "store.email",
+            "store.calendar",
+            "store.contacts",
+            "files",
+            "web",
+        ],
     ),
 ];
 
@@ -537,6 +545,16 @@ pub enum Resource {
     /// contiene una lectura dentro del alcance es la verificación de contención
     /// del lado de Lince, no este permiso (`is_enforceable` es falso).
     Files,
+    /// Buscar en la web y leer páginas por cuenta del usuario, cuando él se lo
+    /// concede a Lince (la habilidad web del asistente).
+    ///
+    /// Como `files` y `store.*`, es **consentimiento y visibilidad, no una
+    /// frontera**: no lo sirve ningún demonio que intercepte la red y se pueda
+    /// confiar para cortarla, lo hace valer Lince del lado del asistente. Negarlo
+    /// apaga el camino web de Lince; que la navegación quede dentro de lo
+    /// concedido es la verificación del lado de Lince, no este permiso
+    /// (`is_enforceable` es falso).
+    Web,
     /// Access to one capability of the user's online accounts.
     #[serde(rename = "account")]
     Account(AccountResource),
@@ -674,6 +692,7 @@ impl Resource {
                 | Resource::Credentials
                 | Resource::Network
                 | Resource::Files
+                | Resource::Web
         )
     }
 
@@ -715,6 +734,7 @@ impl Resource {
             Resource::Credentials => "credentials".into(),
             Resource::Network => "network".into(),
             Resource::Files => "files".into(),
+            Resource::Web => "web".into(),
             Resource::Account(capability) => format!("account.{}", capability.as_id()),
             Resource::Store(area) => format!("store.{}", area.as_id()),
         }
@@ -737,6 +757,7 @@ impl Resource {
             "credentials" => Some(Resource::Credentials),
             "network" => Some(Resource::Network),
             "files" => Some(Resource::Files),
+            "web" => Some(Resource::Web),
             _ => None,
         }
     }
@@ -1215,6 +1236,7 @@ mod tests {
             Resource::InputCapture,
             Resource::Network,
             Resource::Files,
+            Resource::Web,
             Resource::Account(AccountResource::Email),
             Resource::Account(AccountResource::Calendar),
             Resource::Account(AccountResource::Contacts),
@@ -1454,6 +1476,24 @@ mod enforcement_tests {
         assert!(!Resource::Files.decision_has_effect_for(&key));
     }
 
+    /// La web se escribe en disco como `web`: si el texto cambia, la decisión
+    /// guardada deja de coincidir y se vuelve a preguntar.
+    #[test]
+    fn el_recurso_web_se_escribe_web() {
+        assert_eq!(Resource::Web.as_id(), "web");
+        assert_eq!(Resource::from_id("web"), Some(Resource::Web));
+    }
+
+    /// Como los archivos, la web es consentimiento y visibilidad, no una
+    /// frontera: se puede decidir (corta el camino web de Lince) pero ningún
+    /// perfil la niega, así que no se promete como `is_enforceable`.
+    #[test]
+    fn la_web_se_decide_pero_no_es_una_frontera() {
+        assert!(Resource::Web.decision_has_effect());
+        assert!(Resource::Web.decision_has_effect_for("/usr/bin/vasak-assistant"));
+        assert!(!Resource::Web.is_enforceable());
+    }
+
     /// Sólo Lince puede pedir `files`: acotarlo es lo que impide que otro
     /// programa muestre el mismo diálogo para leer los archivos de la persona.
     #[test]
@@ -1465,6 +1505,27 @@ mod enforcement_tests {
                 assert!(!may_request(binary, "files"), "{binary}");
             }
         }
+    }
+
+    /// Sólo Lince puede pedir `web`: acotarlo impide que otro programa acotado
+    /// muestre el mismo diálogo para navegar por cuenta de la persona.
+    #[test]
+    fn solo_lince_puede_pedir_la_web() {
+        assert!(may_request("/usr/bin/vasak-assistant", "web"));
+        let mut otros = 0;
+        for (binary, scope) in SCOPED_BINARIES {
+            if binary != "/usr/bin/vasak-assistant" {
+                otros += 1;
+                assert!(!scope.contains(&"web"), "{binary}");
+                assert!(!may_request(binary, "web"), "{binary}");
+            }
+        }
+        assert!(
+            otros > 0,
+            "hace falta otro binario acotado para el caso negativo"
+        );
+        // Un binario fuera de la lista no está acotado: puede pedir cualquier id.
+        assert!(may_request("/usr/bin/cualquier-otro", "web"));
     }
 }
 
@@ -1651,13 +1712,22 @@ mod scope_tests {
         assert!(may_request(lince, "store.calendar"));
         assert!(may_request(lince, "store.contacts"));
         assert!(may_request(lince, "files"));
+        assert!(may_request(lince, "web"));
         assert!(!may_request(lince, "account.email"));
         assert!(!may_request(lince, "account.calendar"));
         assert!(!may_request(lince, "account.contacts"));
         assert!(!may_request(lince, "credentials"));
         assert_eq!(
             scope_of(lince),
-            Some(&["store.email", "store.calendar", "store.contacts", "files"][..])
+            Some(
+                &[
+                    "store.email",
+                    "store.calendar",
+                    "store.contacts",
+                    "files",
+                    "web"
+                ][..]
+            )
         );
     }
 

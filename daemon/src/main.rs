@@ -1739,6 +1739,23 @@ mod delegation_tests {
         ));
     }
 
+    /// La web se acepta contra el ejecutable de Lince (consentimiento, no
+    /// frontera) y no contra el portal; un id parecido es desconocido.
+    #[test]
+    fn el_servicio_acepta_la_web_de_lince() {
+        assert!(check_resource("web", "/usr/bin/vasak-assistant").is_ok());
+        let key =
+            vasak_permissions_protocol::portal_key("com.google.Chrome").expect("identidad válida");
+        assert!(matches!(
+            check_resource("web", &key),
+            Err(FdoError::NotSupported(_))
+        ));
+        assert!(matches!(
+            check_resource("web.search", "/usr/bin/vasak-assistant"),
+            Err(FdoError::InvalidArgs(_))
+        ));
+    }
+
     /// Un área inventada es un recurso desconocido, y contra una identidad del
     /// portal no hay nada que guardar: por ahí no llega ninguna lectura.
     #[test]
