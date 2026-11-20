@@ -56,6 +56,16 @@ describe('los recursos que el diálogo conoce', () => {
 		}
 	});
 
+	test('incluyen la web, con sus textos en los dos idiomas', () => {
+		expect(KNOWN_RESOURCES as readonly string[]).toContain('web');
+		expect(isKnownResource('web')).toBe(true);
+		for (const language of LANGUAGES) {
+			const web = catalog(language).resources.web;
+			expect(web?.title, `${language}.yml: web.title`).toContain('{0}');
+			expect(web?.explanation, `${language}.yml: web.explanation`).toBeString();
+		}
+	});
+
 	test('incluyen el historial de correo de la libreta', () => {
 		expect(KNOWN_RESOURCES as readonly string[]).toContain(EMAIL_INTERACTIONS);
 		expect(isKnownResource(EMAIL_INTERACTIONS)).toBe(true);

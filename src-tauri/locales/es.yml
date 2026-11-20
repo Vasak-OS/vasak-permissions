@@ -76,6 +76,11 @@ resources:
       Va a poder buscar y leer archivos dentro de las carpetas que vos elijas
       —nunca todo el disco—. Vos definís qué carpetas puede ver. No borra ni
       modifica nada.
+  web:
+    title: ¿Querés que {0} acceda a la web?
+    explanation: >-
+      Va a poder buscar en la web y leer páginas por vos, para responderte. No
+      inicia sesión en tus cuentas ni envía nada en tu nombre.
 
 blocked:
   camera: "{0} quiso usar la cámara"

@@ -34,6 +34,9 @@ export const KNOWN_RESOURCES = [
 	// habilidad de archivos de Lince). Consentimiento grueso; qué carpetas lo
 	// lleva la config de Lince.
 	'files',
+	// Buscar en la web y leer páginas por cuenta del usuario (la habilidad web de
+	// Lince). Como `files`: consentimiento y visibilidad, no una frontera.
+	'web',
 ] as const;
 
 export type KnownResource = (typeof KNOWN_RESOURCES)[number];
