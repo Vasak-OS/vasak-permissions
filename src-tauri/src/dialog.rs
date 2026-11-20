@@ -7,7 +7,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 use vasak_permissions_protocol::PermissionRequest;
 
-const WINDOW_LABEL: &str = "permission-dialog";
+pub(crate) const WINDOW_LABEL: &str = "permission-dialog";
 const DIALOG_WIDTH: f64 = 460.0;
 const DIALOG_HEIGHT: f64 = 320.0;
 
@@ -144,6 +144,11 @@ fn summary(state: &tauri::State<'_, DialogState>) -> String {
 
 fn open_window<R: tauri::Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        // Residente y escondida: su proceso de WebKit pudo haberse matado para
+        // liberar RAM (ver `commands::surface_lifecycle`). Se cancela la muerte
+        // pendiente y, si ya se mató, se recarga para reponerlo antes de mostrar;
+        // la página, al remontar, vuelve a leer el pedido con `pending_request`.
+        crate::commands::surface_lifecycle::prepare_show(app);
         window.show()?;
         window.set_focus()?;
         return Ok(());
@@ -187,6 +192,10 @@ fn clear<R: tauri::Runtime>(app: &AppHandle<R>, allowed: bool) {
     // only exists after the first request is a fair trade.
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
         let _ = window.hide();
+        // Escondida: se programa matar su proceso para liberar la RAM mientras no
+        // se use. La próxima apertura lo repone recargando (ver
+        // `commands::surface_lifecycle`).
+        crate::commands::surface_lifecycle::arm_after_hide(app);
     }
 }
 
