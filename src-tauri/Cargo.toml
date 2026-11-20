@@ -21,7 +21,7 @@ tauri-build = { version = "2", features = [] }
 vasak-permissions-protocol.workspace = true
 tauri = { version = "2", features = [] }
 gtk = "0.18"
-webkit2gtk = "2.0"
+webkit2gtk = { version = "2.0", features = ["v2_34"] }
 tauri-plugin-vicons = "2"
 tauri-plugin-config-manager = "2.13"
 tauri-plugin-i18n-vsk = "2.3.0"
